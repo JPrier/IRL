@@ -681,6 +681,7 @@ mod tests {
             offers: BTreeMap::new(),
             rumors: vec![],
             damage: BTreeMap::new(),
+            location_items: BTreeMap::new(),
             flags: BTreeSet::new(),
             ledger: BTreeMap::new(),
             next_commitment_id: 1,

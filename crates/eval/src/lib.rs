@@ -12,6 +12,7 @@ use rpg_agents::{HeuristicEngine, NpcPolicy};
 use rpg_content::build_town;
 use rpg_domain::action::{
     Action, ActionProposal, InvestigateTarget, Loudness, ProposalSource, QuestPredicate,
+    ValidationOutcome,
 };
 use rpg_domain::ids::*;
 use rpg_domain::ports::InferenceEngine;
@@ -133,6 +134,31 @@ impl Session {
 
     pub fn checksum(&self) -> u64 {
         self.sim.events.checksum()
+    }
+
+    /// Walk to a location and advance ticks until arrival.
+    pub fn goto(&mut self, location: &str) {
+        let out = self.player_do(Action::MoveTo {
+            location: LocationId::new(location),
+        });
+        if matches!(out, ValidationOutcome::Accepted) {
+            let player = ActorId::new(PLAYER);
+            let mut guard = 0;
+            while self.sim.paths.contains_key(&player) && guard < 200 {
+                let _ = self.tick();
+                guard += 1;
+            }
+        }
+    }
+
+    /// Advance until all movement and private-conversation walks settle.
+    pub fn wait_settled(&mut self, max_ticks: u32) {
+        let mut n = 0;
+        while (!self.sim.paths.is_empty() || !self.sim.pending_private.is_empty()) && n < max_ticks
+        {
+            let _ = self.tick();
+            n += 1;
+        }
     }
 }
 
@@ -301,10 +327,12 @@ fn friendly_investigation(seed: u64) -> ScenarioResult {
     s.teleport_player_to("priest");
     s.say("priest", "Do you know who is threatening the shopkeepers?");
 
-    // Explore two locations to find any placed clues.
+    // Explore two locations to find any placed clues (must be physically there).
+    s.goto("warehouse");
     s.player_do(Action::Investigate {
         target: InvestigateTarget::Location(LocationId::new("warehouse")),
     });
+    s.goto("alley");
     s.player_do(Action::Investigate {
         target: InvestigateTarget::Location(LocationId::new("alley")),
     });
@@ -456,9 +484,11 @@ fn private_conversation_and_spy(seed: u64) -> ScenarioResult {
     check(
         &mut checks,
         "privacy_accepted",
-        matches!(out, rpg_domain::action::ValidationOutcome::Accepted),
+        matches!(out, ValidationOutcome::Accepted),
         format!("{out:?}"),
     );
+    // Privacy takes real movement, not a teleport.
+    s.wait_settled(50);
     let grocer_loc = s
         .sim
         .world

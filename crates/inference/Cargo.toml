@@ -1,0 +1,20 @@
+[package]
+name = "rpg_inference"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Agentic RPG: resident llama.cpp inference backend behind the domain port."
+
+[dependencies]
+rpg_domain.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+llama-cpp-2 = "0.1.160"
+
+[features]
+default = []
+cuda = ["llama-cpp-2/cuda"]
+metal = ["llama-cpp-2/metal"]
+rocm = ["llama-cpp-2/rocm"]

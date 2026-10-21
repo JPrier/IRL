@@ -58,6 +58,13 @@ pub enum EventKind {
         item: ItemId,
         qty: u32,
     },
+    /// An actor recovered an item from a searched location.
+    ItemFound {
+        actor: ActorId,
+        item: ItemId,
+        qty: u32,
+        location: LocationId,
+    },
     MoneyPaid {
         from: ActorId,
         to: ActorId,
@@ -216,6 +223,12 @@ impl EventKind {
                 item,
                 qty,
             } => format!("{from} gave {qty}x{item} to {to}"),
+            EventKind::ItemFound {
+                actor,
+                item,
+                qty,
+                location,
+            } => format!("{actor} found {qty}x{item} in {location}"),
             EventKind::MoneyPaid { from, to, amount } => {
                 format!("{from} paid {amount} to {to}")
             }

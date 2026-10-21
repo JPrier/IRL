@@ -106,6 +106,17 @@ pub trait InferenceEngine: Send {
     /// Load weights and run a tiny warm-up pass. Idempotent.
     fn warm(&mut self) -> Result<(), InferenceError>;
     fn complete(&mut self, req: &InferenceRequest) -> Result<InferenceResponse, InferenceError>;
+    /// Incremental completion. Backends that support token streaming override
+    /// this; the default falls back to the buffered result.
+    fn complete_streaming(
+        &mut self,
+        req: &InferenceRequest,
+        sink: &mut dyn FnMut(&str),
+    ) -> Result<InferenceResponse, InferenceError> {
+        let response = self.complete(req)?;
+        sink(&response.text);
+        Ok(response)
+    }
     /// Cancel an in-flight request if the backend supports it.
     fn cancel(&mut self, _id: u64) -> bool {
         false

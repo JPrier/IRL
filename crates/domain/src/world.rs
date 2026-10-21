@@ -684,6 +684,9 @@ pub struct World {
 
     /// Structural damage 0..1 per location (1 = destroyed).
     pub damage: BTreeMap<LocationId, f32>,
+    /// Items lying in a location that a thorough search can recover.
+    #[serde(default)]
+    pub location_items: BTreeMap<LocationId, Vec<ItemStack>>,
     /// Global scenario flags used for explicit conditions.
     pub flags: BTreeSet<String>,
     /// Arbitrary numeric scenario counters keyed by string, used by
@@ -836,6 +839,7 @@ mod tests {
             offers: BTreeMap::new(),
             rumors: Vec::new(),
             damage: BTreeMap::new(),
+            location_items: BTreeMap::new(),
             flags: BTreeSet::new(),
             ledger: BTreeMap::new(),
             next_commitment_id: 1,

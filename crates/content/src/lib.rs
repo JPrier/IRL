@@ -974,6 +974,20 @@ pub fn build_town() -> World {
         );
     }
 
+    // Physical items hidden in the town that a search can recover. This makes
+    // the grocer's medicine-for-information quest completable in-world.
+    let mut location_items: BTreeMap<LocationId, Vec<rpg_domain::world::ItemStack>> =
+        BTreeMap::new();
+    for loc in ["warehouse", "alley"] {
+        location_items.insert(
+            LocationId::new(loc),
+            vec![rpg_domain::world::ItemStack {
+                item: ItemId::new("medicine"),
+                qty: 1,
+            }],
+        );
+    }
+
     World {
         tick: 0,
         day: 0,
@@ -989,6 +1003,7 @@ pub fn build_town() -> World {
         offers: BTreeMap::new(),
         rumors: Vec::new(),
         damage: BTreeMap::new(),
+        location_items,
         flags: BTreeSet::new(),
         ledger: BTreeMap::new(),
         next_commitment_id: 1,

@@ -9,7 +9,7 @@
 //!           wait, save, load, help, quit
 
 use rpg_domain::action::{Action, InvestigateTarget, ValidationOutcome};
-use rpg_domain::ids::{ActorId, ItemId, LocationId, PLAYER};
+use rpg_domain::ids::{ActorId, ItemId, LocationId, OfferId, PLAYER};
 use rpg_eval::Session;
 use rpg_persistence::{load_json, restore, save_json, SaveFile};
 use rpg_sim::SimConfig;
@@ -138,6 +138,19 @@ fn main() {
                     drain_events(&session, before);
                 }
             }
+            "offers" | "o" => list_offers(&session),
+            "accept" => {
+                let id: u64 = rest.parse().unwrap_or(0);
+                let out = session.player_do(Action::AcceptOffer { offer: OfferId(id) });
+                println!("{out:?}");
+                drain_events(&session, before);
+            }
+            "reject" => {
+                let id: u64 = rest.parse().unwrap_or(0);
+                let out = session.player_do(Action::RejectOffer { offer: OfferId(id) });
+                println!("{out:?}");
+                drain_events(&session, before);
+            }
             "status" | "s" => status(&session),
             "wait" | "w" => {
                 let n: u32 = rest.parse().unwrap_or(1);
@@ -186,14 +199,57 @@ fn help() {
          \x20 go <location_id>            walk to a location\n\
          \x20 talk <npc_id> <text>        speak; the NPC decides and responds\n\
          \x20 private <npc_id>            ask to talk somewhere quiet\n\
-         \x20 investigate <id>            search a location or person\n\
+         \x20 investigate <id>            search a location or person (pick up items)\n\
          \x20 give <npc_id> <item_id>     hand over an item\n\
          \x20 threaten <npc_id> <demand>  make a threat (has consequences)\n\
+         \x20 offers                      list pending offers\n\
+         \x20 accept <offer_id>           accept a pending offer\n\
+         \x20 reject <offer_id>           reject a pending offer\n\
          \x20 status                      money, beliefs, relationships, deals\n\
          \x20 wait <n>                    advance n simulation ticks\n\
          \x20 save [path] / load [path]   persist or restore the world\n\
          \x20 quit"
     );
+}
+
+fn list_offers(s: &Session) {
+    let player = ActorId::new(PLAYER);
+    let offers: Vec<_> = s
+        .sim
+        .world
+        .offers
+        .values()
+        .filter(|o| {
+            o.state == rpg_domain::social::OfferState::Pending
+                && (o.to == player || o.from == player)
+        })
+        .collect();
+    if offers.is_empty() {
+        println!("No pending offers.");
+        return;
+    }
+    for o in offers {
+        let want: Vec<String> = o
+            .want
+            .iter()
+            .map(|s| format!("{}x{}", s.qty, s.item))
+            .collect();
+        let give: Vec<String> = o
+            .give
+            .iter()
+            .map(|s| format!("{}x{}", s.qty, s.item))
+            .collect();
+        println!(
+            "#{} from {} to {}: give [{}], want [{}], condition {:?} — {}",
+            o.id.0,
+            o.from,
+            o.to,
+            give.join(", "),
+            want.join(", "),
+            o.condition,
+            o.note
+        );
+    }
 }
 
 fn look(s: &Session) {
