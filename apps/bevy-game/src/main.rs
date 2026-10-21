@@ -722,15 +722,30 @@ fn update_diagnostics(
             .iter()
             .map(|c| format!("  {} — {} ({})", c.kind, c.terms, c.state))
             .collect();
+        let beliefs = if snap.nearby_beliefs.is_empty() {
+            "—".to_string()
+        } else {
+            snap.nearby_beliefs.join("\n  ")
+        };
+        let events = if snap.recent_events.is_empty() {
+            "—".to_string()
+        } else {
+            snap.recent_events.join("\n  ")
+        };
         text.0 = format!(
-            "DIAGNOSTICS\nengine: {} ({})\ntick: {}\nmodel decisions: {}\ncanonical: {}\nfallback: {}\n\nCommitments:\n{}",
+            "DIAGNOSTICS\nengine: {} ({})\ntick: {}\nmodel decisions: {}\ncanonical: {}\nfallback: {}\nlast turn: {}\n\nPerception:\n  {}\n\nNearby relationship:\n  {}\n\nNearby beliefs (developer view):\n  {}\n\nCommitments:\n{}\n\nRecent events:\n  {}",
             snap.engine_name,
             snap.model_id,
             snap.tick,
             snap.model_decisions,
             snap.canonical_decisions,
             snap.fallback_decisions,
+            snap.last_turn_timing.as_deref().unwrap_or("—"),
+            snap.perception.join("\n  "),
+            snap.nearby_relationship.as_deref().unwrap_or("—"),
+            beliefs,
             commitments.join("\n"),
+            events,
         );
     }
 }
@@ -801,6 +816,11 @@ mod tests {
             busy: false,
             status: String::new(),
             voice_error: None,
+            recent_events: vec![],
+            nearby_beliefs: vec![],
+            nearby_relationship: None,
+            perception: vec![],
+            last_turn_timing: None,
             offers: vec![],
             commitments: vec![],
             inventory: vec![],

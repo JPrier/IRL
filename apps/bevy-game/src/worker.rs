@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rpg_domain::action::{Action, InvestigateTarget};
+use rpg_domain::action::{Action, InvestigateTarget, Loudness};
 use rpg_domain::geom::Vec2;
 use rpg_domain::ids::{ActorId, OfferId, PLAYER};
 use rpg_domain::ports::{InferenceEngine, SpeechRecognizer, SpeechRequest, SpeechSynthesizer};
@@ -148,6 +148,13 @@ pub struct Snapshot {
     pub busy: bool,
     pub status: String,
     pub voice_error: Option<String>,
+    /// Developer-diagnostics data. Rendered only in the F3 overlay, never in
+    /// the normal player UI (an NPC's beliefs are not player knowledge).
+    pub recent_events: Vec<String>,
+    pub nearby_beliefs: Vec<String>,
+    pub nearby_relationship: Option<String>,
+    pub perception: Vec<String>,
+    pub last_turn_timing: Option<String>,
     pub offers: Vec<OfferView>,
     pub commitments: Vec<CommitmentView>,
     pub inventory: Vec<ItemView>,
@@ -240,6 +247,10 @@ struct Worker {
     busy: bool,
     voice_error: Option<String>,
     cancel: Arc<AtomicBool>,
+    /// Timing of the most recent voice turn, for the developer overlay.
+    last_asr_ms: Option<u128>,
+    last_decision_ms: Option<u128>,
+    last_tts_ms: Option<u128>,
 }
 
 impl Worker {
@@ -277,6 +288,9 @@ impl Worker {
             busy: false,
             voice_error: None,
             cancel: Arc::new(AtomicBool::new(false)),
+            last_asr_ms: None,
+            last_decision_ms: None,
+            last_tts_ms: None,
         };
         if !cfg.no_voice {
             if let Err(e) = worker.load_voice() {
@@ -423,7 +437,9 @@ impl Worker {
             return;
         };
         self.status = "thinking".into();
+        let t0 = Instant::now();
         let reply = self.session.say(npc.as_str(), text);
+        self.last_decision_ms = Some(t0.elapsed().as_millis());
         match reply {
             Some(line) => {
                 self.dialogue.push(DialogueLine {
@@ -481,6 +497,7 @@ impl Worker {
 
         self.status = "transcribing".into();
         self.publish(tx);
+        let t_asr = Instant::now();
         let transcript = {
             let asr = self.asr.as_mut().expect("asr");
             match asr.transcribe(&seg.samples, seg.sample_rate) {
@@ -495,6 +512,7 @@ impl Worker {
                 }
             }
         };
+        self.last_asr_ms = Some(t_asr.elapsed().as_millis());
         if transcript.is_empty() {
             return;
         }
@@ -517,6 +535,7 @@ impl Worker {
         } else {
             tts.voice_for_actor(speaker).id
         };
+        let t0 = Instant::now();
         let audio = match tts.synthesize(&SpeechRequest {
             text: text.to_string(),
             voice_id,
@@ -532,6 +551,7 @@ impl Worker {
                 return;
             }
         };
+        self.last_tts_ms = Some(t0.elapsed().as_millis());
         // The neural model renders at its native rate; resample to the device
         // rate so playback speed is correct.
         let to_play = if audio.sample_rate == playback.sample_rate {
@@ -663,6 +683,57 @@ impl Worker {
             .unwrap_or_default();
         let money = player_inv.map(|inv| inv.money).unwrap_or(0);
 
+        // --- Developer diagnostics (F3 overlay only) ---------------------
+        let nearby_beliefs = nearby
+            .as_deref()
+            .and_then(|id| world.actor(&ActorId::new(id)))
+            .map(|a| {
+                a.beliefs
+                    .keys()
+                    .filter_map(|f| world.facts.get(f))
+                    .map(|f| format!("[{:?}] {}", f.sensitivity, f.statement).to_ascii_lowercase())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let nearby_relationship = nearby
+            .as_deref()
+            .and_then(|id| world.actor(&ActorId::new(id)))
+            .map(|a| {
+                let r = a.relationship(&ActorId::new(PLAYER));
+                format!(
+                    "trust {:.2}  affection {:.2}  respect {:.2}  fear {:.2}  anger {:.2}  suspicion {:.2}  familiar {:.2}",
+                    r.trust, r.affection, r.respect, r.fear, r.anger, r.suspicion, r.familiarity
+                )
+            });
+        let perception = vec![
+            format!("conversation radius {TALK_RADIUS}"),
+            format!(
+                "hearing: whisper {} / normal {} / loud {} / shout {}",
+                Loudness::Whisper.radius(),
+                Loudness::Normal.radius(),
+                Loudness::Loud.radius(),
+                Loudness::Shout.radius()
+            ),
+            "line of sight is wall-occluded (rpg_perception)".to_string(),
+        ];
+        let recent_events = self
+            .session
+            .sim
+            .events
+            .recent(8)
+            .iter()
+            .map(|e| format!("t{}  {}", e.tick, e.describe()))
+            .collect();
+        let last_turn_timing = match (self.last_asr_ms, self.last_decision_ms, self.last_tts_ms) {
+            (None, None, None) => None,
+            (a, d, t) => Some(format!(
+                "asr {}  decision {}  tts {}",
+                opt_ms(a),
+                opt_ms(d),
+                opt_ms(t)
+            )),
+        };
+
         Snapshot {
             tick: world.tick,
             day: world.day,
@@ -681,6 +752,11 @@ impl Worker {
             busy: self.busy,
             status: self.status.clone(),
             voice_error: self.voice_error.clone(),
+            recent_events,
+            nearby_beliefs,
+            nearby_relationship,
+            perception,
+            last_turn_timing,
             offers,
             commitments,
             inventory,
@@ -732,6 +808,11 @@ fn deinterleave(interleaved: &[f32], channels: u16) -> Vec<f32> {
         .chunks(ch)
         .map(|frame| frame.iter().sum::<f32>() / ch as f32)
         .collect()
+}
+
+/// "123 ms" or an em dash when a stage did not run.
+fn opt_ms(v: Option<u128>) -> String {
+    v.map(|m| format!("{m} ms")).unwrap_or_else(|| "—".into())
 }
 
 /// Human-readable name for an actor id (falls back to the raw id).
@@ -851,6 +932,11 @@ mod tests {
             busy: false,
             status: String::new(),
             voice_error: None,
+            recent_events: vec![],
+            nearby_beliefs: vec![],
+            nearby_relationship: None,
+            perception: vec![],
+            last_turn_timing: None,
             offers: vec![],
             commitments: vec![],
             inventory: vec![],
