@@ -196,6 +196,10 @@ fn parse_args() -> WorkerConfig {
                 }
             }
             "--no-voice" => no_voice = true,
+            "--doctor" | "--paths" => {
+                println!("{}", worker::doctor_report());
+                std::process::exit(0);
+            }
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -204,6 +208,10 @@ fn parse_args() -> WorkerConfig {
         }
         i += 1;
     }
+
+    // With no explicit `--model`, fall back to a model bundled next to the
+    // executable so a shipped build runs with no arguments.
+    let model_path = model_path.or_else(worker::bundled_model);
 
     WorkerConfig {
         seed,

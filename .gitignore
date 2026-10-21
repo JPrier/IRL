@@ -5,3 +5,4 @@ agentic_rpg_save.json
 .DS_Store
 
 .cache/
+/dist/

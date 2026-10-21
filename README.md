@@ -85,6 +85,30 @@ Speech assets are pinned by URL + SHA-256 in
 the same way in [`assets/models/manifest.json`](assets/models/manifest.json).
 Setup verifies every checksum and fails loudly on a mismatch.
 
+### Ship it as a standalone bundle (no Rust needed)
+
+A packaged build needs no Cargo and no setup step. `scripts/package.sh`
+(Windows: `scripts/package.ps1`) builds a self-contained folder — the
+executable, its native libraries (`onnxruntime.dll`, `sherpa-onnx-*.dll`,
+`*.dylib`), and the speech + model assets:
+
+```bash
+make dist          # dist/IRL-<os>-<arch>/  — fully self-contained (~1.2 GiB)
+make dist-slim     # executable + libraries only; fetches assets on first run
+```
+
+The executable resolves assets **relative to itself**, so the folder can be
+zipped, moved to another machine, and run directly:
+
+```bash
+dist/IRL-linux-x86_64/run.sh          # or run.cmd on Windows
+```
+
+Check what a build resolved with `bevy-game --doctor`, and override the asset
+location with `IRL_HOME=/some/dir`. Pushing a `v*` tag (or running the
+**release** workflow) builds these bundles for Linux, Windows and macOS and
+uploads them as artifacts.
+
 ### Controls (graphical client)
 
 `WASD` walk · `V` hold a voice conversation · `Y`/`N` accept/reject an offer ·
