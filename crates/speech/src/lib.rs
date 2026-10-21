@@ -85,8 +85,10 @@ pub fn decode_wav(bytes: &[u8]) -> Result<SpeechAudio, SpeechError> {
         i = body_start + size + (size & 1);
     }
     let samples = data
-        .chunks_exact(2)
-        .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / i16::MAX as f32)
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| i16::from_le_bytes(*c) as f32 / i16::MAX as f32)
         .collect();
     Ok(SpeechAudio {
         samples,
