@@ -1,0 +1,71 @@
+{
+  "version": 1,
+  "description": "Offline neural speech assets for IRL. No cloud services are used at runtime. Every file is pinned by URL and SHA-256; licenses are recorded per asset.",
+  "bundles": [
+    {
+      "id": "silero-vad",
+      "kind": "vad",
+      "description": "Silero VAD ONNX model used for voice activity detection and utterance segmentation.",
+      "license": "MIT",
+      "attribution": "Silero VAD (snakers4/silero-vad), redistributed by sherpa-onnx.",
+      "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx",
+      "sha256": "9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6",
+      "bytes": 643854,
+      "format": "raw",
+      "extract_dir": null,
+      "files": {
+        "vad_model": "silero_vad.onnx"
+      },
+      "voices": []
+    },
+    {
+      "id": "kokoro-en-v0_19",
+      "kind": "tts",
+      "description": "Kokoro 82M English multi-speaker neural TTS (11 voices).",
+      "license": "Apache-2.0",
+      "attribution": "Kokoro TTS (hexgrad/Kokoro-82M), converted and packaged by sherpa-onnx. Model weights Apache-2.0; voice embeddings from the same release.",
+      "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-en-v0_19.tar.bz2",
+      "sha256": "912804855a04745fa77a30be545b3f9a5d15c4d66db00b88cbcd4921df605ac7",
+      "bytes": 319625534,
+      "format": "tar.bz2",
+      "extract_dir": "kokoro-en-v0_19",
+      "files": {
+        "model": "kokoro-en-v0_19/model.onnx",
+        "voices": "kokoro-en-v0_19/voices.bin",
+        "tokens": "kokoro-en-v0_19/tokens.txt",
+        "data_dir": "kokoro-en-v0_19/espeak-ng-data"
+      },
+      "voices": [
+        { "id": "af_alloy",   "display_name": "Alloy (US female)",    "sid": 0,  "language": "en-us" },
+        { "id": "af_bella",   "display_name": "Bella (US female)",    "sid": 1,  "language": "en-us" },
+        { "id": "af_nicole",  "display_name": "Nicole (US female)",   "sid": 2,  "language": "en-us" },
+        { "id": "af_sarah",   "display_name": "Sarah (US female)",    "sid": 3,  "language": "en-us" },
+        { "id": "af_sky",     "display_name": "Sky (US female)",      "sid": 4,  "language": "en-us" },
+        { "id": "am_adam",    "display_name": "Adam (US male)",       "sid": 5,  "language": "en-us" },
+        { "id": "am_michael", "display_name": "Michael (US male)",    "sid": 6,  "language": "en-us" },
+        { "id": "bf_emma",    "display_name": "Emma (UK female)",     "sid": 7,  "language": "en-gb" },
+        { "id": "bf_isabella","display_name": "Isabella (UK female)", "sid": 8,  "language": "en-gb" },
+        { "id": "bm_george",  "display_name": "George (UK male)",     "sid": 9,  "language": "en-gb" },
+        { "id": "bm_lewis",   "display_name": "Lewis (UK male)",      "sid": 10, "language": "en-gb" }
+      ]
+    },
+    {
+      "id": "whisper-tiny-en",
+      "kind": "asr",
+      "description": "OpenAI Whisper tiny.en offline ASR (English), int8-quantized ONNX via sherpa-onnx.",
+      "license": "MIT",
+      "attribution": "Whisper (OpenAI), MIT licensed; ONNX conversion and int8 quantization by sherpa-onnx.",
+      "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-tiny.en.tar.bz2",
+      "sha256": "2bd6cf965c8bb3e068ef9fa2191387ee63a9dfa2a4e37582a8109641c20005dd",
+      "bytes": 118071777,
+      "format": "tar.bz2",
+      "extract_dir": "sherpa-onnx-whisper-tiny.en",
+      "files": {
+        "encoder": "sherpa-onnx-whisper-tiny.en/tiny.en-encoder.int8.onnx",
+        "decoder": "sherpa-onnx-whisper-tiny.en/tiny.en-decoder.int8.onnx",
+        "tokens": "sherpa-onnx-whisper-tiny.en/tiny.en-tokens.txt"
+      },
+      "voices": []
+    }
+  ]
+}

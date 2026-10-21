@@ -83,6 +83,7 @@ pub fn test_world() -> World {
         offers: BTreeMap::new(),
         rumors: Vec::new(),
         damage: BTreeMap::new(),
+        location_items: BTreeMap::new(),
         flags: BTreeSet::new(),
         ledger: BTreeMap::new(),
         next_commitment_id: 1,
@@ -260,6 +261,7 @@ fn offer_pending_then_transfers_on_accept() {
             }],
             want: vec![],
             condition: None,
+            disclose: None,
             note: "take the ledger".into(),
         },
     );
@@ -371,6 +373,11 @@ fn investigate_reveals_placed_clue() {
         },
     );
     assert!(decision.is_accepted());
+    // Searching is local: move into the room first.
+    if let Some(p) = s.world.actor_mut(&ActorId::new(PLAYER)) {
+        p.location = LocationId::new("backroom");
+        p.pos = Vec2::new(3.0, 9.0);
+    }
     assert_eq!(
         s.apply(&proposal(
             PLAYER,
@@ -383,6 +390,88 @@ fn investigate_reveals_placed_clue() {
     assert!(s
         .world
         .believes(&ActorId::new(PLAYER), &FactId::new("shipment")));
+}
+
+#[test]
+fn cannot_investigate_a_distant_location() {
+    let mut s = sim();
+    let out = s.apply(&proposal(
+        PLAYER,
+        Action::Investigate {
+            target: InvestigateTarget::Location(LocationId::new("backroom")),
+        },
+    ));
+    assert!(matches!(
+        out,
+        ValidationOutcome::Rejected(RejectReason::OutOfRange)
+    ));
+}
+
+#[test]
+fn restore_full_preserves_rng_and_movement_for_exact_continuation() {
+    let mut s = sim();
+    // Send the player on a multi-tick path, then snapshot mid-walk.
+    let _ = s.apply(&proposal(
+        PLAYER,
+        Action::MoveTo {
+            location: LocationId::new("warehouse"),
+        },
+    ));
+    s.move_actors();
+    let mut restored = Simulation::restore_full(
+        s.seed,
+        s.world.clone(),
+        s.events.clone(),
+        s.rng.clone(),
+        s.transient(),
+        s.ops.clone(),
+        s.initial_world.clone(),
+        s.config.clone(),
+    );
+
+    // Continue both simulations and compare canonical state exactly.
+    for _ in 0..10 {
+        s.step(vec![]);
+        restored.step(vec![]);
+    }
+    assert_eq!(
+        serde_json::to_string(&s.world).unwrap(),
+        serde_json::to_string(&restored.world).unwrap(),
+        "world diverged after restoring mid-movement"
+    );
+    assert_eq!(s.events.checksum(), restored.events.checksum());
+}
+
+#[test]
+fn proposal_replay_reconstructs_identical_world() {
+    let mut s = sim();
+    let _ = s.apply(&proposal(
+        PLAYER,
+        Action::Speak {
+            target: Some(ActorId::new("grocer")),
+            text: "hello".into(),
+            loudness: Loudness::Normal,
+        },
+    ));
+    s.step(vec![]);
+    let _ = s.apply(&proposal(
+        PLAYER,
+        Action::Threaten {
+            target: ActorId::new("grocer"),
+            demand: "ledger".into(),
+        },
+    ));
+    for _ in 0..5 {
+        s.step(vec![]);
+    }
+    let replayed =
+        rpg_sim::Simulation::replay_ops(s.initial_world.clone(), s.seed, s.config.clone(), &s.ops);
+    assert_eq!(
+        serde_json::to_string(&s.world).unwrap(),
+        serde_json::to_string(&replayed.world).unwrap(),
+        "proposal replay did not reconstruct the world"
+    );
+    assert_eq!(s.events.checksum(), replayed.events.checksum());
 }
 
 #[test]

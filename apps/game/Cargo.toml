@@ -13,3 +13,4 @@ rpg_agents.workspace = true
 rpg_content.workspace = true
 rpg_eval.workspace = true
 rpg_persistence.workspace = true
+rpg_inference.workspace = true

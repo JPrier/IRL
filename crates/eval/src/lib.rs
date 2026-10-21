@@ -12,6 +12,7 @@ use rpg_agents::{HeuristicEngine, NpcPolicy};
 use rpg_content::build_town;
 use rpg_domain::action::{
     Action, ActionProposal, InvestigateTarget, Loudness, ProposalSource, QuestPredicate,
+    ValidationOutcome,
 };
 use rpg_domain::ids::*;
 use rpg_domain::ports::InferenceEngine;
@@ -23,10 +24,18 @@ pub struct Session {
     pub engine: Box<dyn InferenceEngine>,
     pub next_request: u64,
     pub trace: Vec<String>,
+    /// Provenance of every NPC decision, in order.
+    pub decisions: Vec<(String, rpg_agents::DecisionSource)>,
 }
 
 impl Session {
     pub fn new(seed: u64) -> Self {
+        Self::with_engine(seed, Box::new(HeuristicEngine::new()))
+    }
+
+    /// Build a session driven by a specific inference backend. The engine is
+    /// retained for the whole session, so model weights load once.
+    pub fn with_engine(seed: u64, engine: Box<dyn InferenceEngine>) -> Self {
         let config = SimConfig {
             enable_background: true,
             enable_director: true,
@@ -34,10 +43,59 @@ impl Session {
         };
         Self {
             sim: Simulation::new(build_town(), seed, config),
-            engine: Box::new(HeuristicEngine::new()),
+            engine,
             next_request: 1,
             trace: Vec::new(),
+            decisions: Vec::new(),
         }
+    }
+
+    /// True when this session is backed by a real local model.
+    pub fn is_real_model(&self) -> bool {
+        self.engine.is_real_model()
+    }
+
+    pub fn engine_name(&self) -> String {
+        self.engine.engine_name()
+    }
+
+    pub fn model_id(&self) -> String {
+        self.engine.model_id()
+    }
+
+    /// Recover the engine so a resident model can be reused across sessions.
+    pub fn into_engine(self) -> Box<dyn InferenceEngine> {
+        self.engine
+    }
+
+    /// NPC turns answered by the real model.
+    pub fn model_decisions(&self) -> usize {
+        self.decisions
+            .iter()
+            .filter(|(_, s)| matches!(s, rpg_agents::DecisionSource::Model))
+            .count()
+    }
+
+    /// NPC turns where a canonical obligation determined the action.
+    pub fn canonical_decisions(&self) -> usize {
+        self.decisions
+            .iter()
+            .filter(|(_, s)| {
+                matches!(
+                    s,
+                    rpg_agents::DecisionSource::CanonicalObligation { .. }
+                        | rpg_agents::DecisionSource::CanonicalAgenda { .. }
+                )
+            })
+            .count()
+    }
+
+    /// NPC turns that required the deterministic fallback (reported, never hidden).
+    pub fn fallback_decisions(&self) -> usize {
+        self.decisions
+            .iter()
+            .filter(|(_, s)| matches!(s, rpg_agents::DecisionSource::HeuristicFallback { .. }))
+            .count()
     }
 
     pub fn player(&self) -> &rpg_domain::world::Actor {
@@ -64,7 +122,12 @@ impl Session {
 
     /// Player speaks, then the addressed NPC decides and acts through the
     /// shared policy + inference engine.
-    pub fn say(&mut self, target: &str, text: &str) {
+    ///
+    /// Returns the NPC's spoken reply text when the accepted action was
+    /// `Speak`, so a voice client can synthesize exactly what the character
+    /// said. Returns `None` when the speech did not reach the NPC or the NPC
+    /// chose a non-verbal action.
+    pub fn say(&mut self, target: &str, text: &str) -> Option<String> {
         let target_id = ActorId::new(target);
         let out = self.player_do(Action::Speak {
             target: Some(target_id.clone()),
@@ -73,14 +136,32 @@ impl Session {
         });
         self.trace
             .push(format!("player -> {target}: {text} [{out:?}]"));
-        self.npc_respond(target, text);
+        // An NPC can only answer speech that actually reached them (in range
+        // and audible). Rejected speech must not burn inference or produce an
+        // impossible response.
+        if matches!(out, ValidationOutcome::Accepted) {
+            self.npc_respond(target, text)
+        } else {
+            None
+        }
     }
 
-    pub fn npc_respond(&mut self, npc: &str, text: &str) {
+    /// Run the NPC decision for a heard utterance and return the line the NPC
+    /// should speak aloud, when the accepted action has one.
+    ///
+    /// * `Speak` → its `text`.
+    /// * `MakeOffer` → its `note` ("what you promise in return").
+    /// * `Promise` → its `terms`.
+    /// * `Threaten` → its `demand`.
+    ///
+    /// These fields are the character's own words as committed by the
+    /// authoritative simulation; the voice client reads exactly this text and
+    /// never invents dialogue.
+    pub fn npc_respond(&mut self, npc: &str, text: &str) -> Option<String> {
         let npc_id = ActorId::new(npc);
         let player = ActorId::new(PLAYER);
         let policy = NpcPolicy;
-        let proposal = policy.respond(
+        let decision = policy.decide(
             &self.sim.world,
             &npc_id,
             &player,
@@ -89,9 +170,20 @@ impl Session {
             self.next_request,
         );
         self.next_request += 1;
-        let kind = proposal.action.kind_name().to_string();
-        let out = self.sim.apply(&proposal);
-        self.trace.push(format!("{npc} -> {kind}: {out:?}"));
+        let kind = decision.proposal.action.kind_name().to_string();
+        let source = decision.source.clone();
+        let spoken = spoken_line_in(&self.sim.world, &decision.proposal.action);
+        let out = self.sim.apply(&decision.proposal);
+        self.trace
+            .push(format!("{npc} -> {kind} [{}]: {out:?}", source.label()));
+        self.decisions.push((npc.to_string(), source));
+        // A `Pending` outcome means the offer/promise was recorded and awaits
+        // acceptance — the character still spoke the line. Only a rejection
+        // means nothing was said.
+        match out {
+            ValidationOutcome::Rejected(_) => None,
+            _ => spoken,
+        }
     }
 
     pub fn tick(&mut self) -> StepReport {
@@ -134,11 +226,76 @@ impl Session {
     pub fn checksum(&self) -> u64 {
         self.sim.events.checksum()
     }
+
+    /// Walk to a location and advance ticks until arrival.
+    pub fn goto(&mut self, location: &str) {
+        let out = self.player_do(Action::MoveTo {
+            location: LocationId::new(location),
+        });
+        if matches!(out, ValidationOutcome::Accepted) {
+            let player = ActorId::new(PLAYER);
+            let mut guard = 0;
+            while self.sim.paths.contains_key(&player) && guard < 200 {
+                let _ = self.tick();
+                guard += 1;
+            }
+        }
+    }
+
+    /// Advance until all movement and private-conversation walks settle.
+    pub fn wait_settled(&mut self, max_ticks: u32) {
+        let mut n = 0;
+        while (!self.sim.paths.is_empty() || !self.sim.pending_private.is_empty()) && n < max_ticks
+        {
+            let _ = self.tick();
+            n += 1;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Results
 // ---------------------------------------------------------------------------
+
+/// The words an accepted NPC action should be spoken as, if any.
+///
+/// This is the character's own committed text: `Speak.text`, an offer's
+/// `note`, a promise's `terms`, or a threat's `demand`. It deliberately ignores
+/// mechanical fields (item lists, fact ids) and returns `None` for silent
+/// actions, so the voice client never fabricates dialogue.
+pub fn spoken_line(action: &Action) -> Option<String> {
+    let candidate = match action {
+        Action::Speak { text, .. } => text,
+        Action::MakeOffer { note, .. } => note,
+        Action::Promise { terms, .. } => terms,
+        Action::Threaten { demand, .. } => demand,
+        _ => return None,
+    };
+    let trimmed = candidate.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Like [`spoken_line`], but also renders actions whose words live in the world
+/// model.
+///
+/// `ShareClaim` is how an NPC discloses a fact they believe. Its audible text is
+/// the fact's canonical `statement`; the simulation only accepts the claim when
+/// the speaker actually believes it, so speaking the statement never leaks a
+/// secret the character could not know.
+pub fn spoken_line_in(world: &rpg_domain::world::World, action: &Action) -> Option<String> {
+    if let Action::ShareClaim { fact, .. } = action {
+        return world
+            .facts
+            .get(fact)
+            .map(|f| f.statement.trim().to_string())
+            .filter(|s| !s.is_empty());
+    }
+    spoken_line(action)
+}
 
 #[derive(Clone, Debug)]
 pub struct Check {
@@ -301,10 +458,12 @@ fn friendly_investigation(seed: u64) -> ScenarioResult {
     s.teleport_player_to("priest");
     s.say("priest", "Do you know who is threatening the shopkeepers?");
 
-    // Explore two locations to find any placed clues.
+    // Explore two locations to find any placed clues (must be physically there).
+    s.goto("warehouse");
     s.player_do(Action::Investigate {
         target: InvestigateTarget::Location(LocationId::new("warehouse")),
     });
+    s.goto("alley");
     s.player_do(Action::Investigate {
         target: InvestigateTarget::Location(LocationId::new("alley")),
     });
@@ -456,9 +615,11 @@ fn private_conversation_and_spy(seed: u64) -> ScenarioResult {
     check(
         &mut checks,
         "privacy_accepted",
-        matches!(out, rpg_domain::action::ValidationOutcome::Accepted),
+        matches!(out, ValidationOutcome::Accepted),
         format!("{out:?}"),
     );
+    // Privacy takes real movement, not a teleport.
+    s.wait_settled(50);
     let grocer_loc = s
         .sim
         .world
@@ -819,6 +980,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn share_claim_speaks_the_grounded_fact_statement() {
+        let session = Session::new(2026);
+        let claim = Action::ShareClaim {
+            target: ActorId::new(PLAYER),
+            fact: FactId::new("f_grocer_ledger"),
+            assertive: true,
+        };
+        let line = spoken_line_in(&session.sim.world, &claim).expect("statement");
+        assert!(line.contains("ledger"), "unexpected line: {line}");
+
+        // A purely mechanical action still has no spoken line.
+        let silent = Action::Investigate {
+            target: InvestigateTarget::Location(LocationId::new("plaza")),
+        };
+        assert!(spoken_line_in(&session.sim.world, &silent).is_none());
+    }
+
+    #[test]
     fn all_builtin_scenarios_pass() {
         let results = run_all(2026);
         let failed: Vec<_> = results.iter().filter(|r| !r.passed()).collect();
@@ -840,5 +1019,63 @@ mod tests {
             let b = run_replay_script(seed);
             assert_eq!(a.checksum(), b.checksum(), "seed {seed}");
         }
+    }
+
+    /// No-weights regression test for the real-model interaction shape: a
+    /// scripted model that only "speaks" still gets the canonical bargain,
+    /// and the satisfied deal is honoured on the next turn.
+    #[test]
+    fn scripted_model_bargain_is_honoured_canonically() {
+        let engine =
+            rpg_agents::ScriptedEngine::new().with_default(r#"{"action":"speak","text":"Hmm."}"#);
+        let mut s = Session::with_engine(2026, Box::new(engine));
+        s.teleport_player_to("grocer");
+        s.say("grocer", "I need to see your ledger.");
+
+        let offer = s
+            .sim
+            .world
+            .offers
+            .values()
+            .find(|o| o.from.as_str() == "grocer")
+            .cloned()
+            .expect("canonical agenda should create a conditional offer");
+        match &offer.condition {
+            Some(QuestPredicate::HasItem { item, .. }) => assert_eq!(item.as_str(), "medicine"),
+            other => panic!("expected medicine condition, got {other:?}"),
+        }
+        assert_eq!(
+            offer.disclose.as_ref().map(|f| f.as_str()),
+            Some("f_grocer_ledger")
+        );
+        assert!(matches!(
+            s.player_do(Action::AcceptOffer { offer: offer.id }),
+            ValidationOutcome::Accepted
+        ));
+        s.give("medicine", 1);
+        assert!(matches!(
+            s.player_do(Action::TransferItem {
+                target: ActorId::new("grocer"),
+                item: ItemId::new("medicine"),
+                qty: 1,
+            }),
+            ValidationOutcome::Accepted
+        ));
+        s.tick();
+        assert!(
+            s.sim
+                .world
+                .commitments
+                .values()
+                .any(|c| c.state == rpg_domain::social::CommitmentState::Satisfied),
+            "medicine delivery should satisfy the deal"
+        );
+        s.say("grocer", "Now the ledger, as we agreed.");
+        assert!(
+            s.sim
+                .world
+                .believes(&ActorId::new(PLAYER), &FactId::new("f_grocer_ledger")),
+            "player should learn the ledger fact once the deal is honoured"
+        );
     }
 }

@@ -92,6 +92,8 @@ pub enum InferenceError {
     MissingAsset(String),
     #[error("inference timed out after {0} ms")]
     Timeout(u64),
+    #[error("inference cancelled")]
+    Cancelled,
     #[error("backend error: {0}")]
     Backend(String),
     #[error("structured output failed schema validation: {0}")]
@@ -103,9 +105,25 @@ pub enum InferenceError {
 pub trait InferenceEngine: Send {
     fn engine_name(&self) -> String;
     fn model_id(&self) -> String;
+    /// Whether this engine runs a real local model. Deterministic baselines
+    /// return `false` so callers never report a heuristic answer as AI output.
+    fn is_real_model(&self) -> bool {
+        true
+    }
     /// Load weights and run a tiny warm-up pass. Idempotent.
     fn warm(&mut self) -> Result<(), InferenceError>;
     fn complete(&mut self, req: &InferenceRequest) -> Result<InferenceResponse, InferenceError>;
+    /// Incremental completion. Backends that support token streaming override
+    /// this; the default falls back to the buffered result.
+    fn complete_streaming(
+        &mut self,
+        req: &InferenceRequest,
+        sink: &mut dyn FnMut(&str),
+    ) -> Result<InferenceResponse, InferenceError> {
+        let response = self.complete(req)?;
+        sink(&response.text);
+        Ok(response)
+    }
     /// Cancel an in-flight request if the backend supports it.
     fn cancel(&mut self, _id: u64) -> bool {
         false

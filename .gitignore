@@ -3,3 +3,5 @@
 agentic_rpg_save.json
 *.wav
 .DS_Store
+
+.cache/

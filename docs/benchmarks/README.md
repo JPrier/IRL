@@ -1,8 +1,12 @@
 # Benchmark evidence
 
 Everything below was produced by the commands shown, on the host described.
-**Read the caveats**: the speech numbers come from a diagnostic, non-neural
-device, and no real LLM measurements have been taken.
+**Read the caveats**: the diagnostic speech numbers in §3 come from a
+non-neural device and are labelled as such. **Real neural TTS/ASR has since
+been integrated and measured** — see [`voice-neural.md`](voice-neural.md) for
+Kokoro TTS and Whisper ASR latency and real-time factors on the same host. The
+LLM numbers *are* from a real local GGUF model (see §5), but only the 0.8B model
+has been measured.
 
 ## Host
 
@@ -66,13 +70,18 @@ underruns=0 min_lead≈5.75s`.
 
 > **These are not neural-TTS results.** `DiagnosticToneSynth` is a clearly
 > labelled non-neural device that writes real PCM so the WAV path and buffer
-> accounting can be tested. A neural backend must be measured separately against
-> the ≥1.5× P05 target; no such numbers exist yet.
+> accounting can be tested. It remains useful as a device-independent CI signal.
+>
+> **Real neural results now exist.** Kokoro TTS runs at ~3× real time and
+> Whisper ASR at ~27× real time on the development host; the ≥1.5× P05 target is
+> met for both. See [`voice-neural.md`](voice-neural.md) for the measured table,
+> reproduction commands and honest caveats (whole-utterance TTS, one host).
 
-The neural backend correctly reports:
+The neural backend correctly reports a loud, actionable error when assets are
+absent instead of fabricating audio:
 
 ```
-neural backend status: speech asset missing: assets/voices/<licensed-model>.onnx
+neural backend status: speech asset missing: assets/speech/models/...
 ```
 
 ## 4. Model matrix status
@@ -85,21 +94,76 @@ cargo run -p model-bench -- --list-models
 |---|---|
 | heuristic (no-LLM baseline) | VERIFIED-DETERMINISTIC |
 | scripted (test double) | VERIFIED-DETERMINISTIC |
-| Qwen3.5-0.8B / 2B / 4B | NOT TESTED |
+| Qwen3.5-0.8B-Q4_K_M | **MEASURED** (real GGUF, CPU) |
+| Qwen3.5-2B / 4B | NOT TESTED |
 | Qwen3-1.7B | NOT TESTED |
 | LFM2.5-1.2B-Instruct | NOT TESTED |
 | Gemma 3 1B | NOT TESTED |
 
+## 5. Real local LLM — Qwen3.5-0.8B-Q4_K_M (CPU)
+
+```bash
+cargo run -p model-bench -- --profile docs/benchmarks/qwen35-0.8b.json \
+  --turns 3 --seed 2026 --json --out docs/benchmarks/qwen35-0.8b-report.json
+```
+
+Profile: `.cache/models/Qwen3.5-0.8B-Q4_K_M.gguf` (507 MiB), `n_ctx=4096`,
+`n_threads=8`, CPU only. The model file is gitignored; the raw report is
+committed at [`qwen35-0.8b-report.json`](qwen35-0.8b-report.json).
+
+| Metric | Value |
+|---|---:|
+| Load time | 576 ms |
+| Warm-up time | 257 ms |
+| Avg prefill | 777 ms |
+| Avg first token | 40 ms |
+| Avg decode | 2630 ms |
+| Decode throughput | 11.0 tok/s |
+| Structured JSON validity | 3/3 (100%) |
+| Invalid / rejected decisions | 0 |
+| Peak RSS | not measurable on Windows (reported `null`) |
+
+Dialogue probe (unconstrained, `no_think`): 26 tokens in 554 ms, non-empty,
+**no reasoning block leaked** into the output.
+
+Repeated gameplay (3 seeds): `gameplay_pass_rate = 1.0`; each run negotiated the
+conditional bargain, satisfied the commitment and disclosed `f_grocer_ledger`
+(`memory_consistent = true`), with **0 deterministic fallbacks**. When the
+model's own action does not honour a satisfied deal, the policy substitutes the
+canonical action and reports `canonical-obligation`/`canonical-agenda` — those
+are counted separately and never presented as model output.
+
+Real-model regression tests (weights required, `#[ignore]` by default):
+
+```bash
+RPG_TEST_MODEL=.cache/models/Qwen3.5-0.8B-Q4_K_M.gguf \
+  cargo test -p rpg_inference --test model_integration -- --ignored
+```
+
+They cover 5 repeated schema-valid JSON decisions, malformed grammars failing
+loudly, cancellation, and deadlines.
+
 ## NOT TESTED (explicit)
 
-* First-token / first-audio latency for any real LLM.
-* Neural TTS real-time factor, naturalness, voice differentiation.
-* ASR accuracy on game vocabulary, accents, noise, interruption.
+* Any model larger than 0.8B (2B/4B/other families).
 * GPU/Vulkan/ROCm/CUDA paths, VRAM peaks, thermal throttling.
+* Streaming neural TTS / barge-in (Kokoro is whole-utterance; first audio
+  arrives after synthesis completes — measured in `voice-neural.md`).
+* ASR accuracy on game vocabulary, accents, noise, interruption.
+* Neural voice *quality* scoring beyond intelligibility/RTF (no MOS panel).
 * Steam Deck and low-end integrated GPU.
 * Human blind playtests and inter-rater quality scoring.
 * 90% line coverage instrumentation (tests exist; `tarpaulin`/`llvm-cov` is not
   wired into CI).
+
+Neural TTS/ASR real-time factor **is** now measured; see
+[`voice-neural.md`](voice-neural.md). The **integrated**
+WAV→ASR→LLM→TTS pipeline (all engines resident and CPU-contending) is also
+measured, including the observation that TTS slows to 1.24–2.13× under that
+contention; see [`voice-integrated.md`](voice-integrated.md). Model **behaviour**
+beyond the single scripted bargain is also evaluated across eight unrelated
+player phrasings, with model-vs-canonical provenance split out; see
+[`behavior-milestone-d.md`](behavior-milestone-d.md).
 
 Publishing a "Steam Deck compatible" or "faster than speech" claim without
 running the corresponding row is explicitly forbidden by the design brief.

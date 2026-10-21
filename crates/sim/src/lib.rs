@@ -18,10 +18,13 @@ use rpg_domain::geom::Vec2;
 use rpg_domain::ids::*;
 use rpg_domain::rng::DeterministicRng;
 use rpg_domain::social::{CommitmentKind, Offer, OfferState};
-use rpg_domain::world::{evaluate_predicate, Actor, ActorKind, ContainerKind, Sensitivity, World};
+use rpg_domain::world::{
+    evaluate_predicate, Actor, ActorKind, ContainerKind, LocationKind, Sensitivity, World,
+};
 use rpg_narrative::{self as narrative, Decision, NarrativeChange};
 use rpg_perception::PerceptionEngine;
 use rpg_social as social;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Tunable, scenario-fixed simulation parameters.
@@ -67,23 +70,62 @@ pub struct StepReport {
     pub director_notes: Vec<String>,
 }
 
+/// A pending private conversation: both actors are walking to `location`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PendingPrivate {
+    pub a: ActorId,
+    pub b: ActorId,
+    pub location: LocationId,
+}
+
+/// State that is not canonical world truth but must survive save/load so that
+/// subsequent simulation is bit-identical.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SimTransient {
+    pub paths: BTreeMap<ActorId, Vec<Vec2>>,
+    pub pending_private: Vec<PendingPrivate>,
+    pub last_incident_minute: u64,
+}
+
+/// A recorded public entry point, used for input/proposal replay.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum SimOp {
+    /// A direct `apply` call. Boxed to keep the enum small: `ActionProposal`
+    /// is much larger than a `Vec` of proposals and this is a hot replay type.
+    Apply(Box<ActionProposal>),
+    /// A full `step` with its external proposals.
+    Step(Vec<ActionProposal>),
+}
+
 #[derive(Clone, Debug)]
 pub struct Simulation {
+    /// The original seed, distinct from the live RNG state.
+    pub seed: u64,
     pub world: World,
     pub events: EventLog,
     pub rng: DeterministicRng,
     pub perception: PerceptionEngine,
     pub config: SimConfig,
-    /// Transient movement paths (never persisted; rebuilt from intent).
+    /// Transient movement paths (persisted so continuation is exact).
     pub paths: BTreeMap<ActorId, Vec<Vec2>>,
     /// Human-readable trace used by debug overlays and failure diagnostics.
     pub trace: Vec<String>,
     last_incident_minute: u64,
+    /// World state at the start of the simulation, kept for exact replay.
+    pub initial_world: World,
+    /// Recorded public entry points (proposal replay).
+    pub ops: Vec<SimOp>,
+    /// Pending private-conversation walks.
+    pub pending_private: Vec<PendingPrivate>,
+    /// When false, `apply`/`step` do not append to `ops` (used during replay).
+    pub recording: bool,
 }
 
 impl Simulation {
     pub fn new(world: World, seed: u64, config: SimConfig) -> Self {
         Self {
+            seed,
+            initial_world: world.clone(),
             world,
             events: EventLog::new(),
             rng: DeterministicRng::new(seed),
@@ -92,6 +134,9 @@ impl Simulation {
             paths: BTreeMap::new(),
             trace: Vec::new(),
             last_incident_minute: 0,
+            ops: Vec::new(),
+            pending_private: Vec::new(),
+            recording: true,
         }
     }
 
@@ -101,6 +146,63 @@ impl Simulation {
         let mut sim = Self::new(world, seed, config);
         sim.events = events;
         sim.last_incident_minute = last_incident_minute;
+        sim
+    }
+
+    /// Restore the full state needed for bit-identical continuation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn restore_full(
+        seed: u64,
+        world: World,
+        events: EventLog,
+        rng: DeterministicRng,
+        transient: SimTransient,
+        ops: Vec<SimOp>,
+        initial_world: World,
+        config: SimConfig,
+    ) -> Self {
+        Self {
+            seed,
+            world,
+            events,
+            rng,
+            perception: PerceptionEngine::default(),
+            config,
+            paths: transient.paths,
+            trace: Vec::new(),
+            last_incident_minute: transient.last_incident_minute,
+            initial_world,
+            ops,
+            pending_private: transient.pending_private,
+            recording: true,
+        }
+    }
+
+    /// Transient state that must be persisted for exact continuation.
+    pub fn transient(&self) -> SimTransient {
+        SimTransient {
+            paths: self.paths.clone(),
+            pending_private: self.pending_private.clone(),
+            last_incident_minute: self.last_incident_minute,
+        }
+    }
+
+    /// Re-run a recorded entry-point log from the initial world. This is an
+    /// input/proposal replay: it reconstructs canonical state exactly without
+    /// re-running stochastic inference.
+    pub fn replay_ops(initial_world: World, seed: u64, config: SimConfig, ops: &[SimOp]) -> Self {
+        let mut sim = Self::new(initial_world, seed, config);
+        sim.recording = false;
+        for op in ops {
+            match op {
+                SimOp::Apply(p) => {
+                    let _ = sim.apply_impl(p);
+                }
+                SimOp::Step(props) => {
+                    let _ = sim.step_impl(props.clone());
+                }
+            }
+        }
         sim
     }
 
@@ -230,6 +332,10 @@ impl Simulation {
                     if self.world.location(l).is_none() {
                         return Err(RejectReason::UnknownLocation(l.clone()));
                     }
+                    // You must actually be there; no remote investigation.
+                    if actor.location != *l {
+                        return Err(RejectReason::OutOfRange);
+                    }
                 }
                 InvestigateTarget::Actor(a) => {
                     in_range(a)?;
@@ -331,6 +437,13 @@ impl Simulation {
     // -----------------------------------------------------------------
 
     pub fn apply(&mut self, proposal: &ActionProposal) -> ValidationOutcome {
+        if self.recording {
+            self.ops.push(SimOp::Apply(Box::new(proposal.clone())));
+        }
+        self.apply_impl(proposal)
+    }
+
+    fn apply_impl(&mut self, proposal: &ActionProposal) -> ValidationOutcome {
         if let Err(reason) = self.validate(proposal) {
             self.reject(proposal, &reason);
             return ValidationOutcome::Rejected(reason);
@@ -378,8 +491,9 @@ impl Simulation {
                 give,
                 want,
                 condition,
+                disclose,
                 note,
-            } => self.do_make_offer(proposal, target, give, want, condition, note),
+            } => self.do_make_offer(proposal, target, give, want, condition, disclose, note),
             Action::AcceptOffer { offer } => self.do_accept_offer(proposal, offer),
             Action::RejectOffer { offer } => self.do_reject_offer(proposal, offer),
             Action::Promise {
@@ -491,27 +605,69 @@ impl Simulation {
         ValidationOutcome::Accepted
     }
 
+    /// Nearest private location reachable from `actor`.
     fn find_private_location_near(&self, actor: &Actor) -> Option<LocationId> {
         let mut candidates: Vec<(f32, LocationId)> = self
             .world
             .locations
             .values()
-            .filter(|l| l.private || l.kind == rpg_domain::world::LocationKind::Backroom)
+            .filter(|l| l.private || l.kind == LocationKind::Backroom)
+            .filter(|l| pathfind::plan_world_path(&self.world.nav, actor.pos, l.center()).is_some())
             .map(|l| (actor.pos.distance(l.center()), l.id.clone()))
             .collect();
         candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         candidates.into_iter().map(|(_, id)| id).next()
     }
 
+    /// Nearest private location reachable by both actors.
+    fn find_private_location_for(&self, a: &Actor, b: &Actor) -> Option<LocationId> {
+        let mut candidates: Vec<(f32, LocationId)> = self
+            .world
+            .locations
+            .values()
+            .filter(|l| l.private || l.kind == LocationKind::Backroom)
+            .filter(|l| {
+                pathfind::plan_world_path(&self.world.nav, a.pos, l.center()).is_some()
+                    && pathfind::plan_world_path(&self.world.nav, b.pos, l.center()).is_some()
+            })
+            .map(|l| {
+                (
+                    a.pos.distance(l.center()) + b.pos.distance(l.center()),
+                    l.id.clone(),
+                )
+            })
+            .collect();
+        candidates.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
+        candidates.into_iter().map(|(_, id)| id).next()
+    }
+
+    /// Consent is a real social check; actors walk to privacy, they are not
+    /// teleported.
     fn do_ask_privately(
         &mut self,
         proposal: &ActionProposal,
         target: ActorId,
     ) -> ValidationOutcome {
-        let actor = self.world.actor(&proposal.actor).cloned().unwrap();
-        let Some(loc) = self.find_private_location_near(&actor) else {
+        let Some(actor) = self.world.actor(&proposal.actor).cloned() else {
+            return ValidationOutcome::Rejected(RejectReason::UnknownActor(proposal.actor.clone()));
+        };
+        let Some(target_actor) = self.world.actor(&target).cloned() else {
+            return ValidationOutcome::Rejected(RejectReason::UnknownActor(target.clone()));
+        };
+        let rel = target_actor.relationship(&proposal.actor);
+        let willingness = rel.trust * 0.5 + rel.affection * 0.3 + rel.familiarity * 0.3
+            - rel.fear * 0.3
+            - rel.anger * 0.3
+            - rel.suspicion * 0.2;
+        let willing = willingness > -0.1
+            || target_actor.has_flag("friendly")
+            || target_actor.has_flag("shopkeeper");
+        if !willing {
+            return ValidationOutcome::Rejected(RejectReason::TargetUnwilling);
+        }
+        let Some(loc) = self.find_private_location_for(&actor, &target_actor) else {
             return ValidationOutcome::Rejected(RejectReason::Invalid(
-                "no private location available".into(),
+                "no reachable private location".into(),
             ));
         };
         let center = self
@@ -519,16 +675,19 @@ impl Simulation {
             .location(&loc)
             .map(|l| l.center())
             .unwrap_or(actor.pos);
-        if let Some(a) = self.world.actor_mut(&proposal.actor) {
-            a.pos = center;
-            a.location = loc.clone();
-            a.in_private_conversation_with = Some(target.clone());
-        }
-        if let Some(t) = self.world.actor_mut(&target) {
-            t.pos = center;
-            t.location = loc.clone();
-            t.in_private_conversation_with = Some(proposal.actor.clone());
-        }
+        let (Some(path_a), Some(path_b)) = (
+            pathfind::plan_world_path(&self.world.nav, actor.pos, center),
+            pathfind::plan_world_path(&self.world.nav, target_actor.pos, center),
+        ) else {
+            return ValidationOutcome::Rejected(RejectReason::Unreachable);
+        };
+        self.paths.insert(proposal.actor.clone(), path_a);
+        self.paths.insert(target.clone(), path_b);
+        self.pending_private.push(PendingPrivate {
+            a: proposal.actor.clone(),
+            b: target.clone(),
+            location: loc.clone(),
+        });
         let (tick, minute) = (self.world.tick, self.world.minute_of_day);
         self.events.push(
             tick,
@@ -544,6 +703,51 @@ impl Simulation {
             Vec::new(),
         );
         ValidationOutcome::Accepted
+    }
+
+    /// Called after movement: promote arrived pairs to a private conversation.
+    fn finalize_private(&mut self) {
+        let pending = std::mem::take(&mut self.pending_private);
+        let mut keep = Vec::new();
+        for p in pending {
+            let a_arrived = !self.paths.contains_key(&p.a)
+                && self
+                    .world
+                    .actor(&p.a)
+                    .map(|x| x.location == p.location)
+                    .unwrap_or(false);
+            let b_arrived = !self.paths.contains_key(&p.b)
+                && self
+                    .world
+                    .actor(&p.b)
+                    .map(|x| x.location == p.location)
+                    .unwrap_or(false);
+            if a_arrived && b_arrived {
+                if let Some(a) = self.world.actor_mut(&p.a) {
+                    a.in_private_conversation_with = Some(p.b.clone());
+                }
+                if let Some(b) = self.world.actor_mut(&p.b) {
+                    b.in_private_conversation_with = Some(p.a.clone());
+                }
+                let (tick, minute) = (self.world.tick, self.world.minute_of_day);
+                self.events.push(
+                    tick,
+                    minute,
+                    Some(p.a.clone()),
+                    EventKind::MeetingScheduled {
+                        with: p.a.clone(),
+                        target: p.b.clone(),
+                        location: p.location.clone(),
+                        at_minute: minute,
+                    },
+                    Vec::new(),
+                    vec![p.b.clone()],
+                );
+            } else {
+                keep.push(p);
+            }
+        }
+        self.pending_private = keep;
     }
 
     fn do_move_to_location(
@@ -564,6 +768,19 @@ impl Simulation {
     }
 
     fn set_path(&mut self, actor: &ActorId, dest: Vec2) -> ValidationOutcome {
+        // Moving away ends any private conversation.
+        let partner = self
+            .world
+            .actor(actor)
+            .and_then(|a| a.in_private_conversation_with.clone());
+        if let Some(partner) = partner {
+            if let Some(a) = self.world.actor_mut(actor) {
+                a.in_private_conversation_with = None;
+            }
+            if let Some(p) = self.world.actor_mut(&partner) {
+                p.in_private_conversation_with = None;
+            }
+        }
         let from = self.world.actor(actor).map(|a| a.pos).unwrap_or(Vec2::ZERO);
         match pathfind::plan_world_path(&self.world.nav, from, dest) {
             Some(path) => {
@@ -574,6 +791,7 @@ impl Simulation {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn do_make_offer(
         &mut self,
         proposal: &ActionProposal,
@@ -581,6 +799,7 @@ impl Simulation {
         give: Vec<rpg_domain::world::ItemStack>,
         want: Vec<rpg_domain::world::ItemStack>,
         condition: Option<QuestPredicate>,
+        disclose: Option<FactId>,
         note: String,
     ) -> ValidationOutcome {
         let id = OfferId(self.world.next_offer_id);
@@ -595,7 +814,7 @@ impl Simulation {
                 want: want.clone(),
                 price: 0,
                 condition: condition.clone(),
-                disclose: None,
+                disclose: disclose.clone(),
                 note: note.clone(),
                 state: OfferState::Pending,
                 created_tick: self.world.tick,
@@ -661,7 +880,7 @@ impl Simulation {
             self.move_item(&o.to, &o.from, &stack.item, stack.qty);
         }
         if let Some(c) = &o.condition {
-            social::create_commitment(
+            let cid = social::create_commitment(
                 &mut self.world,
                 &mut self.events,
                 tick,
@@ -673,8 +892,15 @@ impl Simulation {
                 c.clone(),
                 None,
             );
-        }
-        if let Some(fact) = &o.disclose {
+            // A conditional deal discloses only once its predicate is met; the
+            // promised fact is stored so the NPC can honour it later.
+            if let Some(fact) = &o.disclose {
+                if let Some(cm) = self.world.commitments.get_mut(&cid) {
+                    cm.promised_fact = Some(fact.clone());
+                }
+            }
+        } else if let Some(fact) = &o.disclose {
+            // Unconditional offers disclose immediately on acceptance.
             let _ = social::share_claim(
                 &mut self.world,
                 &mut self.events,
@@ -914,6 +1140,26 @@ impl Simulation {
             InvestigateTarget::Location(loc) => {
                 if let Some(a) = self.world.actor_mut(&proposal.actor) {
                     a.inspected.insert(loc.as_str().to_string());
+                }
+                // Recover any physical items left here.
+                let found = self.world.location_items.remove(&loc).unwrap_or_default();
+                for stack in found {
+                    if let Some(a) = self.world.actor_mut(&proposal.actor) {
+                        a.inventory.add(stack.item.clone(), stack.qty);
+                    }
+                    self.events.push(
+                        tick,
+                        minute,
+                        Some(proposal.actor.clone()),
+                        EventKind::ItemFound {
+                            actor: proposal.actor.clone(),
+                            item: stack.item,
+                            qty: stack.qty,
+                            location: loc.clone(),
+                        },
+                        Vec::new(),
+                        vec![proposal.actor.clone()],
+                    );
                 }
                 // Reveal any clue containers physically present here.
                 let facts_here: Vec<FactId> = self
@@ -1257,6 +1503,13 @@ impl Simulation {
     /// Run one full simulation step: apply proposals, run routines, move,
     /// then run background economy/ambient systems and story maintenance.
     pub fn step(&mut self, proposals: Vec<ActionProposal>) -> StepReport {
+        if self.recording {
+            self.ops.push(SimOp::Step(proposals.clone()));
+        }
+        self.step_impl(proposals)
+    }
+
+    fn step_impl(&mut self, proposals: Vec<ActionProposal>) -> StepReport {
         self.advance_clock();
         let mut report = StepReport::default();
         let mut acted: BTreeSet<ActorId> = BTreeSet::new();
@@ -1270,7 +1523,7 @@ impl Simulation {
         });
 
         for p in &props {
-            match self.apply(p) {
+            match self.apply_impl(p) {
                 ValidationOutcome::Accepted => report.accepted += 1,
                 ValidationOutcome::Pending { .. } => report.pending += 1,
                 ValidationOutcome::Rejected(_) => report.rejected += 1,
@@ -1284,10 +1537,11 @@ impl Simulation {
 
         let routine = self.routine_proposals(&acted);
         for p in &routine {
-            let _ = self.apply(p);
+            let _ = self.apply_impl(p);
         }
 
         self.move_actors();
+        self.finalize_private();
         if self.config.enable_background {
             self.faction_tick();
             self.ambient_incidents(&mut report);
@@ -1313,6 +1567,12 @@ impl Simulation {
             if !actor.is_alive()
                 || actor.kind == ActorKind::Player
                 || already_acted.contains(&actor.id)
+                || self.paths.contains_key(&actor.id)
+                || actor.in_private_conversation_with.is_some()
+                || self
+                    .pending_private
+                    .iter()
+                    .any(|p| p.a == actor.id || p.b == actor.id)
             {
                 continue;
             }

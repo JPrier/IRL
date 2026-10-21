@@ -268,6 +268,7 @@ pub fn create_commitment(
             } else {
                 0.0
             },
+            promised_fact: None,
         },
     );
     events.push(
@@ -573,6 +574,7 @@ mod tests {
             offers: BTreeMap::new(),
             rumors: Vec::new(),
             damage: BTreeMap::new(),
+            location_items: BTreeMap::new(),
             flags: BTreeSet::new(),
             ledger: BTreeMap::new(),
             next_commitment_id: 1,

@@ -48,6 +48,9 @@ pub struct Commitment {
     /// How much the debtor resents this (0..1). Rises for coerced deals.
     #[serde(default)]
     pub resentment: f32,
+    /// Fact the debtor promised to disclose once the predicate is satisfied.
+    #[serde(default)]
+    pub promised_fact: Option<FactId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,6 +124,7 @@ mod tests {
             created_tick: 0,
             deadline_minute: None,
             resentment: 0.0,
+            promised_fact: None,
         };
         assert_eq!(c.state, CommitmentState::Pending);
     }

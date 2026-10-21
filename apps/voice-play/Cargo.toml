@@ -1,0 +1,13 @@
+[package]
+name = "voice-play"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Agentic RPG: offline voice conversation client (mic -> ASR -> LLM -> validation -> TTS -> speaker)."
+
+[dependencies]
+rpg_domain.workspace = true
+rpg_eval.workspace = true
+rpg_inference.workspace = true
+rpg_speech.workspace = true

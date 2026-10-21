@@ -9,8 +9,9 @@
 
 use rpg_domain::events::{Event, EventLog};
 use rpg_domain::ids::EventId;
+use rpg_domain::rng::DeterministicRng;
 use rpg_domain::world::World;
-use rpg_sim::{SimConfig, Simulation};
+use rpg_sim::{SimConfig, SimOp, SimTransient, Simulation};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -34,27 +35,35 @@ pub enum PersistenceError {
 
 pub type Result<T> = std::result::Result<T, PersistenceError>;
 
-/// A complete, versioned save: canonical world + append-only event log.
+/// A complete, versioned save: canonical world, event log, live RNG state,
+/// transient movement/privacy state, and the proposal log needed for replay.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SaveFile {
     pub version: u32,
     pub seed: u64,
+    pub rng: DeterministicRng,
     pub world: World,
     pub events: EventLog,
+    #[serde(default)]
+    pub transient: SimTransient,
+    #[serde(default)]
+    pub ops: Vec<SimOp>,
+    #[serde(default)]
+    pub initial_world: Option<World>,
 }
 
 impl SaveFile {
-    pub fn new(seed: u64, world: World, events: EventLog) -> Self {
+    pub fn from_sim(sim: &Simulation) -> Self {
         Self {
             version: SAVE_VERSION,
-            seed,
-            world,
-            events,
+            seed: sim.seed,
+            rng: sim.rng.clone(),
+            world: sim.world.clone(),
+            events: sim.events.clone(),
+            transient: sim.transient(),
+            ops: sim.ops.clone(),
+            initial_world: Some(sim.initial_world.clone()),
         }
-    }
-
-    pub fn from_sim(sim: &Simulation) -> Self {
-        Self::new(sim.rng.seed(), sim.world.clone(), sim.events.clone())
     }
 }
 
@@ -76,9 +85,32 @@ pub fn load_json(path: impl AsRef<Path>) -> Result<SaveFile> {
     Ok(save)
 }
 
-/// Restore a `Simulation` from a save file.
+/// Restore a `Simulation` from a save file, preserving live RNG and transient
+/// movement state so subsequent steps match the original exactly.
 pub fn restore(save: SaveFile, config: SimConfig) -> Simulation {
-    Simulation::restore(save.world, save.events, save.seed, config)
+    let initial = save
+        .initial_world
+        .clone()
+        .unwrap_or_else(|| save.world.clone());
+    Simulation::restore_full(
+        save.seed,
+        save.world,
+        save.events,
+        save.rng,
+        save.transient,
+        save.ops,
+        initial,
+        config,
+    )
+}
+
+/// Reconstruct canonical state from the recorded proposal/entry-point log.
+pub fn replay(save: &SaveFile, config: SimConfig) -> Simulation {
+    let initial = save
+        .initial_world
+        .clone()
+        .unwrap_or_else(|| save.world.clone());
+    Simulation::replay_ops(initial, save.seed, config, &save.ops)
 }
 
 // ---------------------------------------------------------------------------
@@ -289,5 +321,71 @@ mod tests {
         let save = SaveFile::from_sim(&s);
         let restored = restore(save, SimConfig::default());
         assert_eq!(restored.events.checksum(), s.events.checksum());
+    }
+
+    #[test]
+    fn save_load_continuation_matches_original_exactly() {
+        use rpg_domain::action::{Action, ActionProposal, ProposalSource};
+        use rpg_domain::ids::{ActorId, LocationId, PLAYER};
+        let mut s = sim();
+        let _ = s.apply(&ActionProposal {
+            actor: ActorId::new(PLAYER),
+            action: Action::MoveTo {
+                location: LocationId::new("warehouse"),
+            },
+            source: ProposalSource::Player,
+            rationale: String::new(),
+        });
+        s.step(vec![]);
+        let save = SaveFile::from_sim(&s);
+        let mut restored = restore(save, SimConfig::default());
+        for _ in 0..12 {
+            s.step(vec![]);
+            restored.step(vec![]);
+        }
+        assert_eq!(
+            serde_json::to_string(&s.world).unwrap(),
+            serde_json::to_string(&restored.world).unwrap(),
+            "restored simulation diverged (RNG/transient state lost)"
+        );
+        assert_eq!(s.events.checksum(), restored.events.checksum());
+    }
+
+    #[test]
+    fn proposal_replay_reconstructs_world() {
+        use rpg_domain::action::{Action, ActionProposal, Loudness, ProposalSource};
+        use rpg_domain::ids::{ActorId, PLAYER};
+        let mut s = sim();
+        let _ = s.apply(&ActionProposal {
+            actor: ActorId::new(PLAYER),
+            action: Action::Speak {
+                target: Some(ActorId::new("grocer")),
+                text: "hello".into(),
+                loudness: Loudness::Normal,
+            },
+            source: ProposalSource::Player,
+            rationale: String::new(),
+        });
+        s.step(vec![]);
+        let _ = s.apply(&ActionProposal {
+            actor: ActorId::new(PLAYER),
+            action: Action::Threaten {
+                target: ActorId::new("grocer"),
+                demand: "ledger".into(),
+            },
+            source: ProposalSource::Player,
+            rationale: String::new(),
+        });
+        for _ in 0..5 {
+            s.step(vec![]);
+        }
+        let save = SaveFile::from_sim(&s);
+        let replayed = replay(&save, SimConfig::default());
+        assert_eq!(
+            serde_json::to_string(&s.world).unwrap(),
+            serde_json::to_string(&replayed.world).unwrap(),
+            "proposal replay did not reconstruct the world"
+        );
+        assert_eq!(s.events.checksum(), replayed.events.checksum());
     }
 }
