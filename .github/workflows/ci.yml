@@ -45,9 +45,15 @@ jobs:
             libasound2-dev libudev-dev \
             libwayland-dev libxkbcommon-dev \
             libx11-dev libxcursor-dev libxrandr-dev libxi-dev
-      - name: Drop stale sherpa-onnx prebuilt cache
+      # `rust-cache` can restore a `target` whose sherpa-onnx prebuilt directory
+      # is incomplete while its build-script fingerprint still looks fresh, so
+      # cargo skips re-extraction and linking fails with `LNK1181`. Remove the
+      # prebuilt and the fingerprint so the build script re-downloads it.
+      - name: Repair sherpa-onnx prebuilt cache
         shell: bash
-        run: rm -rf target/sherpa-onnx-prebuilt
+        run: |
+          rm -rf target/sherpa-onnx-prebuilt
+          cargo clean -p sherpa-onnx-sys || true
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
@@ -84,12 +90,15 @@ jobs:
           } else {
             Write-Host 'LLVM not found in the default location; bindgen must discover libclang itself.'
           }
-      # `rust-cache` can restore a `target/sherpa-onnx-prebuilt` whose `lib`
-      # directory exists but is missing the import libraries, which makes the
-      # crate skip re-extraction and then fail to link. Force a clean fetch.
-      - name: Drop stale sherpa-onnx prebuilt cache
+      # `rust-cache` can restore a `target` whose sherpa-onnx prebuilt directory
+      # is incomplete while its build-script fingerprint still looks fresh, so
+      # cargo skips re-extraction and linking fails with `LNK1181`. Remove the
+      # prebuilt and the fingerprint so the build script re-downloads it.
+      - name: Repair sherpa-onnx prebuilt cache
         shell: bash
-        run: rm -rf target/sherpa-onnx-prebuilt
+        run: |
+          rm -rf target/sherpa-onnx-prebuilt
+          cargo clean -p sherpa-onnx-sys || true
       - run: cargo test --workspace
       - run: cargo run -q -p scenario-runner -- --seed 2026
       # Diagnostic (non-neural) speech/WAV buffer benchmark. Run through
