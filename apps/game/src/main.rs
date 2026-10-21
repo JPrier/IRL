@@ -10,7 +10,9 @@
 
 use rpg_domain::action::{Action, InvestigateTarget, ValidationOutcome};
 use rpg_domain::ids::{ActorId, ItemId, LocationId, OfferId, PLAYER};
+use rpg_domain::ports::InferenceEngine;
 use rpg_eval::Session;
+use rpg_inference::{LlamaEngine, ModelProfile};
 use rpg_persistence::{load_json, restore, save_json, SaveFile};
 use rpg_sim::SimConfig;
 use std::io::{self, Write};
@@ -18,13 +20,30 @@ use std::io::{self, Write};
 const SAVE_PATH: &str = "agentic_rpg_save.json";
 
 fn main() {
-    let seed: u64 = std::env::args()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(2026);
-    let mut session = Session::new(seed);
-    println!("Agentic RPG — Hidden Mafia (text vertical slice)");
-    println!("Seed {seed}. Type 'help' for commands.\n");
+    let opts = match Options::parse(std::env::args().skip(1).collect()) {
+        Ok(o) => o,
+        Err(msg) => {
+            eprintln!("{msg}");
+            eprintln!();
+            usage();
+            std::process::exit(2);
+        }
+    };
+    if opts.help {
+        usage();
+        return;
+    }
+    let mut session = match build_session(&opts) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Cannot start real-model session: {e}");
+            eprintln!("Pass --heuristic to run the deterministic baseline instead.");
+            std::process::exit(1);
+        }
+    };
+    announce(&session);
+    println!("Seed {}. Type 'help' for commands.", opts.seed);
+    println!();
     look(&session);
 
     loop {
@@ -76,6 +95,7 @@ fn main() {
                     println!("Usage: talk <npc_id> <what to say>");
                 } else {
                     session.say(npc, text);
+                    report_decision(&session);
                     drain_events(&session, before);
                 }
             }
@@ -183,6 +203,175 @@ fn main() {
             other => println!("Unknown command '{other}'. Type 'help'."),
         }
     }
+    print_session_summary(&session);
+}
+
+// ---------------------------------------------------------------------------
+// Real-model / heuristic session setup
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default)]
+struct Options {
+    seed: u64,
+    profile: Option<String>,
+    model: Option<String>,
+    heuristic: bool,
+    no_think: Option<bool>,
+    n_ctx: u32,
+    max_tokens: u32,
+    threads: i32,
+    help: bool,
+}
+
+impl Options {
+    fn parse(args: Vec<String>) -> Result<Self, String> {
+        let mut o = Options {
+            seed: 2026,
+            n_ctx: 4096,
+            max_tokens: 192,
+            ..Options::default()
+        };
+        let mut it = args.into_iter();
+        while let Some(a) = it.next() {
+            match a.as_str() {
+                "--profile" => o.profile = Some(next_arg(&mut it, "--profile")?),
+                "--model" => o.model = Some(next_arg(&mut it, "--model")?),
+                "--heuristic" => o.heuristic = true,
+                "--no-think" => o.no_think = Some(true),
+                "--think" => o.no_think = Some(false),
+                "--ctx" => o.n_ctx = parse_arg(&mut it, "--ctx")?,
+                "--max-tokens" => o.max_tokens = parse_arg(&mut it, "--max-tokens")?,
+                "--threads" => o.threads = parse_arg(&mut it, "--threads")?,
+                "--seed" => o.seed = parse_arg(&mut it, "--seed")?,
+                "--help" | "-h" => o.help = true,
+                other if !other.starts_with('-') => {
+                    o.seed = other
+                        .parse()
+                        .map_err(|_| format!("unexpected argument '{other}'"))?;
+                }
+                other => return Err(format!("unknown option '{other}'")),
+            }
+        }
+        Ok(o)
+    }
+}
+
+fn next_arg(it: &mut std::vec::IntoIter<String>, flag: &str) -> Result<String, String> {
+    it.next().ok_or_else(|| format!("{flag} needs a value"))
+}
+
+fn parse_arg<T: std::str::FromStr>(
+    it: &mut std::vec::IntoIter<String>,
+    flag: &str,
+) -> Result<T, String> {
+    next_arg(it, flag)?
+        .parse()
+        .map_err(|_| format!("{flag} has an invalid value"))
+}
+
+fn default_threads() -> i32 {
+    std::thread::available_parallelism()
+        .map(|n| n.get() as i32)
+        .unwrap_or(4)
+        .min(16)
+}
+
+fn profile_from_options(o: &Options) -> Result<ModelProfile, String> {
+    if let Some(path) = &o.profile {
+        let mut p = ModelProfile::load(path).map_err(|e| format!("profile {path}: {e}"))?;
+        if let Some(nt) = o.no_think {
+            p.no_think = nt;
+        }
+        return Ok(p);
+    }
+    let model = o
+        .model
+        .as_ref()
+        .ok_or_else(|| "no --profile or --model supplied".to_string())?;
+    if !std::path::Path::new(model).exists() {
+        return Err(format!("model file not found: {model}"));
+    }
+    let threads = if o.threads > 0 {
+        o.threads
+    } else {
+        default_threads()
+    };
+    let path = model.replace(char::from(92), "/");
+    let no_think = o.no_think.unwrap_or(true);
+    let json = format!(
+        r#"{{"id":"cli","model_path":"{path}","n_ctx":{ctx},"n_threads":{threads},"max_tokens":{max},"temperature":0.4,"no_think":{no_think},"deadline_ms":60000}}"#,
+        path = path,
+        ctx = o.n_ctx,
+        threads = threads,
+        max = o.max_tokens,
+        no_think = no_think,
+    );
+    ModelProfile::from_json(&json).map_err(|e| e.to_string())
+}
+
+/// Build the session. A model is only used when one is actually requested;
+/// otherwise this is explicitly the deterministic baseline.
+fn build_session(opts: &Options) -> Result<Session, String> {
+    if opts.heuristic || (opts.profile.is_none() && opts.model.is_none()) {
+        return Ok(Session::new(opts.seed));
+    }
+    let profile = profile_from_options(opts)?;
+    let mut engine = LlamaEngine::load(profile).map_err(|e| e.to_string())?;
+    engine.warm().map_err(|e| e.to_string())?;
+    Ok(Session::with_engine(opts.seed, Box::new(engine)))
+}
+
+fn announce(session: &Session) {
+    println!("Agentic RPG - Hidden Mafia (text vertical slice)");
+    if session.is_real_model() {
+        println!(
+            "Engine: {} (model {}) - real local model",
+            session.engine_name(),
+            session.model_id()
+        );
+    } else {
+        println!("Engine: {} - DETERMINISTIC BASELINE", session.engine_name());
+        println!("  NPC replies come from canned rules, NOT a language model.");
+        println!("  Pass --profile <json> or --model <gguf> for real AI.");
+    }
+}
+
+fn report_decision(session: &Session) {
+    if let Some((npc, source)) = session.decisions.last() {
+        if !source.is_model() {
+            println!(
+                "   [{npc}: {}] - deterministic answer, not model output",
+                source.label()
+            );
+        }
+    }
+}
+
+fn print_session_summary(session: &Session) {
+    if session.is_real_model() {
+        println!();
+        println!(
+            "Session: {} model decision(s), {} canonical obligation(s), {} deterministic fallback(s).",
+            session.model_decisions(),
+            session.canonical_decisions(),
+            session.fallback_decisions()
+        );
+    }
+}
+
+fn usage() {
+    println!(
+        r#"game [options]
+  --profile <file.json>  load a ModelProfile (real local model)
+  --model <model.gguf>   shortcut: build a profile for a GGUF file
+  --heuristic            force the deterministic baseline
+  --seed <n>             scenario seed (default 2026)
+  --ctx <n>              context window for --model (default 4096)
+  --max-tokens <n>       max generated tokens (default 192)
+  --threads <n>          CPU threads (default: available)
+  --no-think / --think   override the reasoning block
+  --help"#
+    );
 }
 
 fn split_npc_text(rest: &str) -> (&str, &str) {

@@ -24,10 +24,18 @@ pub struct Session {
     pub engine: Box<dyn InferenceEngine>,
     pub next_request: u64,
     pub trace: Vec<String>,
+    /// Provenance of every NPC decision, in order.
+    pub decisions: Vec<(String, rpg_agents::DecisionSource)>,
 }
 
 impl Session {
     pub fn new(seed: u64) -> Self {
+        Self::with_engine(seed, Box::new(HeuristicEngine::new()))
+    }
+
+    /// Build a session driven by a specific inference backend. The engine is
+    /// retained for the whole session, so model weights load once.
+    pub fn with_engine(seed: u64, engine: Box<dyn InferenceEngine>) -> Self {
         let config = SimConfig {
             enable_background: true,
             enable_director: true,
@@ -35,10 +43,59 @@ impl Session {
         };
         Self {
             sim: Simulation::new(build_town(), seed, config),
-            engine: Box::new(HeuristicEngine::new()),
+            engine,
             next_request: 1,
             trace: Vec::new(),
+            decisions: Vec::new(),
         }
+    }
+
+    /// True when this session is backed by a real local model.
+    pub fn is_real_model(&self) -> bool {
+        self.engine.is_real_model()
+    }
+
+    pub fn engine_name(&self) -> String {
+        self.engine.engine_name()
+    }
+
+    pub fn model_id(&self) -> String {
+        self.engine.model_id()
+    }
+
+    /// Recover the engine so a resident model can be reused across sessions.
+    pub fn into_engine(self) -> Box<dyn InferenceEngine> {
+        self.engine
+    }
+
+    /// NPC turns answered by the real model.
+    pub fn model_decisions(&self) -> usize {
+        self.decisions
+            .iter()
+            .filter(|(_, s)| matches!(s, rpg_agents::DecisionSource::Model))
+            .count()
+    }
+
+    /// NPC turns where a canonical obligation determined the action.
+    pub fn canonical_decisions(&self) -> usize {
+        self.decisions
+            .iter()
+            .filter(|(_, s)| {
+                matches!(
+                    s,
+                    rpg_agents::DecisionSource::CanonicalObligation { .. }
+                        | rpg_agents::DecisionSource::CanonicalAgenda { .. }
+                )
+            })
+            .count()
+    }
+
+    /// NPC turns that required the deterministic fallback (reported, never hidden).
+    pub fn fallback_decisions(&self) -> usize {
+        self.decisions
+            .iter()
+            .filter(|(_, s)| matches!(s, rpg_agents::DecisionSource::HeuristicFallback { .. }))
+            .count()
     }
 
     pub fn player(&self) -> &rpg_domain::world::Actor {
@@ -74,14 +131,19 @@ impl Session {
         });
         self.trace
             .push(format!("player -> {target}: {text} [{out:?}]"));
-        self.npc_respond(target, text);
+        // An NPC can only answer speech that actually reached them (in range
+        // and audible). Rejected speech must not burn inference or produce an
+        // impossible response.
+        if matches!(out, ValidationOutcome::Accepted) {
+            self.npc_respond(target, text);
+        }
     }
 
     pub fn npc_respond(&mut self, npc: &str, text: &str) {
         let npc_id = ActorId::new(npc);
         let player = ActorId::new(PLAYER);
         let policy = NpcPolicy;
-        let proposal = policy.respond(
+        let decision = policy.decide(
             &self.sim.world,
             &npc_id,
             &player,
@@ -90,9 +152,12 @@ impl Session {
             self.next_request,
         );
         self.next_request += 1;
-        let kind = proposal.action.kind_name().to_string();
-        let out = self.sim.apply(&proposal);
-        self.trace.push(format!("{npc} -> {kind}: {out:?}"));
+        let kind = decision.proposal.action.kind_name().to_string();
+        let source = decision.source.clone();
+        let out = self.sim.apply(&decision.proposal);
+        self.trace
+            .push(format!("{npc} -> {kind} [{}]: {out:?}", source.label()));
+        self.decisions.push((npc.to_string(), source));
     }
 
     pub fn tick(&mut self) -> StepReport {
@@ -870,5 +935,63 @@ mod tests {
             let b = run_replay_script(seed);
             assert_eq!(a.checksum(), b.checksum(), "seed {seed}");
         }
+    }
+
+    /// No-weights regression test for the real-model interaction shape: a
+    /// scripted model that only "speaks" still gets the canonical bargain,
+    /// and the satisfied deal is honoured on the next turn.
+    #[test]
+    fn scripted_model_bargain_is_honoured_canonically() {
+        let engine =
+            rpg_agents::ScriptedEngine::new().with_default(r#"{"action":"speak","text":"Hmm."}"#);
+        let mut s = Session::with_engine(2026, Box::new(engine));
+        s.teleport_player_to("grocer");
+        s.say("grocer", "I need to see your ledger.");
+
+        let offer = s
+            .sim
+            .world
+            .offers
+            .values()
+            .find(|o| o.from.as_str() == "grocer")
+            .cloned()
+            .expect("canonical agenda should create a conditional offer");
+        match &offer.condition {
+            Some(QuestPredicate::HasItem { item, .. }) => assert_eq!(item.as_str(), "medicine"),
+            other => panic!("expected medicine condition, got {other:?}"),
+        }
+        assert_eq!(
+            offer.disclose.as_ref().map(|f| f.as_str()),
+            Some("f_grocer_ledger")
+        );
+        assert!(matches!(
+            s.player_do(Action::AcceptOffer { offer: offer.id }),
+            ValidationOutcome::Accepted
+        ));
+        s.give("medicine", 1);
+        assert!(matches!(
+            s.player_do(Action::TransferItem {
+                target: ActorId::new("grocer"),
+                item: ItemId::new("medicine"),
+                qty: 1,
+            }),
+            ValidationOutcome::Accepted
+        ));
+        s.tick();
+        assert!(
+            s.sim
+                .world
+                .commitments
+                .values()
+                .any(|c| c.state == rpg_domain::social::CommitmentState::Satisfied),
+            "medicine delivery should satisfy the deal"
+        );
+        s.say("grocer", "Now the ledger, as we agreed.");
+        assert!(
+            s.sim
+                .world
+                .believes(&ActorId::new(PLAYER), &FactId::new("f_grocer_ledger")),
+            "player should learn the ledger fact once the deal is honoured"
+        );
     }
 }

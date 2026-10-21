@@ -90,8 +90,9 @@ pub struct SimTransient {
 /// A recorded public entry point, used for input/proposal replay.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum SimOp {
-    /// A direct `apply` call.
-    Apply(ActionProposal),
+    /// A direct `apply` call. Boxed to keep the enum small: `ActionProposal`
+    /// is much larger than a `Vec` of proposals and this is a hot replay type.
+    Apply(Box<ActionProposal>),
     /// A full `step` with its external proposals.
     Step(Vec<ActionProposal>),
 }
@@ -437,7 +438,7 @@ impl Simulation {
 
     pub fn apply(&mut self, proposal: &ActionProposal) -> ValidationOutcome {
         if self.recording {
-            self.ops.push(SimOp::Apply(proposal.clone()));
+            self.ops.push(SimOp::Apply(Box::new(proposal.clone())));
         }
         self.apply_impl(proposal)
     }
@@ -490,8 +491,9 @@ impl Simulation {
                 give,
                 want,
                 condition,
+                disclose,
                 note,
-            } => self.do_make_offer(proposal, target, give, want, condition, note),
+            } => self.do_make_offer(proposal, target, give, want, condition, disclose, note),
             Action::AcceptOffer { offer } => self.do_accept_offer(proposal, offer),
             Action::RejectOffer { offer } => self.do_reject_offer(proposal, offer),
             Action::Promise {
@@ -789,6 +791,7 @@ impl Simulation {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn do_make_offer(
         &mut self,
         proposal: &ActionProposal,
@@ -796,6 +799,7 @@ impl Simulation {
         give: Vec<rpg_domain::world::ItemStack>,
         want: Vec<rpg_domain::world::ItemStack>,
         condition: Option<QuestPredicate>,
+        disclose: Option<FactId>,
         note: String,
     ) -> ValidationOutcome {
         let id = OfferId(self.world.next_offer_id);
@@ -810,7 +814,7 @@ impl Simulation {
                 want: want.clone(),
                 price: 0,
                 condition: condition.clone(),
-                disclose: None,
+                disclose: disclose.clone(),
                 note: note.clone(),
                 state: OfferState::Pending,
                 created_tick: self.world.tick,
@@ -876,7 +880,7 @@ impl Simulation {
             self.move_item(&o.to, &o.from, &stack.item, stack.qty);
         }
         if let Some(c) = &o.condition {
-            social::create_commitment(
+            let cid = social::create_commitment(
                 &mut self.world,
                 &mut self.events,
                 tick,
@@ -888,8 +892,15 @@ impl Simulation {
                 c.clone(),
                 None,
             );
-        }
-        if let Some(fact) = &o.disclose {
+            // A conditional deal discloses only once its predicate is met; the
+            // promised fact is stored so the NPC can honour it later.
+            if let Some(fact) = &o.disclose {
+                if let Some(cm) = self.world.commitments.get_mut(&cid) {
+                    cm.promised_fact = Some(fact.clone());
+                }
+            }
+        } else if let Some(fact) = &o.disclose {
+            // Unconditional offers disclose immediately on acceptance.
             let _ = social::share_claim(
                 &mut self.world,
                 &mut self.events,

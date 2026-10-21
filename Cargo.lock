@@ -272,6 +272,7 @@ dependencies = [
  "rpg_content",
  "rpg_domain",
  "rpg_eval",
+ "rpg_inference",
  "rpg_persistence",
  "rpg_sim",
 ]
@@ -452,6 +453,7 @@ dependencies = [
  "rpg_content",
  "rpg_domain",
  "rpg_eval",
+ "rpg_inference",
  "rpg_sim",
  "rpg_speech",
  "serde",

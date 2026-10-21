@@ -261,6 +261,7 @@ fn offer_pending_then_transfers_on_accept() {
             }],
             want: vec![],
             condition: None,
+            disclose: None,
             note: "take the ledger".into(),
         },
     );

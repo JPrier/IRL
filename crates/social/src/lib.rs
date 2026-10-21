@@ -268,6 +268,7 @@ pub fn create_commitment(
             } else {
                 0.0
             },
+            promised_fact: None,
         },
     );
     events.push(

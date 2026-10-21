@@ -64,6 +64,8 @@ pub enum Action {
         want: Vec<ItemStack>,
         /// Optional world condition the offer is contingent on.
         condition: Option<QuestPredicate>,
+        /// Fact the proposer promises to disclose once the deal is honoured.
+        disclose: Option<FactId>,
         note: String,
     },
     AcceptOffer {
