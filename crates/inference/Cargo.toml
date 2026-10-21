@@ -14,7 +14,11 @@ thiserror.workspace = true
 llama-cpp-2 = "0.1.160"
 
 [features]
-default = []
+# `common` pulls in the C++ shim that converts llama.cpp exceptions into
+# recoverable error codes. It is required so a grammar-sampler failure can
+# never cross the C ABI as a `std::terminate`/abort.
+default = ["common"]
+common = ["llama-cpp-2/common"]
 cuda = ["llama-cpp-2/cuda"]
 metal = ["llama-cpp-2/metal"]
 rocm = ["llama-cpp-2/rocm"]

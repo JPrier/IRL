@@ -213,6 +213,18 @@ impl LlamaEngine {
     }
 
     fn build_prompt(&self, req: &InferenceRequest) -> String {
+        let mut prompt = self.render_chat(req);
+        if self.profile.no_think {
+            apply_no_think_prefix(&mut prompt);
+        }
+        prompt
+    }
+
+    /// Render the chat template (baked GGUF template, named override, or the
+    /// ChatML fallback). `llama-cpp-2` 0.1.160 does not expose template kwargs
+    /// such as `enable_thinking`, so non-thinking behaviour is normalised in
+    /// [`apply_no_think_prefix`].
+    fn render_chat(&self, req: &InferenceRequest) -> String {
         let system = req.system.clone();
         let tmpl = match &self.profile.chat_format {
             Some(name) => self.model.chat_template(Some(name)).ok(),
@@ -228,7 +240,7 @@ impl LlamaEngine {
                 }
             }
         }
-        // Fallback: Qwen ChatML with the non-thinking assistant prefix.
+        // Fallback: Qwen ChatML with a pre-closed empty reasoning block.
         format!(
             "{start}system\n{system}{end}\n{start}user\n{prompt}{end}\n{start}assistant\n{think_open}\n\n{think_close}\n\n",
             start = IM_START,
@@ -250,6 +262,53 @@ impl LlamaEngine {
             Some(spec.to_string())
         }
     }
+}
+
+/// Rewrite a bare or open-ended assistant prefix into a pre-closed empty
+/// reasoning block. Needed because `llama-cpp-2` 0.1.160 cannot forward
+/// `enable_thinking=false` to the GGUF chat template.
+fn apply_no_think_prefix(prompt: &mut String) {
+    let nl = char::from(10u8);
+    let open = format!("{THINK_OPEN}{nl}");
+    let empty = format!("{THINK_OPEN}{nl}{nl}{THINK_CLOSE}{nl}{nl}");
+    if prompt.ends_with(&empty) {
+        return;
+    }
+    if prompt.ends_with(&open) {
+        prompt.truncate(prompt.len() - open.len());
+        prompt.push_str(&empty);
+        return;
+    }
+    let assistant_nl = format!("assistant{nl}");
+    if prompt.ends_with(&assistant_nl) || prompt.ends_with("assistant") {
+        prompt.push_str(&empty);
+    }
+}
+/// Remove a leading reasoning block (including a pre-filled empty one) so
+/// callers receive only the answer. Text without a complete block is
+/// returned unchanged.
+fn strip_reasoning_block(text: String) -> String {
+    let trimmed = text.trim_start();
+    if !trimmed.starts_with(THINK_OPEN) {
+        return text;
+    }
+    if let Some(end) = trimmed.find(THINK_CLOSE) {
+        let rest = &trimmed[end + THINK_CLOSE.len()..];
+        let nl = char::from(10u8);
+        let cr = char::from(13u8);
+        return rest.trim_start_matches([nl, cr]).to_string();
+    }
+    text
+}
+
+/// True when `text` is exactly one complete JSON object. Used to stop
+/// constrained decoding at the grammar's terminal state.
+fn json_value_complete(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.len() < 2 || !trimmed.starts_with('{') || !trimmed.ends_with('}') {
+        return false;
+    }
+    serde_json::from_str::<serde_json::Value>(trimmed).is_ok()
 }
 
 impl InferenceEngine for LlamaEngine {
@@ -333,11 +392,16 @@ impl InferenceEngine for LlamaEngine {
             .map_err(|e| InferenceError::Backend(format!("{e:?}")))?;
         let prefill_ms = prefill_start.elapsed().as_secs_f32() * 1000.0;
 
+        let grammar = self.grammar_for(req);
+        let structured = grammar.is_some();
         let mut samplers: Vec<LlamaSampler> = Vec::new();
-        if let Some(grammar) = self.grammar_for(req) {
-            if let Ok(g) = LlamaSampler::grammar(&self.model, &grammar, "root") {
-                samplers.push(g);
-            }
+        if let Some(grammar) = &grammar {
+            // A malformed grammar must be a loud, recoverable error. The old
+            // code silently dropped it and then claimed `structured: true`.
+            let g = LlamaSampler::grammar(&self.model, grammar, "root").map_err(|e| {
+                InferenceError::Backend(format!("grammar sampler init failed: {e:?}"))
+            })?;
+            samplers.push(g);
         }
         samplers.push(LlamaSampler::temp(req.temperature.max(0.0)));
         samplers.push(LlamaSampler::top_p(self.profile.top_p, 1));
@@ -359,8 +423,13 @@ impl InferenceEngine for LlamaEngine {
             if decode_start.elapsed().as_millis() as u64 > self.profile.deadline_ms {
                 return Err(InferenceError::Timeout(self.profile.deadline_ms));
             }
+            // `LlamaSampler::sample` already accepts the selected token into
+            // the sampler chain ("Sample and accept a token..."). Calling
+            // `accept` again was the root cause of the grammar abort: it
+            // advanced the grammar twice per token and left the stack empty,
+            // so the next `sample()` hit
+            // `GGML_ASSERT(!stacks.empty())` in `llama_grammar_reject_candidates`.
             let token = sampler.sample(&ctx, -1);
-            sampler.accept(token);
             if self.model.vocab().is_eog(token) {
                 break;
             }
@@ -375,14 +444,13 @@ impl InferenceEngine for LlamaEngine {
             }
             produced += 1;
 
-            decoder.clear();
-            decoder
-                .add(token, n_cur as i32, &[0], true)
-                .map_err(|e| InferenceError::Backend(format!("{e:?}")))?;
-            n_cur += 1;
-            ctx.decode(&mut decoder)
-                .map_err(|e| InferenceError::Backend(format!("{e:?}")))?;
-
+            // A JSON-schema value is complete once it parses. Stop before the
+            // next `sample()` so no trailing prose is generated. The grammar
+            // sampler permits EOG at this point, so `is_eog` would also stop
+            // us, but not reliably on every model.
+            if structured && json_value_complete(&text) {
+                break;
+            }
             if self
                 .profile
                 .stop
@@ -391,6 +459,14 @@ impl InferenceEngine for LlamaEngine {
             {
                 break;
             }
+
+            decoder.clear();
+            decoder
+                .add(token, n_cur as i32, &[0], true)
+                .map_err(|e| InferenceError::Backend(format!("{e:?}")))?;
+            n_cur += 1;
+            ctx.decode(&mut decoder)
+                .map_err(|e| InferenceError::Backend(format!("{e:?}")))?;
         }
         let tail = utf8.finish();
         if !tail.is_empty() {
@@ -400,13 +476,13 @@ impl InferenceEngine for LlamaEngine {
         let decode_ms = decode_start.elapsed().as_secs_f32() * 1000.0;
 
         Ok(InferenceResponse {
-            text,
+            text: strip_reasoning_block(text),
             prompt_tokens: prompt_tokens.len() as u32,
             completion_tokens: produced,
             first_token_ms,
             prefill_ms,
             decode_ms,
-            structured: self.grammar_for(req).is_some(),
+            structured,
         })
     }
 
@@ -442,6 +518,67 @@ mod tests {
         assert!(g.unwrap().contains("root"));
     }
 
+    #[test]
+    fn action_grammar_has_expected_root_and_enum() {
+        let g = llama_cpp_2::json_schema_to_grammar(ACTION_SCHEMA).unwrap();
+        assert!(g.contains("root ::="), "root rule missing:\n{g}");
+        for action in [
+            "speak",
+            "share_claim",
+            "offer",
+            "promise",
+            "threaten",
+            "idle",
+        ] {
+            assert!(g.contains(action), "action enum missing {action}");
+        }
+    }
+
+    #[test]
+    fn json_value_complete_only_accepts_full_objects() {
+        assert!(!json_value_complete(""));
+        assert!(!json_value_complete("{"));
+        assert!(!json_value_complete("{\"action\":"));
+        assert!(!json_value_complete("{\"action\":\"idle\""));
+        assert!(!json_value_complete("[1,2]"));
+        assert!(json_value_complete("{\"action\":\"idle\"}"));
+        assert!(json_value_complete("  {\"action\":\"idle\"}\n"));
+    }
+
+    #[test]
+    fn strip_reasoning_block_removes_only_complete_blocks() {
+        let nl = char::from(10u8);
+        let empty = format!("{THINK_OPEN}{nl}{nl}{THINK_CLOSE}{nl}{nl}");
+        let filled = format!("{THINK_OPEN}{nl}reasoning{nl}{THINK_CLOSE}{nl}{nl}answer");
+        assert_eq!(strip_reasoning_block(filled), "answer");
+        assert_eq!(strip_reasoning_block(empty.clone()), "");
+        assert_eq!(strip_reasoning_block("plain answer".into()), "plain answer");
+        // An unterminated block is left alone.
+        let dangling = format!("{THINK_OPEN}{nl}still thinking");
+        assert_eq!(strip_reasoning_block(dangling.clone()), dangling);
+    }
+
+    #[test]
+    fn no_think_prefix_is_normalised_and_idempotent() {
+        let nl = char::from(10u8);
+        let empty = format!("{THINK_OPEN}{nl}{nl}{THINK_CLOSE}{nl}{nl}");
+        let mut p = format!("{IM_START}assistant{nl}{THINK_OPEN}{nl}");
+        apply_no_think_prefix(&mut p);
+        assert!(p.ends_with(&empty), "got {p:?}");
+        let mut again = p.clone();
+        apply_no_think_prefix(&mut again);
+        assert_eq!(p, again, "apply_no_think_prefix must be idempotent");
+
+        let mut bare = format!("{IM_START}assistant{nl}");
+        apply_no_think_prefix(&mut bare);
+        assert!(bare.ends_with(&empty), "got {bare:?}");
+
+        // An already explicitly-closed reasoning block is left untouched.
+        let mut closed = format!("{IM_START}assistant{nl}{empty}");
+        let before = closed.clone();
+        apply_no_think_prefix(&mut closed);
+        assert_eq!(closed, before);
+    }
     #[test]
     fn profile_parses_defaults() {
         let p =
