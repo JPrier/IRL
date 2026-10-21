@@ -15,16 +15,23 @@ still requires model assets or hardware we did not have.
 > * `cargo run -p scenario-runner` → **10/10** simulated-player scenarios pass.
 > * `cargo run -p game` → playable text client with movement, conversation,
 >   conditional bargains, threats, investigation and save/load.
+> * `cargo run -p game -- --model .cache/models/Qwen3.5-0.8B-Q4_K_M.gguf` →
+>   the playable client talks to a **real local GGUF model** (llama.cpp); NPC
+>   decisions are grammar-constrained JSON and validated by the simulation.
+> * `cargo run -p model-bench -- --profile docs/benchmarks/qwen35-0.8b.json` →
+>   real load/warm/prefill/decode latency, tokens/s and structured-action rate.
 > * `cargo run -p model-bench -- --speech` → real WAV output + streaming
 >   buffer metrics for the **diagnostic (non-neural)** synthesizer.
 >
 > **Not yet verified / NOT TESTED**
-> * Real local **LLM** latency/quality (no GGUF weights bundled).
 > * Real **neural TTS/ASR** (no model assets bundled; the diagnostic tone is not
 >   speech and is not evidence of TTS quality).
 > * **Bevy 0.20 desktop renderer** (the shipped client is a text console; the
 >   simulation is renderer-agnostic by design).
 > * Steam Deck / low-end hardware numbers.
+> * Raw decision quality of the 0.8B model. It is usable but weak: the
+>   authoritative policy enforces satisfied obligations and designed bargains,
+>   and any fallback is always reported rather than hidden.
 
 ## Quick start
 
@@ -38,8 +45,14 @@ cargo test --workspace
 # Headless simulated-player acceptance suite
 cargo run -p scenario-runner -- --seed 2026
 
-# Play the text vertical slice
+# Play the text vertical slice (deterministic baseline)
 cargo run -p game
+
+# Play against a real local GGUF model (weights are gitignored; see docs/benchmarks)
+cargo run -p game -- --model .cache/models/Qwen3.5-0.8B-Q4_K_M.gguf
+
+# Measure a real model profile (load/warm/prefill/decode/structured validity)
+cargo run -p model-bench -- --profile docs/benchmarks/qwen35-0.8b.json
 
 # Integrated speech/buffer benchmark (diagnostic device)
 cargo run -p model-bench -- --speech
@@ -91,6 +104,18 @@ cargo run -p model-bench -- --list-models
 * Director role-promotion proposals, validated by the narrative controller.
 * Inner-circle facts are filtered out of non-inner-circle prompts.
 
+### Inference (`crates/inference`)
+* Resident `llama.cpp` backend behind `InferenceEngine`: weights load once and
+  are reused for every NPC turn.
+* GGUF chat template is used when available, with a ChatML fallback; a
+  `no_think` normalisation works around the binding's missing template kwargs.
+* Tool decisions are constrained with a JSON-schema→GBNF grammar, and
+  `LlamaSampler::sample` is used correctly (it accepts internally — double
+  accepting was the cause of a native grammar abort).
+* Streaming tokens, deadlines, cooperative cancellation and honest errors.
+* Malformed raw grammars fail loudly; constrained decoding stops at the first
+  complete JSON value instead of running into the grammar's terminal state.
+
 ### Persistence (`crates/persistence`)
 * Versioned JSON save/load.
 * SQLite event store with migrations, transactional bulk append, idempotent
@@ -124,6 +149,7 @@ crates/
   narrative/     anchors, checkpoints, clue validation, director commits
   sim/           authoritative clock, events, action validation, economy
   agents/        NPC context/policy, inference scheduler, director proposals
+  inference/     resident llama.cpp backend, model profiles, JSON grammar
   speech/        WAV I/O, diagnostic synth, streaming metrics, neural port
   persistence/   JSON snapshots + SQLite event store
   content/       the handcrafted Hidden Mafia town (8 locations, 14 NPCs)
@@ -163,9 +189,11 @@ ports without touching gameplay.
 1. **No neural voice yet.** The pipeline, WAV output and metrics are real; the
    neural backends are ports with clear failure modes. Installing a compliant
    local TTS/ASR model is the next integration step.
-2. **No real LLM yet.** The deterministic policy and JSON contract are in
-   place. A `llama.cpp`/`mistral.rs` backend can implement `InferenceEngine`
-   without changing the simulation.
+2. **The 0.8B model is the only measured LLM.** Real GGUF inference,
+   grammar-constrained tool decisions and the playable loop work, but raw
+   0.8B decision quality is limited; larger models (2B+) are NOT TESTED. The
+   simulation enforces knowledge boundaries, satisfied obligations and the
+   designed bargain regardless of what the model proposes.
 3. **No Bevy renderer.** The text client proves the gameplay loop; the
    simulation is already renderer-agnostic.
 4. **No hardware matrix.** All numbers in `docs/benchmarks/` are from the

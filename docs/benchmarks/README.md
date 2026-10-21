@@ -2,7 +2,8 @@
 
 Everything below was produced by the commands shown, on the host described.
 **Read the caveats**: the speech numbers come from a diagnostic, non-neural
-device, and no real LLM measurements have been taken.
+device. The LLM numbers *are* from a real local GGUF model (see §5), but only
+the 0.8B model has been measured.
 
 ## Host
 
@@ -85,17 +86,61 @@ cargo run -p model-bench -- --list-models
 |---|---|
 | heuristic (no-LLM baseline) | VERIFIED-DETERMINISTIC |
 | scripted (test double) | VERIFIED-DETERMINISTIC |
-| Qwen3.5-0.8B / 2B / 4B | NOT TESTED |
+| Qwen3.5-0.8B-Q4_K_M | **MEASURED** (real GGUF, CPU) |
+| Qwen3.5-2B / 4B | NOT TESTED |
 | Qwen3-1.7B | NOT TESTED |
 | LFM2.5-1.2B-Instruct | NOT TESTED |
 | Gemma 3 1B | NOT TESTED |
 
+## 5. Real local LLM — Qwen3.5-0.8B-Q4_K_M (CPU)
+
+```bash
+cargo run -p model-bench -- --profile docs/benchmarks/qwen35-0.8b.json \
+  --turns 3 --seed 2026 --json --out docs/benchmarks/qwen35-0.8b-report.json
+```
+
+Profile: `.cache/models/Qwen3.5-0.8B-Q4_K_M.gguf` (507 MiB), `n_ctx=4096`,
+`n_threads=8`, CPU only. The model file is gitignored; the raw report is
+committed at [`qwen35-0.8b-report.json`](qwen35-0.8b-report.json).
+
+| Metric | Value |
+|---|---:|
+| Load time | 576 ms |
+| Warm-up time | 257 ms |
+| Avg prefill | 777 ms |
+| Avg first token | 40 ms |
+| Avg decode | 2630 ms |
+| Decode throughput | 11.0 tok/s |
+| Structured JSON validity | 3/3 (100%) |
+| Invalid / rejected decisions | 0 |
+| Peak RSS | not measurable on Windows (reported `null`) |
+
+Dialogue probe (unconstrained, `no_think`): 26 tokens in 554 ms, non-empty,
+**no reasoning block leaked** into the output.
+
+Repeated gameplay (3 seeds): `gameplay_pass_rate = 1.0`; each run negotiated the
+conditional bargain, satisfied the commitment and disclosed `f_grocer_ledger`
+(`memory_consistent = true`), with **0 deterministic fallbacks**. When the
+model's own action does not honour a satisfied deal, the policy substitutes the
+canonical action and reports `canonical-obligation`/`canonical-agenda` — those
+are counted separately and never presented as model output.
+
+Real-model regression tests (weights required, `#[ignore]` by default):
+
+```bash
+RPG_TEST_MODEL=.cache/models/Qwen3.5-0.8B-Q4_K_M.gguf \
+  cargo test -p rpg_inference --test model_integration -- --ignored
+```
+
+They cover 5 repeated schema-valid JSON decisions, malformed grammars failing
+loudly, cancellation, and deadlines.
+
 ## NOT TESTED (explicit)
 
-* First-token / first-audio latency for any real LLM.
+* Any model larger than 0.8B (2B/4B/other families).
+* GPU/Vulkan/ROCm/CUDA paths, VRAM peaks, thermal throttling.
 * Neural TTS real-time factor, naturalness, voice differentiation.
 * ASR accuracy on game vocabulary, accents, noise, interruption.
-* GPU/Vulkan/ROCm/CUDA paths, VRAM peaks, thermal throttling.
 * Steam Deck and low-end integrated GPU.
 * Human blind playtests and inter-rater quality scoring.
 * 90% line coverage instrumentation (tests exist; `tarpaulin`/`llvm-cov` is not
