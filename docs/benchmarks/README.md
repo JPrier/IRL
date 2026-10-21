@@ -160,7 +160,10 @@ Neural TTS/ASR real-time factor **is** now measured; see
 [`voice-neural.md`](voice-neural.md). The **integrated**
 WAV→ASR→LLM→TTS pipeline (all engines resident and CPU-contending) is also
 measured, including the observation that TTS slows to 1.24–2.13× under that
-contention; see [`voice-integrated.md`](voice-integrated.md).
+contention; see [`voice-integrated.md`](voice-integrated.md). Model **behaviour**
+beyond the single scripted bargain is also evaluated across eight unrelated
+player phrasings, with model-vs-canonical provenance split out; see
+[`behavior-milestone-d.md`](behavior-milestone-d.md).
 
 Publishing a "Steam Deck compatible" or "faster than speech" claim without
 running the corresponding row is explicitly forbidden by the design brief.

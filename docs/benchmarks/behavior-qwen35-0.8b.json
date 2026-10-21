@@ -1,0 +1,136 @@
+{
+  "cases": [
+    {
+      "canonical_decisions": 1,
+      "fallback_decisions": 0,
+      "final_source": "canonical-obligation (satisfied deal requires f_grocer_ledger)",
+      "ledger_disclosed": true,
+      "model_decisions": 1,
+      "opening": "I need to see your ledger.",
+      "opening_source": "model",
+      "trace": [
+        "player -> grocer: I need to see your ledger. [Accepted]",
+        "grocer -> make_offer [model]: Pending { offer: Some(OfferId(1)), commitment: None }",
+        "player -> grocer: The medicine is yours. The ledger? [Accepted]",
+        "grocer -> share_claim [canonical-obligation (satisfied deal requires f_grocer_ledger)]: Accepted"
+      ]
+    },
+    {
+      "canonical_decisions": 0,
+      "fallback_decisions": 0,
+      "final_source": "model",
+      "ledger_disclosed": false,
+      "model_decisions": 2,
+      "opening": "Show me the book where you record the dock payments.",
+      "opening_source": "model",
+      "trace": [
+        "player -> grocer: Show me the book where you record the dock payments. [Accepted]",
+        "grocer -> share_claim [model]: Accepted",
+        "player -> grocer: The medicine is yours. The ledger? [Accepted]",
+        "grocer -> make_offer [model]: Pending { offer: Some(OfferId(1)), commitment: None }"
+      ]
+    },
+    {
+      "canonical_decisions": 1,
+      "fallback_decisions": 0,
+      "final_source": "canonical-obligation (satisfied deal requires f_grocer_ledger)",
+      "ledger_disclosed": true,
+      "model_decisions": 1,
+      "opening": "What can you tell me about the shipments from the docks?",
+      "opening_source": "model",
+      "trace": [
+        "player -> grocer: What can you tell me about the shipments from the docks? [Accepted]",
+        "grocer -> make_offer [model]: Pending { offer: Some(OfferId(1)), commitment: None }",
+        "player -> grocer: The medicine is yours. The ledger? [Accepted]",
+        "grocer -> share_claim [canonical-obligation (satisfied deal requires f_grocer_ledger)]: Accepted"
+      ]
+    },
+    {
+      "canonical_decisions": 0,
+      "fallback_decisions": 0,
+      "final_source": "model",
+      "ledger_disclosed": false,
+      "model_decisions": 2,
+      "opening": "I heard you keep a record of who pays you.",
+      "opening_source": "model",
+      "trace": [
+        "player -> grocer: I heard you keep a record of who pays you. [Accepted]",
+        "grocer -> share_claim [model]: Accepted",
+        "player -> grocer: The medicine is yours. The ledger? [Accepted]",
+        "grocer -> make_offer [model]: Pending { offer: Some(OfferId(1)), commitment: None }"
+      ]
+    },
+    {
+      "canonical_decisions": 1,
+      "fallback_decisions": 0,
+      "final_source": "canonical-obligation (satisfied deal requires f_grocer_ledger)",
+      "ledger_disclosed": true,
+      "model_decisions": 1,
+      "opening": "Who has been paying you, Marta?",
+      "opening_source": "model",
+      "trace": [
+        "player -> grocer: Who has been paying you, Marta? [Accepted]",
+        "grocer -> make_offer [model]: Pending { offer: Some(OfferId(1)), commitment: None }",
+        "player -> grocer: The medicine is yours. The ledger? [Accepted]",
+        "grocer -> share_claim [canonical-obligation (satisfied deal requires f_grocer_ledger)]: Accepted"
+      ]
+    },
+    {
+      "canonical_decisions": 1,
+      "fallback_decisions": 0,
+      "final_source": "canonical-obligation (satisfied deal requires f_grocer_ledger)",
+      "ledger_disclosed": true,
+      "model_decisions": 1,
+      "opening": "Hand over the ledger and no one gets hurt.",
+      "opening_source": "model",
+      "trace": [
+        "player -> grocer: Hand over the ledger and no one gets hurt. [Accepted]",
+        "grocer -> make_offer [model]: Pending { offer: Some(OfferId(1)), commitment: None }",
+        "player -> grocer: The medicine is yours. The ledger? [Accepted]",
+        "grocer -> share_claim [canonical-obligation (satisfied deal requires f_grocer_ledger)]: Accepted"
+      ]
+    },
+    {
+      "canonical_decisions": 0,
+      "fallback_decisions": 0,
+      "final_source": "model",
+      "ledger_disclosed": false,
+      "model_decisions": 2,
+      "opening": "Good morning — how is your daughter feeling?",
+      "opening_source": "model",
+      "trace": [
+        "player -> grocer: Good morning — how is your daughter feeling? [Accepted]",
+        "grocer -> idle [model]: Accepted",
+        "player -> grocer: The medicine is yours. The ledger? [Accepted]",
+        "grocer -> make_offer [model]: Pending { offer: Some(OfferId(1)), commitment: None }"
+      ]
+    },
+    {
+      "canonical_decisions": 1,
+      "fallback_decisions": 0,
+      "final_source": "canonical-obligation (satisfied deal requires f_grocer_ledger)",
+      "ledger_disclosed": true,
+      "model_decisions": 1,
+      "opening": "I can bring medicine for your daughter.",
+      "opening_source": "model",
+      "trace": [
+        "player -> grocer: I can bring medicine for your daughter. [Accepted]",
+        "grocer -> make_offer [model]: Pending { offer: Some(OfferId(1)), commitment: None }",
+        "player -> grocer: The medicine is yours. The ledger? [Accepted]",
+        "grocer -> share_claim [canonical-obligation (satisfied deal requires f_grocer_ledger)]: Accepted"
+      ]
+    }
+  ],
+  "disclosed": 5,
+  "harness": "model-bench --behavior",
+  "milestone": "D",
+  "model_id": "qwen35-0.8b-q4_k_m",
+  "openings": 8,
+  "provenance_totals": {
+    "canonical": 5,
+    "fallback": 0,
+    "model": 11
+  },
+  "real_model": true,
+  "seed": 2026
+}

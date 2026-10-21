@@ -36,6 +36,21 @@ fn main() {
         speech_bench();
         return;
     }
+    if args.iter().any(|a| a == "--behavior") {
+        match arg_value(&args, "--profile") {
+            Some(profile) => {
+                let code = behaviour_bench(&args, profile);
+                if code != 0 {
+                    std::process::exit(code);
+                }
+            }
+            None => {
+                eprintln!("model-bench: --behavior requires --profile <file.json>");
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
     if let Some(profile) = arg_value(&args, "--profile") {
         let code = profile_bench(&args, profile);
         if code != 0 {
@@ -368,6 +383,162 @@ fn profile_bench(args: &[String], profile_path: &str) -> i32 {
     0
 }
 
+/// Milestone D: does the town resolve *unanticipated* player approaches, and
+/// how much of that is the model versus the canonical policy?
+///
+/// Each case opens the grocer conversation with a different natural phrasing,
+/// completes the medicine-for-ledger bargain the ordinary way, then asks again.
+/// Provenance is reported per turn and in total: a canonical correction is
+/// robustness, **not** evidence the model reasoned correctly, so it is counted
+/// separately from `model` decisions.
+fn behaviour_bench(args: &[String], profile_path: &str) -> i32 {
+    let seed: u64 = arg_value(args, "--seed")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2026);
+    let out = arg_value(args, "--out");
+    let json = args.iter().any(|a| a == "--json");
+
+    let profile = match ModelProfile::load(profile_path) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("model-bench: cannot load profile {profile_path}: {e}");
+            return 2;
+        }
+    };
+    if !std::path::Path::new(&profile.model_path).exists() {
+        eprintln!(
+            "model-bench: MISSING MODEL ASSET '{}' for profile '{}'",
+            profile.model_path, profile.id
+        );
+        eprintln!("model-bench: refusing to substitute heuristic results for a real profile.");
+        return 3;
+    }
+    let mut engine = match LlamaEngine::load(profile.clone()) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("model-bench: failed to load model: {e}");
+            return 4;
+        }
+    };
+    if let Err(e) = engine.warm() {
+        eprintln!("model-bench: warm-up failed: {e}");
+        return 5;
+    }
+    let mut engine: Box<dyn InferenceEngine> = Box::new(engine);
+
+    println!("# model-bench: MILESTONE D behaviour battery");
+    println!("# profile: {} ({})", profile.id, profile_path);
+    println!("# seed: {seed}\n");
+
+    let openings = [
+        "I need to see your ledger.",
+        "Show me the book where you record the dock payments.",
+        "What can you tell me about the shipments from the docks?",
+        "I heard you keep a record of who pays you.",
+        "Who has been paying you, Marta?",
+        "Hand over the ledger and no one gets hurt.",
+        "Good morning — how is your daughter feeling?",
+        "I can bring medicine for your daughter.",
+    ];
+
+    let player = ActorId::new(PLAYER);
+    let ledger = FactId::new("f_grocer_ledger");
+    let mut cases = Vec::new();
+    let (mut tot_model, mut tot_canon, mut tot_fall) = (0usize, 0usize, 0usize);
+    let mut disclosed = 0usize;
+
+    for opening in openings {
+        let mut s = rpg_eval::Session::with_engine(seed, engine);
+        s.teleport_player_to("grocer");
+        let opening_source = say_and_source(&mut s, opening);
+        s.tick();
+
+        // Complete the ordinary bargain so the world predicate is satisfied.
+        if let Some(offer) = s
+            .sim
+            .world
+            .offers
+            .values()
+            .find(|o| o.from.as_str() == "grocer")
+            .map(|o| o.id)
+        {
+            let _ = s.player_do(Action::AcceptOffer { offer });
+        }
+        s.give("medicine", 1);
+        let _ = s.player_do(Action::TransferItem {
+            target: ActorId::new("grocer"),
+            item: ItemId::new("medicine"),
+            qty: 1,
+        });
+        s.tick();
+        let final_source = say_and_source(&mut s, "The medicine is yours. The ledger?");
+
+        let learned = s.sim.world.believes(&player, &ledger);
+        if learned {
+            disclosed += 1;
+        }
+        tot_model += s.model_decisions();
+        tot_canon += s.canonical_decisions();
+        tot_fall += s.fallback_decisions();
+        cases.push(serde_json::json!({
+            "opening": opening,
+            "opening_source": opening_source,
+            "final_source": final_source,
+            "ledger_disclosed": learned,
+            "model_decisions": s.model_decisions(),
+            "canonical_decisions": s.canonical_decisions(),
+            "fallback_decisions": s.fallback_decisions(),
+            "trace": s.trace.clone(),
+        }));
+        engine = s.into_engine();
+    }
+
+    for c in &cases {
+        println!(
+            "  {:<54} disclosed={:<5} opening={:<10} final={}",
+            c["opening"].as_str().unwrap_or(""),
+            c["ledger_disclosed"],
+            c["opening_source"].as_str().unwrap_or(""),
+            c["final_source"].as_str().unwrap_or(""),
+        );
+    }
+    println!(
+        "\nindependent openings that reached the ledger: {disclosed}/{}",
+        cases.len()
+    );
+    println!(
+        "provenance totals: model {tot_model}, canonical {tot_canon}, heuristic fallback {tot_fall}"
+    );
+
+    let report = serde_json::json!({
+        "harness": "model-bench --behavior",
+        "milestone": "D",
+        "real_model": true,
+        "model_id": profile.id,
+        "seed": seed,
+        "openings": cases.len(),
+        "disclosed": disclosed,
+        "provenance_totals": {
+            "model": tot_model,
+            "canonical": tot_canon,
+            "fallback": tot_fall,
+        },
+        "cases": cases,
+    });
+    print_report(&report, out, json);
+    0
+}
+
+/// Say `text` to the grocer and return the provenance label of the resulting
+/// NPC decision (`model`, `canonical-obligation`, `heuristic-fallback`, ...).
+fn say_and_source(s: &mut rpg_eval::Session, text: &str) -> String {
+    s.say("grocer", text);
+    s.decisions
+        .last()
+        .map(|(_, d)| d.label())
+        .unwrap_or_else(|| "none".into())
+}
+
 fn run_gameplay(
     engine: Box<dyn InferenceEngine>,
     seed: u64,
@@ -465,6 +636,7 @@ fn help() {
     println!(
         "model-bench [options]\n\
          \x20 --profile PATH    run a real ModelProfile JSON (REAL model)\n\
+         \x20 --behavior         Milestone D paraphrase/provenance battery (needs --profile)\n\
          \x20 --seed N          seed (default 2026)\n\
          \x20 --turns N         structured-decision battery size (default 5)\n\
          \x20 --out PATH        write the JSON report\n\
