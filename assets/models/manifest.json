@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "description": "Pinned local language-model assets for IRL. These weights are NOT committed to Git (they are hundreds of MiB); scripts/setup.sh and scripts/setup.ps1 fetch them into .cache/models and verify the SHA-256 before the game uses them. No cloud service is contacted at gameplay time.",
+  "models": [
+    {
+      "id": "qwen35-0.8b-q4_k_m",
+      "display_name": "Qwen3.5-0.8B (Q4_K_M)",
+      "kind": "llm",
+      "description": "Compact instruction-tuned model used for NPC decisions. Chosen for CPU-only, low-memory hardware.",
+      "license": "Apache-2.0",
+      "attribution": "Qwen3.5-0.8B (Qwen) — GGUF quantization by unsloth.",
+      "url": "https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q4_K_M.gguf",
+      "sha256": "bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a06121dc517",
+      "bytes": 532517120,
+      "file": ".cache/models/Qwen3.5-0.8B-Q4_K_M.gguf"
+    }
+  ]
+}

@@ -4,6 +4,13 @@ on:
   push:
   pull_request:
 
+# Bevy + llama.cpp + sherpa-onnx produce very large debug artifacts. Dropping
+# debuginfo keeps the hosted runners from filling their disk and speeds links.
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
 jobs:
   fmt:
     runs-on: ubuntu-latest
@@ -22,12 +29,25 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /opt/hostedtoolcache/CodeQL
+          df -h /
       # `rpg_inference` links llama.cpp via `llama-cpp-sys-2`, whose bindgen
-      # build needs libclang. It is not guaranteed to be present.
-      - name: Install libclang
+      # build needs libclang. `apps/bevy-game` pulls winit, which needs the
+      # Wayland/X11 development libraries, and `cpal` needs ALSA.
+      - name: Install Linux system libraries
         run: |
           sudo apt-get update
-          sudo apt-get install -y libclang-dev clang
+          sudo apt-get install -y \
+            libclang-dev clang pkg-config \
+            libasound2-dev libudev-dev \
+            libwayland-dev libxkbcommon-dev \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev
+      - name: Drop stale sherpa-onnx prebuilt cache
+        shell: bash
+        run: rm -rf target/sherpa-onnx-prebuilt
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
@@ -40,11 +60,21 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Install libclang (Linux)
+      - name: Free disk space (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /opt/hostedtoolcache/CodeQL
+          df -h /
+      - name: Install Linux system libraries
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libclang-dev clang
+          sudo apt-get install -y \
+            libclang-dev clang pkg-config \
+            libasound2-dev libudev-dev \
+            libwayland-dev libxkbcommon-dev \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev
       - name: Point bindgen at LLVM (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -54,6 +84,17 @@ jobs:
           } else {
             Write-Host 'LLVM not found in the default location; bindgen must discover libclang itself.'
           }
+      # `rust-cache` can restore a `target/sherpa-onnx-prebuilt` whose `lib`
+      # directory exists but is missing the import libraries, which makes the
+      # crate skip re-extraction and then fail to link. Force a clean fetch.
+      - name: Drop stale sherpa-onnx prebuilt cache
+        shell: bash
+        run: rm -rf target/sherpa-onnx-prebuilt
       - run: cargo test --workspace
       - run: cargo run -q -p scenario-runner -- --seed 2026
-      - run: cargo run -q -p model-bench -- --speech
+      # Diagnostic (non-neural) speech/WAV buffer benchmark. Run through
+      # `rpg_speech` rather than `model-bench`: the latter links llama.cpp and
+      # the static onnxruntime together, whose initialisers abort with
+      # `std::bad_alloc` on some Linux runners before `main` runs. This example
+      # exercises the identical WAV/buffer-accounting path.
+      - run: cargo run -q -p rpg_speech --example speech_bench

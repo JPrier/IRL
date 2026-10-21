@@ -53,9 +53,23 @@ failure.
 * SQLite append is idempotent (primary-key `INSERT OR REPLACE`) and transactional.
 
 ### 4. Speech pipeline
-`cargo run -p model-bench -- --speech` synthesizes 5 s / 15 s / 40 s utterances,
-writes real WAV files, and reports audio-seconds per wall-second, underruns and
-minimum buffer lead. It is explicitly a **diagnostic, non-neural** device.
+Synthesizes 5 s / 15 s / 40 s utterances, writes real WAV files, and reports
+audio-seconds per wall-second, underruns and minimum buffer lead. It is
+explicitly a **diagnostic, non-neural** device.
+
+Two entry points run the identical measurement:
+
+```bash
+cargo run -p rpg_speech --example speech_bench   # CI: links only the speech stack
+cargo run -p model-bench -- --speech             # dev host: same measurement
+```
+
+Hosted Linux CI uses the `rpg_speech` example because the combined `model-bench`
+binary links llama.cpp and the static onnxruntime together, and their native
+initialisers abort with `std::bad_alloc` on that runner before `main` runs. The
+example links only the speech stack and covers the same WAV/buffer-accounting
+path, so no coverage is lost. `model-bench --speech` remains the documented
+developer command.
 
 ## Commands
 
@@ -64,7 +78,7 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo run -p scenario-runner -- --seed 2026
-cargo run -p model-bench -- --speech
+cargo run -p rpg_speech --example speech_bench   # diagnostic WAV/buffer accounting
 ```
 
 `make verify` runs the first four.
@@ -74,7 +88,8 @@ cargo run -p model-bench -- --speech
 * `fmt` job: `cargo fmt --all --check`.
 * `clippy` job: `cargo clippy --workspace --all-targets -- -D warnings`.
 * `test` job (Ubuntu + Windows): `cargo test --workspace`, then
-  `cargo run -p scenario-runner`, then the diagnostic speech benchmark.
+  `cargo run -p scenario-runner`, then the diagnostic speech benchmark via
+  `cargo run -p rpg_speech --example speech_bench` (see §4).
 
 Real-model and neural-voice jobs are intentionally **not** in hosted CI: they
 need multi-GB assets and representative hardware. They belong in a self-hosted
