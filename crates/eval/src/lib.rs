@@ -172,7 +172,7 @@ impl Session {
         self.next_request += 1;
         let kind = decision.proposal.action.kind_name().to_string();
         let source = decision.source.clone();
-        let spoken = spoken_line(&decision.proposal.action);
+        let spoken = spoken_line_in(&self.sim.world, &decision.proposal.action);
         let out = self.sim.apply(&decision.proposal);
         self.trace
             .push(format!("{npc} -> {kind} [{}]: {out:?}", source.label()));
@@ -277,6 +277,24 @@ pub fn spoken_line(action: &Action) -> Option<String> {
     } else {
         Some(trimmed.to_string())
     }
+}
+
+/// Like [`spoken_line`], but also renders actions whose words live in the world
+/// model.
+///
+/// `ShareClaim` is how an NPC discloses a fact they believe. Its audible text is
+/// the fact's canonical `statement`; the simulation only accepts the claim when
+/// the speaker actually believes it, so speaking the statement never leaks a
+/// secret the character could not know.
+pub fn spoken_line_in(world: &rpg_domain::world::World, action: &Action) -> Option<String> {
+    if let Action::ShareClaim { fact, .. } = action {
+        return world
+            .facts
+            .get(fact)
+            .map(|f| f.statement.trim().to_string())
+            .filter(|s| !s.is_empty());
+    }
+    spoken_line(action)
 }
 
 #[derive(Clone, Debug)]
@@ -960,6 +978,24 @@ pub fn leaderboard(results: &[ScenarioResult]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn share_claim_speaks_the_grounded_fact_statement() {
+        let session = Session::new(2026);
+        let claim = Action::ShareClaim {
+            target: ActorId::new(PLAYER),
+            fact: FactId::new("f_grocer_ledger"),
+            assertive: true,
+        };
+        let line = spoken_line_in(&session.sim.world, &claim).expect("statement");
+        assert!(line.contains("ledger"), "unexpected line: {line}");
+
+        // A purely mechanical action still has no spoken line.
+        let silent = Action::Investigate {
+            target: InvestigateTarget::Location(LocationId::new("plaza")),
+        };
+        assert!(spoken_line_in(&session.sim.world, &silent).is_none());
+    }
 
     #[test]
     fn all_builtin_scenarios_pass() {

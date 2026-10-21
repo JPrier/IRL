@@ -506,7 +506,12 @@ fn write_reply(o: &Opts, tts: &mut SherpaTts, text: &str) {
         sample_rate: 24_000,
     }) {
         Ok(audio) => match rpg_speech::write_wav(path, &audio) {
-            Ok(()) => println!("[tts] wrote {path} ({:.2}s audio)", audio.audio_seconds()),
+            Ok(()) => println!(
+                "[tts] wrote {path} ({:.2}s audio in {:.0} ms, {:.2}x real time)",
+                audio.audio_seconds(),
+                audio.synth_ms,
+                audio.real_time_factor()
+            ),
             Err(e) => eprintln!("[tts] {e}"),
         },
         Err(e) => eprintln!("[tts] {e}"),
