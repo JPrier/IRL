@@ -44,45 +44,78 @@ still requires model assets or hardware we did not have.
 >   authoritative policy enforces satisfied obligations and designed bargains,
 >   and any fallback is always reported rather than hidden.
 
-## Quick start
+## Quick start (one command)
+
+Everything the game needs is fetched, checksum-verified and cached locally by a
+single setup step; after that the game runs fully offline. Nothing large is
+committed to Git — `.cache/` is ignored and the setup scripts download it.
 
 ```bash
-# Build everything
-cargo build --workspace
+git clone https://github.com/JPrier/IRL && cd IRL
 
-# Run the full test suite (unit, integration, scenarios, replay, persistence)
+# Linux / macOS
+./scripts/setup.sh      # fetch + verify neural speech assets and the local model
+./scripts/play.sh       # build and launch the graphical, voice-native client
+```
+
+```powershell
+# Windows (PowerShell)
+.\scripts\setup.ps1
+.\scripts\play.ps1
+```
+
+`make play` is the same as `./scripts/play.sh`, and `scripts/play.*` runs setup
+automatically on first launch if anything is missing, so in practice:
+
+```bash
+./scripts/play.sh       # does setup if needed, then launches the game
+```
+
+### What setup downloads
+
+| Asset | Size | License | Location |
+|---|---|---|---|
+| Kokoro 82M TTS (11 voices) | ~320 MiB | Apache-2.0 | `.cache/speech/` |
+| Whisper tiny.en ASR (int8) | ~118 MiB | MIT | `.cache/speech/` |
+| Silero VAD | 0.6 MiB | MIT | `.cache/speech/` |
+| Qwen3.5-0.8B Q4_K_M (LLM) | ~508 MiB | Apache-2.0 | `.cache/models/` |
+
+Speech assets are pinned by URL + SHA-256 in
+[`assets/speech/manifest.json`](assets/speech/manifest.json); the model is pinned
+the same way in [`assets/models/manifest.json`](assets/models/manifest.json).
+Setup verifies every checksum and fails loudly on a mismatch.
+
+### Controls (graphical client)
+
+`WASD` walk · `V` hold a voice conversation · `Y`/`N` accept/reject an offer ·
+`Tab` next offer · `E` investigate · `F5`/`F9` save/load · `F3` developer
+diagnostics · `Esc` quit.
+
+### Text-only client
+
+```bash
+cargo run -p game                                                    # deterministic baseline
+cargo run -p game -- --model .cache/models/Qwen3.5-0.8B-Q4_K_M.gguf # real local model
+```
+
+### Developer and benchmark commands
+
+```bash
+# Full test suite, then the headless simulated-player acceptance gate
 cargo test --workspace
-
-# Headless simulated-player acceptance suite
 cargo run -p scenario-runner -- --seed 2026
 
-# Play the text vertical slice (deterministic baseline)
-cargo run -p game
-
-# Play against a real local GGUF model (weights are gitignored; see docs/benchmarks)
-cargo run -p game -- --model .cache/models/Qwen3.5-0.8B-Q4_K_M.gguf
-
-# Measure a real model profile (load/warm/prefill/decode/structured validity)
+# Real-model latency and behaviour
 cargo run -p model-bench -- --profile docs/benchmarks/qwen35-0.8b.json
+cargo run -p model-bench -- --behavior --profile docs/benchmarks/qwen35-0.8b.json
 
-# Integrated speech/buffer benchmark (diagnostic device)
-cargo run -p model-bench -- --speech
-
-# Real offline neural voice (requires the pinned assets; see docs/benchmarks/voice-neural.md)
-cargo run --release -p voice-demo -- install
+# Neural speech harness (install/list/bench/roundtrip/mic)
 cargo run --release -p voice-demo -- list
 cargo run --release -p voice-demo -- bench
 cargo run --release -p voice-demo -- roundtrip path/to/speech.wav --play
-cargo run --release -p voice-demo -- mic   # live microphone loop
+cargo run --release -p voice-demo -- mic
 
-# Full offline voice conversation (WAV fixture -> ASR -> local LLM -> validation)
-cargo run --release -p voice-play -- once path/to/speech.wav \
-  --model .cache/models/Qwen3.5-0.8B-Q4_K_M.gguf
-
-# Graphical Bevy client (real model + neural voice)
-cargo run -p bevy-game -- --model .cache/models/Qwen3.5-0.8B-Q4_K_M.gguf
-
-# Candidate model matrix (status + evidence)
+# Model matrix (status + evidence)
 cargo run -p model-bench -- --list-models
 ```
 
