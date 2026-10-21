@@ -1,0 +1,180 @@
+# Agentic RPG — Rust vertical slice
+
+An offline-first, deterministic, **agentic** RPG prototype: a small town where
+NPCs have persistent beliefs, goals and relationships; conversations and actions
+are validated by an authoritative Rust simulation; a director can place
+flexible clues; and spies only learn what they actually perceive.
+
+This repository is the **first production-quality increment** described in
+[`docs/design/agentic_rpg_rust_prototype_agent_prompt.md`](docs/design/agentic_rpg_rust_prototype_agent_prompt.md).
+It is deliberately honest about what is implemented and verified versus what
+still requires model assets or hardware we did not have.
+
+> **TL;DR — verified today**
+> * `cargo test --workspace` → all unit + integration tests pass.
+> * `cargo run -p scenario-runner` → **10/10** simulated-player scenarios pass.
+> * `cargo run -p game` → playable text client with movement, conversation,
+>   conditional bargains, threats, investigation and save/load.
+> * `cargo run -p model-bench -- --speech` → real WAV output + streaming
+>   buffer metrics for the **diagnostic (non-neural)** synthesizer.
+>
+> **Not yet verified / NOT TESTED**
+> * Real local **LLM** latency/quality (no GGUF weights bundled).
+> * Real **neural TTS/ASR** (no model assets bundled; the diagnostic tone is not
+>   speech and is not evidence of TTS quality).
+> * **Bevy 0.20 desktop renderer** (the shipped client is a text console; the
+>   simulation is renderer-agnostic by design).
+> * Steam Deck / low-end hardware numbers.
+
+## Quick start
+
+```bash
+# Build everything
+cargo build --workspace
+
+# Run the full test suite (unit, integration, scenarios, replay, persistence)
+cargo test --workspace
+
+# Headless simulated-player acceptance suite
+cargo run -p scenario-runner -- --seed 2026
+
+# Play the text vertical slice
+cargo run -p game
+
+# Integrated speech/buffer benchmark (diagnostic device)
+cargo run -p model-bench -- --speech
+
+# Candidate model matrix (status + evidence)
+cargo run -p model-bench -- --list-models
+```
+
+## What works
+
+### Canonical simulation (`crates/sim`)
+* Fixed-step clock, A* navigation on a walled grid, movement over time.
+* Typed actions (`speak`, `move_to`, `make_offer`, `promise`, `share_claim`,
+  `investigate`, `threaten`, `report_crime`, `allocate_budget`, `repair`, …)
+  that are **validated before any state changes**.
+* Append-only event log with checksums; replaying the same seed + proposals
+  reproduces the same canonical events.
+* Offers and commitments are transactional: a trade only completes if both
+  sides actually hold their side; promises are satisfied by world predicates.
+
+### Perception (`crates/perception`)
+* Line of sight with wall occlusion, field-of-view cones, distance-based
+  hearing with wall attenuation, addressee inference, overhearers.
+* Spies receive subjective perception events, never the global transcript.
+
+### Social (`crates/social`)
+* Multi-dimensional relationships (trust, affection, respect, fear, anger,
+  sadness, temptation, suspicion, obligation, familiarity) — no single honor
+  meter.
+* Provenance-aware beliefs; a claim can be believed or doubted based on trust,
+  suspicion and confidence.
+* Rumor propagation with a tracked transmission chain.
+* Threats raise fear *and* anger; comfort reduces sadness; gifts create
+  obligation.
+
+### Narrative (`crates/narrative`)
+* Immutable anchors + flexible checkpoints.
+* Clue placement is rejected in already-inspected locations and for facts whose
+  prerequisites are not established.
+* The "three clue rule" is represented structurally (parallel candidate facts
+  and multiple eligible holders).
+* A seeded, fixed mystery answer (the mafia leader) supports genuine deduction.
+
+### Agents (`crates/agents`)
+* Minimal, scoped NPC context (identity, traits, relationships, the NPC's own
+  beliefs only, current turn).
+* Deterministic fallback policy plus a JSON action contract for a real model.
+* Priority scheduler (P0 player → P2 background).
+* Director role-promotion proposals, validated by the narrative controller.
+* Inner-circle facts are filtered out of non-inner-circle prompts.
+
+### Persistence (`crates/persistence`)
+* Versioned JSON save/load.
+* SQLite event store with migrations, transactional bulk append, idempotent
+  event ids and world snapshots.
+
+### Evaluation (`crates/eval`)
+* 10 deterministic simulated-player scenarios, including:
+  friendly investigation, conditional grocer bargain, private conversation with
+  a spy present, blackmail consequences, world progress while ignoring the plot,
+  save/reload continuity, deterministic replay, knowledge boundaries, three
+  independent routes and "the innocent grocer stays innocent".
+* `ScenarioResult` exposes per-check pass/fail detail, event counts and a
+  canonical checksum for CI gating.
+
+### Speech (`crates/speech`)
+* Real WAV encode/decode and file output.
+* Integrated streaming/buffer metric (`audio-seconds / wall-seconds`,
+  underruns, minimum lead).
+* `DiagnosticToneSynth` clearly labelled **non-neural** — for pipeline tests
+  only.
+* `MissingNeuralBackend` fails loudly with the expected asset path instead of
+  fabricating audio.
+
+## Workspace layout
+
+```
+crates/
+  domain/        stable IDs, geometry, world schema, actions, ports, RNG
+  perception/    line of sight, hearing, speech routing
+  social/        relationships, beliefs, commitments, rumours
+  narrative/     anchors, checkpoints, clue validation, director commits
+  sim/           authoritative clock, events, action validation, economy
+  agents/        NPC context/policy, inference scheduler, director proposals
+  speech/        WAV I/O, diagnostic synth, streaming metrics, neural port
+  persistence/   JSON snapshots + SQLite event store
+  content/       the handcrafted Hidden Mafia town (8 locations, 14 NPCs)
+  eval/          simulated players, 10 acceptance scenarios, metrics
+apps/
+  game/          playable text client
+  scenario-runner/  headless CI gate
+  model-bench/   model matrix + integrated speech benchmark
+docs/
+  design/        the authoritative game-design documents
+  research/      technical decisions and candidate manifest
+  benchmarks/    reproducible evidence and NOT-TESTED list
+  architecture.md
+  testing.md
+  playtest.md
+```
+
+The domain and simulation crates do **not** depend on Bevy, a model runtime or
+SQLite. A renderer or a real inference backend can be added behind the existing
+ports without touching gameplay.
+
+## Design principles enforced by tests
+
+* **Model output is a proposal, never truth.** Every action goes through
+  `Simulation::apply` → validation → typed event.
+* **Knowledge is provenance-bound.** NPCs cannot disclose facts they do not
+  believe; inner-circle secrets require inner-circle status.
+* **Privacy is mechanical.** Whispering in a private room does not reach a spy
+  in the shop.
+* **Attention is not evidence.** Repeatedly investigating the grocer does not
+  make them the leader; the fixed answer stays fixed.
+* **Determinism is a feature.** Same seed + same proposals ⇒ same event log
+  checksum.
+
+## Honest limitations
+
+1. **No neural voice yet.** The pipeline, WAV output and metrics are real; the
+   neural backends are ports with clear failure modes. Installing a compliant
+   local TTS/ASR model is the next integration step.
+2. **No real LLM yet.** The deterministic policy and JSON contract are in
+   place. A `llama.cpp`/`mistral.rs` backend can implement `InferenceEngine`
+   without changing the simulation.
+3. **No Bevy renderer.** The text client proves the gameplay loop; the
+   simulation is already renderer-agnostic.
+4. **No hardware matrix.** All numbers in `docs/benchmarks/` are from the
+   development host and are explicitly labelled; Deck/GPU tiers are NOT TESTED.
+
+See [`docs/research/2026-10-technical-decisions.md`](docs/research/2026-10-technical-decisions.md)
+for the full decision log and candidate manifest.
+
+## License
+
+Code: MIT OR Apache-2.0. The bundled design documents are project
+documentation. No third-party model weights are included in this repository.

@@ -1,0 +1,5 @@
+/target
+**/*.rs.bk
+agentic_rpg_save.json
+*.wav
+.DS_Store

@@ -1,0 +1,17 @@
+[package]
+name = "model-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Agentic RPG: local model + integrated speech benchmark harness."
+
+[dependencies]
+rpg_domain.workspace = true
+rpg_sim.workspace = true
+rpg_agents.workspace = true
+rpg_content.workspace = true
+rpg_eval.workspace = true
+rpg_speech.workspace = true
+serde.workspace = true
+serde_json.workspace = true

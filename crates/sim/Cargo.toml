@@ -1,0 +1,16 @@
+[package]
+name = "rpg_sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Agentic RPG: authoritative world simulation, action validation and event log."
+
+[dependencies]
+rpg_domain.workspace = true
+rpg_perception.workspace = true
+rpg_social.workspace = true
+rpg_narrative.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

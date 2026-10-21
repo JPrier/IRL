@@ -1,0 +1,16 @@
+[package]
+name = "rpg_content"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Agentic RPG: content layer."
+
+[dependencies]
+rpg_domain.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+rpg_sim.workspace = true

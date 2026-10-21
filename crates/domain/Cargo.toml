@@ -1,0 +1,15 @@
+[package]
+name = "rpg_domain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Stable IDs, schemas, facts, beliefs, actions and policy types for the Agentic RPG."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

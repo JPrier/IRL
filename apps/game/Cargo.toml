@@ -1,0 +1,15 @@
+[package]
+name = "game"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Agentic RPG binary: game."
+
+[dependencies]
+rpg_domain.workspace = true
+rpg_sim.workspace = true
+rpg_agents.workspace = true
+rpg_content.workspace = true
+rpg_eval.workspace = true
+rpg_persistence.workspace = true

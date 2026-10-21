@@ -1,0 +1,20 @@
+[package]
+name = "rpg_eval"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Agentic RPG: simulated-player scenarios, replay and quality metrics."
+
+[dependencies]
+rpg_domain.workspace = true
+rpg_sim.workspace = true
+rpg_agents.workspace = true
+rpg_content.workspace = true
+rpg_narrative.workspace = true
+rpg_social.workspace = true
+rpg_perception.workspace = true
+rpg_persistence.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
