@@ -1,0 +1,13 @@
+# voice-demo bench (real neural TTS + ASR)
+asr backend: sherpa-onnx/whisper (whisper-tiny-en)
+tts backend: sherpa-onnx/kokoro (neural)
+voice      : af_sarah
+
+text                                                  audio_s synth_ms   first_ms       rtf
+The ledger is behind the flour.                          2.04    807.0      807.0      2.53
+I will give you the medicine if you tell me who s…       2.97    943.5      943.5      3.15
+Come back after dark and we will talk about the s…       3.06    918.8      918.8      3.33
+
+aggregate: 8.07s audio in 2.67s wall = 3.02x real time
+asr       : 244.2 ms for 6.62s audio  (27.13x real time)
+asr text  : After early nightfall, the yellow lamps would light up here and there the squalid quarter of the brothels.

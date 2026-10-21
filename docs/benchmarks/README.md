@@ -1,9 +1,12 @@
 # Benchmark evidence
 
 Everything below was produced by the commands shown, on the host described.
-**Read the caveats**: the speech numbers come from a diagnostic, non-neural
-device. The LLM numbers *are* from a real local GGUF model (see §5), but only
-the 0.8B model has been measured.
+**Read the caveats**: the diagnostic speech numbers in §3 come from a
+non-neural device and are labelled as such. **Real neural TTS/ASR has since
+been integrated and measured** — see [`voice-neural.md`](voice-neural.md) for
+Kokoro TTS and Whisper ASR latency and real-time factors on the same host. The
+LLM numbers *are* from a real local GGUF model (see §5), but only the 0.8B model
+has been measured.
 
 ## Host
 
@@ -67,13 +70,18 @@ underruns=0 min_lead≈5.75s`.
 
 > **These are not neural-TTS results.** `DiagnosticToneSynth` is a clearly
 > labelled non-neural device that writes real PCM so the WAV path and buffer
-> accounting can be tested. A neural backend must be measured separately against
-> the ≥1.5× P05 target; no such numbers exist yet.
+> accounting can be tested. It remains useful as a device-independent CI signal.
+>
+> **Real neural results now exist.** Kokoro TTS runs at ~3× real time and
+> Whisper ASR at ~27× real time on the development host; the ≥1.5× P05 target is
+> met for both. See [`voice-neural.md`](voice-neural.md) for the measured table,
+> reproduction commands and honest caveats (whole-utterance TTS, one host).
 
-The neural backend correctly reports:
+The neural backend correctly reports a loud, actionable error when assets are
+absent instead of fabricating audio:
 
 ```
-neural backend status: speech asset missing: assets/voices/<licensed-model>.onnx
+neural backend status: speech asset missing: assets/speech/models/...
 ```
 
 ## 4. Model matrix status
@@ -139,12 +147,17 @@ loudly, cancellation, and deadlines.
 
 * Any model larger than 0.8B (2B/4B/other families).
 * GPU/Vulkan/ROCm/CUDA paths, VRAM peaks, thermal throttling.
-* Neural TTS real-time factor, naturalness, voice differentiation.
+* Streaming neural TTS / barge-in (Kokoro is whole-utterance; first audio
+  arrives after synthesis completes — measured in `voice-neural.md`).
 * ASR accuracy on game vocabulary, accents, noise, interruption.
+* Neural voice *quality* scoring beyond intelligibility/RTF (no MOS panel).
 * Steam Deck and low-end integrated GPU.
 * Human blind playtests and inter-rater quality scoring.
 * 90% line coverage instrumentation (tests exist; `tarpaulin`/`llvm-cov` is not
   wired into CI).
+
+Neural TTS/ASR real-time factor **is** now measured; see
+[`voice-neural.md`](voice-neural.md).
 
 Publishing a "Steam Deck compatible" or "faster than speech" claim without
 running the corresponding row is explicitly forbidden by the design brief.

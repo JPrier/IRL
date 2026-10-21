@@ -145,9 +145,30 @@ pub trait SpeechSynthesizer: Send { /* voices, warm, synthesize, cancel */ }
 pub trait SpeechRecognizer: Send { /* warm, transcribe */ }
 ```
 
-`DiagnosticToneSynth` is a non-neural pipeline test device. `MissingNeuralBackend`
-returns `MissingAsset` with the expected path. No fake audio is ever presented as
-neural TTS.
+The production voice stack is **offline neural speech via `sherpa-onnx`**, in
+`crates/speech/src/neural.rs` (feature `neural`, on by default):
+
+| Component | Type | Model | Purpose |
+|---|---|---|---|
+| `SherpaTts` | neural TTS | Kokoro 82M multi-speaker | audible NPC voice, 11 distinct speakers |
+| `SherpaAsr` | neural ASR | Whisper tiny.en (int8) | player speech → text |
+| `VadSegmenter` | VAD | Silero VAD | endpointing a live microphone stream |
+| `AudioCapture` / `AudioPlayback` | device I/O | `cpal` | mic capture and speaker playback |
+
+Asset paths and checksums come from the pinned manifest
+`assets/speech/manifest.json`, not from hard-coded strings. `crates/speech/src/assets.rs`
+verifies SHA-256 before use and installs bundles only on explicit request
+(`voice-demo install`). Nothing is fetched from the network at gameplay time.
+
+`DiagnosticToneSynth` remains a **non-neural** pipeline test device for CI, and
+`MissingNeuralBackend` still fails loudly with the expected asset path. A sine
+wave is never presented as evidence of neural TTS.
+
+Audio callbacks are nonblocking: the device callback only pulls from a bounded
+channel, and `OutputFeeder` carries leftover samples across callbacks so a whole
+utterance plays correctly even when the device frame size differs. See
+[`docs/benchmarks/voice-neural.md`](benchmarks/voice-neural.md) for measured
+latency and real-time factors.
 
 ## Save format
 

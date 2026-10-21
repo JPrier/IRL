@@ -1,0 +1,12 @@
+[package]
+name = "voice-demo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Agentic RPG: offline voice loop demo (mic/WAV -> ASR -> TTS -> speaker)."
+
+[dependencies]
+rpg_domain.workspace = true
+rpg_speech.workspace = true
+serde_json.workspace = true

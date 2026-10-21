@@ -121,11 +121,32 @@ Machine-readable copy: `cargo run -p model-bench -- --list-models`.
 
 | Backend | Why shortlisted | Status |
 |---|---|---|
-| `llama.cpp` via maintained Rust bindings | mature cross-platform, Vulkan, GGUF, structured output | NOT INTEGRATED |
+| `llama.cpp` via maintained Rust bindings | mature cross-platform, Vulkan, GGUF, structured output | INTEGRATED (`rpg_inference`) |
 | `mistral.rs` | Rust-native runtime, GGUF, structured outputs | NOT INTEGRATED |
-| `sherpa-onnx` | offline streaming ASR + Kokoro/Piper TTS | NOT INTEGRATED |
+| `sherpa-onnx` | offline ASR + Kokoro TTS + Silero VAD in one runtime | **INTEGRATED** (`rpg_speech`) |
 | `whisper.cpp` | ASR alternative | NOT INTEGRATED |
 | Pocket TTS | small native voices | NOT INTEGRATED |
+
+### Neural speech backend (implemented)
+
+**Decision:** use `sherpa-onnx` for offline neural ASR, TTS and VAD, behind the
+existing `SpeechSynthesizer`/`SpeechRecognizer` ports.
+
+**Why:** one dependency provides all three stages; it links a prebuilt ONNX
+runtime (no system ONNX install); models are ungated and permissively licensed
+(Kokoro Apache-2.0, Whisper MIT, Silero MIT); and it runs CPU-only at ~3× real
+time for TTS and ~27× for ASR on the development host.
+
+**Windows linking note:** the *static* prebuilt archive is built with `/MT`
+while Rust links the dynamic STL, producing unresolved `std::` symbols. The
+*shared* (DLL) archive is self-contained and is therefore selected on Windows;
+on other platforms the static archive links `libstdc++` and gives a
+self-contained binary. See the target-specific dependency block in
+`crates/speech/Cargo.toml`.
+
+**Honesty:** Kokoro is whole-utterance, so first-audio latency equals total
+synthesis time; streaming TTS and barge-in are NOT TESTED. Measured numbers and
+caveats are in [`docs/benchmarks/voice-neural.md`](../benchmarks/voice-neural.md).
 
 ### Licensing notes (must be re-verified before shipping)
 
@@ -140,8 +161,8 @@ Machine-readable copy: `cargo run -p model-bench -- --list-models`.
 
 ## Not done / NOT TESTED (explicit)
 
-1. Real LLM integration and the full model × hardware × workout matrix.
-2. Real neural TTS/ASR installation, quality scoring and RTF on CPU/GPU.
+1. Full LLM model × hardware × workout matrix (only the 0.8B GGUF is measured).
+2. Streaming neural TTS and barge-in; real microphone turn-taking on this host.
 3. Bevy 0.20 renderer, controller input, subtitles UI, mouse/keyboard.
 4. Steam Deck / low-end GPU / AMD-Vulkan measurements.
 5. Human blind playtests.
@@ -152,12 +173,9 @@ Machine-readable copy: `cargo run -p model-bench -- --list-models`.
 
 ## Next highest-value evidence-backed steps
 
-1. Integrate `llama.cpp` behind `InferenceEngine`, then run the existing
-   scenarios with a real 0.8B/2B/4B model on this host and record first-token and
-   first-audio latency.
-2. Integrate `sherpa-onnx` TTS with a redistributable voice, then re-run
-   `model-bench --speech` and report true neural RTF and underruns.
+1. Wire ASR transcripts into the resident LLM and speak the model's answer
+   (Milestone B): first-token latency plus neural TTS time for a real NPC reply.
+2. Measure neural voice on a low-end/Deck-class device; report RTF and underruns.
 3. Add a Bevy client that reads `Simulation` state; keep the text client as a
    headless diagnostic.
-4. Measure on Steam Deck and a low-end integrated GPU before making any
-   compatibility claim.
+4. Add streaming TTS / sentence-chunked synthesis to cut first-audio latency.

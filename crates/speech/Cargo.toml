@@ -4,10 +4,59 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Agentic RPG: speech layer."
+description = "Agentic RPG: offline neural speech (WAV I/O, TTS/ASR/VAD, audio devices)."
 
 [dependencies]
 rpg_domain.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+
+# --- Neural speech (offline, no cloud services) ---------------------------
+# `sherpa-onnx` provides offline ASR, neural TTS and VAD in one ONNX runtime.
+# On Windows the *static* prebuilt archive is compiled with /MT while Rust links
+# the dynamic STL, which leaves unresolved std:: symbols at link time; the
+# *shared* archive is self-contained and links cleanly. On other platforms the
+# static archive is used and links libstdc++ explicitly, giving a self-contained
+# binary. See docs/research for the full note.
+[target.'cfg(windows)'.dependencies]
+sherpa-onnx = { version = "1.13.8", default-features = false, features = ["shared"], optional = true }
+
+[target.'cfg(not(windows))'.dependencies]
+sherpa-onnx = { version = "1.13.8", default-features = false, features = ["static"], optional = true }
+
+[dependencies.cpal]
+version = "0.15"
+optional = true
+
+[dependencies.sha2]
+version = "0.10"
+optional = true
+
+[dependencies.tar]
+version = "0.4"
+optional = true
+
+[dependencies.bzip2]
+version = "0.5"
+optional = true
+
+[dependencies.ureq]
+version = "2"
+optional = true
+default-features = false
+features = ["tls"]
+
+[features]
+# Voice is a mandatory product feature: neural is on by default. It can be
+# disabled only for restricted environments that cannot fetch the native
+# runtime, in which case the diagnostic/missing-asset backends remain.
+default = ["neural"]
+neural = [
+    "dep:sherpa-onnx",
+    "dep:cpal",
+    "dep:sha2",
+    "dep:tar",
+    "dep:bzip2",
+    "dep:ureq",
+]

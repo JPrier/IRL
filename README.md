@@ -22,10 +22,15 @@ still requires model assets or hardware we did not have.
 >   real load/warm/prefill/decode latency, tokens/s and structured-action rate.
 > * `cargo run -p model-bench -- --speech` → real WAV output + streaming
 >   buffer metrics for the **diagnostic (non-neural)** synthesizer.
+> * `cargo run --release -p voice-demo -- install && cargo run --release -p voice-demo -- bench`
+>   → **real offline neural voice**: Kokoro TTS (~3× real time) and Whisper ASR
+>   (~27× real time) on CPU. See [docs/benchmarks/voice-neural.md](docs/benchmarks/voice-neural.md).
+> * `cargo run --release -p voice-demo -- roundtrip <file.wav> --play` →
+>   WAV → ASR transcript → neural TTS reply → audible playback.
 >
 > **Not yet verified / NOT TESTED**
-> * Real **neural TTS/ASR** (no model assets bundled; the diagnostic tone is not
->   speech and is not evidence of TTS quality).
+> * **Streaming neural TTS / barge-in.** Kokoro is whole-utterance, so first
+>   audio arrives only after synthesis completes.
 > * **Bevy 0.20 desktop renderer** (the shipped client is a text console; the
 >   simulation is renderer-agnostic by design).
 > * Steam Deck / low-end hardware numbers.
@@ -56,6 +61,13 @@ cargo run -p model-bench -- --profile docs/benchmarks/qwen35-0.8b.json
 
 # Integrated speech/buffer benchmark (diagnostic device)
 cargo run -p model-bench -- --speech
+
+# Real offline neural voice (requires the pinned assets; see docs/benchmarks/voice-neural.md)
+cargo run --release -p voice-demo -- install
+cargo run --release -p voice-demo -- list
+cargo run --release -p voice-demo -- bench
+cargo run --release -p voice-demo -- roundtrip path/to/speech.wav --play
+cargo run --release -p voice-demo -- mic   # live microphone loop
 
 # Candidate model matrix (status + evidence)
 cargo run -p model-bench -- --list-models

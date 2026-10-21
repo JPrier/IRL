@@ -14,8 +14,33 @@
 //! * [`MissingNeuralBackend`], which fails loudly with install instructions
 //!   instead of silently faking audio.
 //!
-//! The end-to-end acceptance test for neural voice is `cargo run -p model-bench`
+//! The end-to-end acceptance test for neural voice is `cargo run -p voice-demo`
 //! once a compliant backend + assets are installed.
+//!
+//! ## Neural backends (feature `neural`, enabled by default)
+//!
+//! * [`assets`] resolves the pinned, checksummed speech-asset manifest.
+//! * [`neural::SherpaTts`] is real offline multi-speaker neural TTS.
+//! * [`neural::SherpaAsr`] is real offline neural speech recognition.
+//! * [`neural::VadSegmenter`] segments a live microphone stream into utterances.
+//! * [`audio`] provides real microphone capture and speaker playback via `cpal`.
+
+pub mod assets;
+
+#[cfg(feature = "neural")]
+pub mod audio;
+#[cfg(feature = "neural")]
+pub mod neural;
+
+#[cfg(feature = "neural")]
+pub use audio::{
+    AudioCapture, AudioDeviceInfo, AudioPlayback, CaptureConfig, PlaybackConfig,
+};
+#[cfg(feature = "neural")]
+pub use neural::{
+    default_bundle_for, CancelToken, SherpaAsr, SherpaTts, SpeechSegmentAudio, VadSegmenter,
+    DEFAULT_ASR_BUNDLE, DEFAULT_TTS_BUNDLE, DEFAULT_VAD_BUNDLE,
+};
 
 use rpg_domain::ports::{SpeechAudio, SpeechError, SpeechRequest, SpeechSynthesizer, VoiceInfo};
 use std::io::{Read, Write};
