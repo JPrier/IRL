@@ -122,7 +122,12 @@ impl Session {
 
     /// Player speaks, then the addressed NPC decides and acts through the
     /// shared policy + inference engine.
-    pub fn say(&mut self, target: &str, text: &str) {
+    ///
+    /// Returns the NPC's spoken reply text when the accepted action was
+    /// `Speak`, so a voice client can synthesize exactly what the character
+    /// said. Returns `None` when the speech did not reach the NPC or the NPC
+    /// chose a non-verbal action.
+    pub fn say(&mut self, target: &str, text: &str) -> Option<String> {
         let target_id = ActorId::new(target);
         let out = self.player_do(Action::Speak {
             target: Some(target_id.clone()),
@@ -135,11 +140,24 @@ impl Session {
         // and audible). Rejected speech must not burn inference or produce an
         // impossible response.
         if matches!(out, ValidationOutcome::Accepted) {
-            self.npc_respond(target, text);
+            self.npc_respond(target, text)
+        } else {
+            None
         }
     }
 
-    pub fn npc_respond(&mut self, npc: &str, text: &str) {
+    /// Run the NPC decision for a heard utterance and return the line the NPC
+    /// should speak aloud, when the accepted action has one.
+    ///
+    /// * `Speak` → its `text`.
+    /// * `MakeOffer` → its `note` ("what you promise in return").
+    /// * `Promise` → its `terms`.
+    /// * `Threaten` → its `demand`.
+    ///
+    /// These fields are the character's own words as committed by the
+    /// authoritative simulation; the voice client reads exactly this text and
+    /// never invents dialogue.
+    pub fn npc_respond(&mut self, npc: &str, text: &str) -> Option<String> {
         let npc_id = ActorId::new(npc);
         let player = ActorId::new(PLAYER);
         let policy = NpcPolicy;
@@ -154,10 +172,18 @@ impl Session {
         self.next_request += 1;
         let kind = decision.proposal.action.kind_name().to_string();
         let source = decision.source.clone();
+        let spoken = spoken_line(&decision.proposal.action);
         let out = self.sim.apply(&decision.proposal);
         self.trace
             .push(format!("{npc} -> {kind} [{}]: {out:?}", source.label()));
         self.decisions.push((npc.to_string(), source));
+        // A `Pending` outcome means the offer/promise was recorded and awaits
+        // acceptance — the character still spoke the line. Only a rejection
+        // means nothing was said.
+        match out {
+            ValidationOutcome::Rejected(_) => None,
+            _ => spoken,
+        }
     }
 
     pub fn tick(&mut self) -> StepReport {
@@ -230,6 +256,28 @@ impl Session {
 // ---------------------------------------------------------------------------
 // Results
 // ---------------------------------------------------------------------------
+
+/// The words an accepted NPC action should be spoken as, if any.
+///
+/// This is the character's own committed text: `Speak.text`, an offer's
+/// `note`, a promise's `terms`, or a threat's `demand`. It deliberately ignores
+/// mechanical fields (item lists, fact ids) and returns `None` for silent
+/// actions, so the voice client never fabricates dialogue.
+pub fn spoken_line(action: &Action) -> Option<String> {
+    let candidate = match action {
+        Action::Speak { text, .. } => text,
+        Action::MakeOffer { note, .. } => note,
+        Action::Promise { terms, .. } => terms,
+        Action::Threaten { demand, .. } => demand,
+        _ => return None,
+    };
+    let trimmed = candidate.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Check {

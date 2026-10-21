@@ -2026,6 +2026,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "voice-play"
+version = "0.1.0"
+dependencies = [
+ "rpg_domain",
+ "rpg_eval",
+ "rpg_inference",
+ "rpg_speech",
+]
+
+[[package]]
 name = "wait-timeout"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

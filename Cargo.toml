@@ -16,6 +16,7 @@ members = [
     "apps/game",
     "apps/model-bench",
     "apps/voice-demo",
+    "apps/voice-play",
 ]
 
 [workspace.package]
