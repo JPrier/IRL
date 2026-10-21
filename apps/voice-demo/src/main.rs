@@ -17,8 +17,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use rpg_domain::ports::{SpeechError, SpeechRequest, SpeechSynthesizer};
 use rpg_domain::ports::SpeechRecognizer;
+use rpg_domain::ports::{SpeechError, SpeechRequest, SpeechSynthesizer};
 use rpg_speech::assets::SpeechAssets;
 use rpg_speech::{SherpaAsr, SherpaTts};
 
@@ -183,7 +183,11 @@ fn cmd_list(o: &Opts) -> Result<(), SpeechError> {
     match rpg_speech::audio::AudioCapture::list_devices() {
         Ok(devs) if !devs.is_empty() => {
             for d in devs {
-                println!("  {}{}", d.name, if d.is_default { "  (default)" } else { "" });
+                println!(
+                    "  {}{}",
+                    d.name,
+                    if d.is_default { "  (default)" } else { "" }
+                );
             }
         }
         Ok(_) => println!("  (none found)"),
@@ -193,7 +197,11 @@ fn cmd_list(o: &Opts) -> Result<(), SpeechError> {
     match rpg_speech::audio::AudioPlayback::list_devices() {
         Ok(devs) if !devs.is_empty() => {
             for d in devs {
-                println!("  {}{}", d.name, if d.is_default { "  (default)" } else { "" });
+                println!(
+                    "  {}{}",
+                    d.name,
+                    if d.is_default { "  (default)" } else { "" }
+                );
             }
         }
         Ok(_) => println!("  (none found)"),
@@ -214,9 +222,10 @@ fn cmd_install(o: &Opts) -> Result<(), SpeechError> {
 }
 
 fn cmd_asr(o: &Opts) -> Result<(), SpeechError> {
-    let wav = o.wav.as_ref().ok_or_else(|| {
-        SpeechError::Backend("usage: voice-demo asr <file.wav>".into())
-    })?;
+    let wav = o
+        .wav
+        .as_ref()
+        .ok_or_else(|| SpeechError::Backend("usage: voice-demo asr <file.wav>".into()))?;
     let assets = load_assets(o)?;
     let audio = rpg_speech::read_wav(wav)?;
     println!(
@@ -227,22 +236,26 @@ fn cmd_asr(o: &Opts) -> Result<(), SpeechError> {
         audio.audio_seconds()
     );
     let mut asr = open_asr(o, &assets)?;
-    asr.warm().map_err(|e| SpeechError::Backend(e.to_string()))?;
+    asr.warm()
+        .map_err(|e| SpeechError::Backend(e.to_string()))?;
     let t0 = Instant::now();
     let t = asr
         .transcribe(&audio.samples, audio.sample_rate)
         .map_err(|e| SpeechError::Backend(e.to_string()))?;
     println!("backend   : {}", asr.backend_name());
-    println!("latency   : {:.1} ms (reported {:.1} ms)", t0.elapsed().as_secs_f32() * 1000.0, t.latency_ms);
+    println!(
+        "latency   : {:.1} ms (reported {:.1} ms)",
+        t0.elapsed().as_secs_f32() * 1000.0,
+        t.latency_ms
+    );
     println!("transcript: {}", t.text);
     Ok(())
 }
 
 fn cmd_tts(o: &Opts) -> Result<(), SpeechError> {
-    let text = o
-        .text
-        .as_ref()
-        .ok_or_else(|| SpeechError::Backend("usage: voice-demo tts --text \"...\" [--out x.wav]".into()))?;
+    let text = o.text.as_ref().ok_or_else(|| {
+        SpeechError::Backend("usage: voice-demo tts --text \"...\" [--out x.wav]".into())
+    })?;
     let assets = load_assets(o)?;
     let mut tts = open_tts(o, &assets)?;
     tts.warm(&o.voice)?;
@@ -258,7 +271,11 @@ fn cmd_tts(o: &Opts) -> Result<(), SpeechError> {
     rpg_speech::write_wav(&out, &audio).map_err(|e| SpeechError::Backend(e.to_string()))?;
     println!("backend      : {}", tts.backend_name());
     println!("voice        : {}", o.voice);
-    println!("audio        : {:.2}s @ {} Hz", audio.audio_seconds(), audio.sample_rate);
+    println!(
+        "audio        : {:.2}s @ {} Hz",
+        audio.audio_seconds(),
+        audio.sample_rate
+    );
     println!("synth        : {:.1} ms", audio.synth_ms);
     println!("real-time x  : {:.2}x", audio.real_time_factor());
     println!("wrote        : {out}");
@@ -276,7 +293,8 @@ fn cmd_roundtrip(o: &Opts) -> Result<(), SpeechError> {
     let audio = rpg_speech::read_wav(wav)?;
     let mut asr = open_asr(o, &assets)?;
     let mut tts = open_tts(o, &assets)?;
-    asr.warm().map_err(|e| SpeechError::Backend(e.to_string()))?;
+    asr.warm()
+        .map_err(|e| SpeechError::Backend(e.to_string()))?;
     tts.warm(&o.voice)?;
 
     let a0 = Instant::now();
@@ -299,7 +317,12 @@ fn cmd_roundtrip(o: &Opts) -> Result<(), SpeechError> {
         .unwrap_or_else(|| "voice-demo-roundtrip.wav".to_string());
     rpg_speech::write_wav(&out, &reply).map_err(|e| SpeechError::Backend(e.to_string()))?;
     println!("ASR  : {} ({:.0} ms)", t.text, asr_ms);
-    println!("TTS  : {:.2}s audio in {:.0} ms ({:.2}x real time)", reply.audio_seconds(), tts_ms, reply.real_time_factor());
+    println!(
+        "TTS  : {:.2}s audio in {:.0} ms ({:.2}x real time)",
+        reply.audio_seconds(),
+        tts_ms,
+        reply.real_time_factor()
+    );
     println!("wrote: {out}");
     if o.play {
         play_audio(&reply)?;
@@ -336,7 +359,8 @@ fn cmd_bench(o: &Opts) -> Result<(), SpeechError> {
     let assets = load_assets(o)?;
     let mut asr = open_asr(o, &assets)?;
     let mut tts = open_tts(o, &assets)?;
-    asr.warm().map_err(|e| SpeechError::Backend(e.to_string()))?;
+    asr.warm()
+        .map_err(|e| SpeechError::Backend(e.to_string()))?;
     tts.warm(&o.voice)?;
     println!("# voice-demo bench (real neural TTS + ASR)");
     println!("asr backend: {}", asr.backend_name());
@@ -348,7 +372,10 @@ fn cmd_bench(o: &Opts) -> Result<(), SpeechError> {
         "I will give you the medicine if you tell me who signed the book.",
         "Come back after dark and we will talk about the shipment.",
     ];
-    println!("\n{:<52} {:>8} {:>8} {:>10} {:>9}", "text", "audio_s", "synth_ms", "first_ms", "rtf");
+    println!(
+        "\n{:<52} {:>8} {:>8} {:>10} {:>9}",
+        "text", "audio_s", "synth_ms", "first_ms", "rtf"
+    );
     let mut total_audio = 0.0f32;
     let mut total_wall = 0.0f32;
     for s in sentences {
@@ -372,7 +399,11 @@ fn cmd_bench(o: &Opts) -> Result<(), SpeechError> {
         "\naggregate: {:.2}s audio in {:.2}s wall = {:.2}x real time",
         total_audio,
         total_wall,
-        if total_wall > 0.0 { total_audio / total_wall } else { f32::INFINITY }
+        if total_wall > 0.0 {
+            total_audio / total_wall
+        } else {
+            f32::INFINITY
+        }
     );
 
     // ASR latency on a real fixture if present in the cache.
@@ -398,13 +429,16 @@ fn cmd_bench(o: &Opts) -> Result<(), SpeechError> {
 }
 
 fn cmd_mic(o: &Opts) -> Result<(), SpeechError> {
-    use rpg_speech::audio::{AudioCapture, AudioPlayback, CaptureConfig, LinearResampler, PlaybackConfig};
+    use rpg_speech::audio::{
+        AudioCapture, AudioPlayback, CaptureConfig, LinearResampler, PlaybackConfig,
+    };
     use rpg_speech::VadSegmenter;
 
     let assets = load_assets(o)?;
     let mut asr = open_asr(o, &assets)?;
     let mut tts = open_tts(o, &assets)?;
-    asr.warm().map_err(|e| SpeechError::Backend(e.to_string()))?;
+    asr.warm()
+        .map_err(|e| SpeechError::Backend(e.to_string()))?;
     tts.warm(&o.voice)?;
 
     let capture = AudioCapture::open(&CaptureConfig::default())?;
@@ -412,12 +446,12 @@ fn cmd_mic(o: &Opts) -> Result<(), SpeechError> {
     let mut vad = VadSegmenter::from_assets(&assets, rpg_speech::DEFAULT_VAD_BUNDLE, 16_000)?;
 
     // Resample captured audio from the device rate to 16 kHz for VAD/ASR.
-    let mut resampler = rpg_speech::audio::LinearResampler::new(
-        capture.native_sample_rate,
-        16_000,
-    );
+    let mut resampler = rpg_speech::audio::LinearResampler::new(capture.native_sample_rate, 16_000);
 
-    println!("listening on '{}' @ {} Hz", "default input", capture.native_sample_rate);
+    println!(
+        "listening on 'default input' @ {} Hz",
+        capture.native_sample_rate
+    );
     println!("speak; press Ctrl+C to quit. The reply is spoken back with neural TTS.");
     println!("(voice: {})", o.voice);
 

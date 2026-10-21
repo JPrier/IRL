@@ -34,6 +34,12 @@ macro_rules! string_id {
                 Self(s)
             }
         }
+        impl std::str::FromStr for $name {
+            type Err = std::convert::Infallible;
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                Ok(Self(s.to_string()))
+            }
+        }
         impl fmt::Display for $name {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 f.write_str(&self.0)

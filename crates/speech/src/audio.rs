@@ -121,7 +121,9 @@ impl AudioCapture {
             }
         }
         .map_err(|e| SpeechError::Device(e.to_string()))?;
-        stream.play().map_err(|e| SpeechError::Device(e.to_string()))?;
+        stream
+            .play()
+            .map_err(|e| SpeechError::Device(e.to_string()))?;
         Ok(Self {
             _stream: stream,
             rx,
@@ -151,7 +153,10 @@ impl AudioCapture {
         let host = cpal::default_host();
         let default_name = host.default_input_device().and_then(|d| d.name().ok());
         let mut out = Vec::new();
-        for d in host.input_devices().map_err(|e| SpeechError::Device(e.to_string()))? {
+        for d in host
+            .input_devices()
+            .map_err(|e| SpeechError::Device(e.to_string()))?
+        {
             if let Ok(name) = d.name() {
                 let is_default = Some(&name) == default_name.as_ref();
                 out.push(AudioDeviceInfo { name, is_default });
@@ -290,7 +295,9 @@ impl AudioPlayback {
             }
         }
         .map_err(|e| SpeechError::Device(e.to_string()))?;
-        stream.play().map_err(|e| SpeechError::Device(e.to_string()))?;
+        stream
+            .play()
+            .map_err(|e| SpeechError::Device(e.to_string()))?;
         Ok(Self {
             _stream: stream,
             tx,
@@ -308,14 +315,16 @@ impl AudioPlayback {
         self.tx
             .send(samples.to_vec())
             .map_err(|_| SpeechError::Device("playback stream closed".into()))?;
-        self.queued.fetch_add(samples.len() as u64, Ordering::Relaxed);
+        self.queued
+            .fetch_add(samples.len() as u64, Ordering::Relaxed);
         Ok(())
     }
 
     /// Queue without blocking; returns `false` if the queue is full.
     pub fn try_queue(&self, samples: &[f32]) -> bool {
         if self.tx.try_send(samples.to_vec()).is_ok() {
-            self.queued.fetch_add(samples.len() as u64, Ordering::Relaxed);
+            self.queued
+                .fetch_add(samples.len() as u64, Ordering::Relaxed);
             true
         } else {
             false
@@ -356,7 +365,10 @@ impl AudioPlayback {
         let host = cpal::default_host();
         let default_name = host.default_output_device().and_then(|d| d.name().ok());
         let mut out = Vec::new();
-        for d in host.output_devices().map_err(|e| SpeechError::Device(e.to_string()))? {
+        for d in host
+            .output_devices()
+            .map_err(|e| SpeechError::Device(e.to_string()))?
+        {
             if let Ok(name) = d.name() {
                 let is_default = Some(&name) == default_name.as_ref();
                 out.push(AudioDeviceInfo { name, is_default });

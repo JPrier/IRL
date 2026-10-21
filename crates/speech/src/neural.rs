@@ -11,11 +11,11 @@
 //! checksums come from the pinned manifest rather than being hard-coded here.
 
 use crate::assets::{AssetKind, SpeechAssets};
+use rpg_domain::ports::SpeechRecognizer;
 use rpg_domain::ports::{
     RecognitionError, SpeechAudio, SpeechError, SpeechRequest, SpeechSynthesizer, Transcript,
     VoiceInfo,
 };
-use rpg_domain::ports::SpeechRecognizer;
 use sherpa_onnx::{
     GenerationConfig, OfflineRecognizer, OfflineRecognizerConfig, OfflineTts, OfflineTtsConfig,
     OfflineTtsKokoroModelConfig, OfflineTtsModelConfig, OfflineTtsVitsModelConfig,
@@ -68,7 +68,11 @@ pub struct SherpaTts {
 
 impl SherpaTts {
     /// Build a resident Kokoro engine from installed assets.
-    pub fn from_assets(assets: &SpeechAssets, bundle_id: &str, threads: i32) -> Result<Self, SpeechError> {
+    pub fn from_assets(
+        assets: &SpeechAssets,
+        bundle_id: &str,
+        threads: i32,
+    ) -> Result<Self, SpeechError> {
         let resolved = assets
             .require_bundle(bundle_id)
             .map_err(|e| SpeechError::MissingAsset(e.to_string()))?;
@@ -103,8 +107,9 @@ impl SherpaTts {
             model: model_config,
             ..Default::default()
         };
-        let tts = OfflineTts::create(&config)
-            .ok_or_else(|| SpeechError::Backend(format!("failed to create TTS engine for '{bundle_id}'")))?;
+        let tts = OfflineTts::create(&config).ok_or_else(|| {
+            SpeechError::Backend(format!("failed to create TTS engine for '{bundle_id}'"))
+        })?;
 
         let reported = tts.num_speakers();
         let mut voices = Vec::new();
@@ -234,7 +239,11 @@ pub struct SherpaAsr {
 }
 
 impl SherpaAsr {
-    pub fn from_assets(assets: &SpeechAssets, bundle_id: &str, threads: i32) -> Result<Self, RecognitionError> {
+    pub fn from_assets(
+        assets: &SpeechAssets,
+        bundle_id: &str,
+        threads: i32,
+    ) -> Result<Self, RecognitionError> {
         let resolved = assets
             .require_bundle(bundle_id)
             .map_err(|e| RecognitionError::MissingAsset(e.to_string()))?;
@@ -269,8 +278,9 @@ impl SherpaAsr {
         config.model_config.num_threads = threads.max(1);
         config.model_config.provider = Some("cpu".into());
 
-        let recognizer = OfflineRecognizer::create(&config)
-            .ok_or_else(|| RecognitionError::Backend(format!("failed to create ASR engine for '{bundle_id}'")))?;
+        let recognizer = OfflineRecognizer::create(&config).ok_or_else(|| {
+            RecognitionError::Backend(format!("failed to create ASR engine for '{bundle_id}'"))
+        })?;
         Ok(Self {
             recognizer,
             backend: format!("sherpa-onnx/whisper ({bundle_id})"),
@@ -322,7 +332,11 @@ impl SpeechRecognizer for SherpaAsr {
         Ok(())
     }
 
-    fn transcribe(&mut self, pcm: &[f32], sample_rate: u32) -> Result<Transcript, RecognitionError> {
+    fn transcribe(
+        &mut self,
+        pcm: &[f32],
+        sample_rate: u32,
+    ) -> Result<Transcript, RecognitionError> {
         if pcm.is_empty() {
             return Err(RecognitionError::NoSpeech);
         }
@@ -381,7 +395,11 @@ pub struct VadSegmenter {
 }
 
 impl VadSegmenter {
-    pub fn from_assets(assets: &SpeechAssets, bundle_id: &str, sample_rate: u32) -> Result<Self, SpeechError> {
+    pub fn from_assets(
+        assets: &SpeechAssets,
+        bundle_id: &str,
+        sample_rate: u32,
+    ) -> Result<Self, SpeechError> {
         let resolved = assets
             .require_bundle(bundle_id)
             .map_err(|e| SpeechError::MissingAsset(e.to_string()))?;

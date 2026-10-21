@@ -218,7 +218,10 @@ impl SpeechAssets {
     }
 
     /// Load `manifest.json` and bind it to `cache_dir`.
-    pub fn load(cache_dir: impl Into<PathBuf>, manifest_path: impl AsRef<Path>) -> Result<Self, AssetError> {
+    pub fn load(
+        cache_dir: impl Into<PathBuf>,
+        manifest_path: impl AsRef<Path>,
+    ) -> Result<Self, AssetError> {
         Ok(Self::new(cache_dir, SpeechManifest::load(manifest_path)?))
     }
 
@@ -411,7 +414,10 @@ pub mod install {
                 log(format!("[dl] {id} <- {}", bundle.url));
                 self.download(&bundle.url, &archive_path)?;
             } else {
-                log(format!("[dl] {id}: using cached {}", archive_path.display()));
+                log(format!(
+                    "[dl] {id}: using cached {}",
+                    archive_path.display()
+                ));
             }
             let size = std::fs::metadata(&archive_path)?.len();
             if bundle.bytes != 0 && size != bundle.bytes {
@@ -446,7 +452,12 @@ pub mod install {
         }
 
         /// Verify the SHA-256 of a local file against the manifest value.
-        pub fn verify_sha256(&self, path: &Path, expected: &str, id: &str) -> Result<(), AssetError> {
+        pub fn verify_sha256(
+            &self,
+            path: &Path,
+            expected: &str,
+            id: &str,
+        ) -> Result<(), AssetError> {
             let found = sha256_file(path)?;
             if found != expected {
                 return Err(AssetError::Checksum {

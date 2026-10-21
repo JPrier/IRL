@@ -1,0 +1,6 @@
+[toolchain]
+# The graphical client uses Bevy 0.20, whose MSRV is 1.97.1. The rest of the
+# workspace remains MSRV-compatible with 1.91; this pin makes the whole
+# workspace deterministic and satisfies Bevy. See docs/testing.md.
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]

@@ -1,0 +1,28 @@
+[package]
+name = "bevy-game"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Agentic RPG: graphical, voice-native client. Renders the authoritative simulation; never owns game rules."
+
+[[bin]]
+name = "bevy-game"
+path = "src/main.rs"
+
+[dependencies]
+rpg_domain.workspace = true
+rpg_eval.workspace = true
+rpg_inference.workspace = true
+rpg_speech.workspace = true
+rpg_sim.workspace = true
+rpg_persistence.workspace = true
+serde_json.workspace = true
+
+# Bevy 0.20 requires Rust >= 1.97.1; the workspace pins 1.98.1 (see
+# rust-toolchain.toml). Only the 2D/UI feature set is enabled so the build
+# stays as small as possible.
+[dependencies.bevy]
+version = "0.20"
+default-features = false
+features = ["2d", "ui", "default_font", "multi_threaded", "png"]

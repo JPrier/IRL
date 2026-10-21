@@ -33,9 +33,7 @@ pub mod audio;
 pub mod neural;
 
 #[cfg(feature = "neural")]
-pub use audio::{
-    AudioCapture, AudioDeviceInfo, AudioPlayback, CaptureConfig, PlaybackConfig,
-};
+pub use audio::{AudioCapture, AudioDeviceInfo, AudioPlayback, CaptureConfig, PlaybackConfig};
 #[cfg(feature = "neural")]
 pub use neural::{
     default_bundle_for, CancelToken, SherpaAsr, SherpaTts, SpeechSegmentAudio, VadSegmenter,

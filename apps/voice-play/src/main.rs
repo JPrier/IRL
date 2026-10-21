@@ -282,7 +282,9 @@ fn select_npc(session: &Session, pinned: Option<&str>) -> Option<ActorId> {
 // ---------------------------------------------------------------------------
 
 fn run_mic(o: &Opts) -> AppResult<()> {
-    use rpg_speech::audio::{AudioCapture, AudioPlayback, CaptureConfig, LinearResampler, PlaybackConfig};
+    use rpg_speech::audio::{
+        AudioCapture, AudioPlayback, CaptureConfig, LinearResampler, PlaybackConfig,
+    };
     use rpg_speech::VadSegmenter;
 
     let mut session = build_session(o)?;
@@ -296,8 +298,8 @@ fn run_mic(o: &Opts) -> AppResult<()> {
     session.teleport_player_to(&o.near);
     println!("You are standing near '{}'.", o.near);
 
-    let capture = AudioCapture::open(&CaptureConfig::default())
-        .map_err(|e| format!("microphone: {e}"))?;
+    let capture =
+        AudioCapture::open(&CaptureConfig::default()).map_err(|e| format!("microphone: {e}"))?;
     let playback = AudioPlayback::open(&PlaybackConfig::new(speech.tts.sample_rate()))
         .map_err(|e| format!("speaker: {e}"))?;
     let mut vad = VadSegmenter::from_assets(&assets, rpg_speech::DEFAULT_VAD_BUNDLE, 16_000)
@@ -333,10 +335,7 @@ fn handle_utterance(
     o: &Opts,
 ) {
     let t0 = Instant::now();
-    let transcript = match speech
-        .asr
-        .transcribe(&seg.samples, seg.sample_rate)
-    {
+    let transcript = match speech.asr.transcribe(&seg.samples, seg.sample_rate) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("[asr] {e}");
@@ -382,7 +381,10 @@ fn run_turn(
     match reply {
         Some(reply_text) => {
             println!("[{}] {}", target.as_str(), reply_text);
-            println!("      (decision {decide_ms:.0} ms, engine {})", session.engine_name());
+            println!(
+                "      (decision {decide_ms:.0} ms, engine {})",
+                session.engine_name()
+            );
             if let Some(pb) = playback {
                 speak(&mut speech.tts, pb, &reply_text, &o.voice);
             }
@@ -395,14 +397,22 @@ fn run_turn(
             // a promise, a threat), or the action was rejected. We do not invent
             // dialogue; report exactly what the authoritative simulation did.
             let trace = session.trace.last().cloned().unwrap_or_default();
-            println!("[{}] (no spoken reply)   ({decide_ms:.0} ms)", target.as_str());
+            println!(
+                "[{}] (no spoken reply)   ({decide_ms:.0} ms)",
+                target.as_str()
+            );
             println!("      {trace}");
         }
     }
 }
 
 /// Synthesize and play a reply, resampling to the real device rate.
-fn speak(tts: &mut SherpaTts, playback: &rpg_speech::audio::AudioPlayback, text: &str, voice: &str) {
+fn speak(
+    tts: &mut SherpaTts,
+    playback: &rpg_speech::audio::AudioPlayback,
+    text: &str,
+    voice: &str,
+) {
     let audio = match tts.synthesize(&SpeechRequest {
         text: text.to_string(),
         voice_id: voice.to_string(),
@@ -445,10 +455,9 @@ fn resample_for_device(audio: &SpeechAudio, device_rate: u32) -> Vec<f32> {
 // ---------------------------------------------------------------------------
 
 fn run_once_wav(o: &Opts) -> AppResult<()> {
-    let wav = o
-        .wav
-        .as_ref()
-        .ok_or_else(|| "usage: voice-play once <file.wav> [--model ...] [--out reply.wav]".to_string())?;
+    let wav = o.wav.as_ref().ok_or_else(|| {
+        "usage: voice-play once <file.wav> [--model ...] [--out reply.wav]".to_string()
+    })?;
     let mut session = build_session(o)?;
     announce(&session);
     session.teleport_player_to(&o.near);
@@ -472,11 +481,9 @@ fn run_once_wav(o: &Opts) -> AppResult<()> {
 
 fn run_say_text(o: &Opts) -> AppResult<()> {
     // The text may be given positionally (`say "..."`) or with `--text`.
-    let text = o
-        .text
-        .as_ref()
-        .or(o.wav.as_ref())
-        .ok_or_else(|| "usage: voice-play say \"<text>\" [--model ...] [--out reply.wav]".to_string())?;
+    let text = o.text.as_ref().or(o.wav.as_ref()).ok_or_else(|| {
+        "usage: voice-play say \"<text>\" [--model ...] [--out reply.wav]".to_string()
+    })?;
     let mut session = build_session(o)?;
     announce(&session);
     session.teleport_player_to(&o.near);
