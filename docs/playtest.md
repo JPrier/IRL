@@ -69,11 +69,22 @@ Other beats to try:
   mystery solving itself?
 * Does the same sequence produce the same result after `save`/`load`?
 
+## Graphical and voice clients
+
+* `cargo run -p bevy-game -- --model .cache/models/<model>.gguf` — the Bevy
+  client. Walk with WASD, press `V` to hold a voice conversation, `Y`/`N` to
+  accept/reject offers, `E` to investigate, `F3` for diagnostics, `F5`/`F9` to
+  save/load. Requires the pinned speech assets (`voice-demo install`) for voice.
+* `cargo run -p voice-play -- once <file.wav> --model .cache/models/<model>.gguf`
+  — headless full voice loop over a recorded fixture (WAV → ASR → local LLM →
+  authoritative validation → grounded NPC action).
+
 ## Known limitations
 
-* The text client uses the deterministic fallback policy, not a real LLM, so
-  dialogue is short and templated.
-* There is no neural voice playback in the shipped binary yet; the speech
-  pipeline and metrics are exercised by `model-bench --speech`.
-* Combat, animation, a full economy and a Bevy renderer are out of scope for
-  this increment.
+* Raw small-model decision quality is limited; the authoritative simulation
+  enforces knowledge boundaries, satisfied obligations and the designed bargain
+  regardless of what the model proposes, and every fallback is reported.
+* Neural TTS is whole-utterance (Kokoro), so there is no streaming/barge-in yet.
+* Actors are flat coloured rectangles; there is no sprite art or walk animation.
+* Combat and a full economy remain out of scope.
+* Steam Deck and live-microphone results are NOT TESTED on this host.

@@ -27,12 +27,18 @@ still requires model assets or hardware we did not have.
 >   (~27× real time) on CPU. See [docs/benchmarks/voice-neural.md](docs/benchmarks/voice-neural.md).
 > * `cargo run --release -p voice-demo -- roundtrip <file.wav> --play` →
 >   WAV → ASR transcript → neural TTS reply → audible playback.
+> * `cargo run --release -p voice-play -- once <file.wav> --model .cache/models/Qwen3.5-0.8B-Q4_K_M.gguf`
+>   → **full offline voice loop**: WAV → Whisper ASR → resident local LLM →
+>   authoritative validation → grounded NPC action.
+> * `cargo run -p bevy-game -- --model .cache/models/Qwen3.5-0.8B-Q4_K_M.gguf`
+>   → **graphical Bevy 0.20 client**: walk the town, press `V` to speak, watch
+>   the authoritative simulation change.
 >
 > **Not yet verified / NOT TESTED**
 > * **Streaming neural TTS / barge-in.** Kokoro is whole-utterance, so first
 >   audio arrives only after synthesis completes.
-> * **Bevy 0.20 desktop renderer** (the shipped client is a text console; the
->   simulation is renderer-agnostic by design).
+> * **Live microphone / speaker I/O on the current host.** The ASR/TTS paths are
+>   exercised with WAV fixtures; live device I/O is unverified here.
 > * Steam Deck / low-end hardware numbers.
 > * Raw decision quality of the 0.8B model. It is usable but weak: the
 >   authoritative policy enforces satisfied obligations and designed bargains,
@@ -68,6 +74,13 @@ cargo run --release -p voice-demo -- list
 cargo run --release -p voice-demo -- bench
 cargo run --release -p voice-demo -- roundtrip path/to/speech.wav --play
 cargo run --release -p voice-demo -- mic   # live microphone loop
+
+# Full offline voice conversation (WAV fixture -> ASR -> local LLM -> validation)
+cargo run --release -p voice-play -- once path/to/speech.wav \
+  --model .cache/models/Qwen3.5-0.8B-Q4_K_M.gguf
+
+# Graphical Bevy client (real model + neural voice)
+cargo run -p bevy-game -- --model .cache/models/Qwen3.5-0.8B-Q4_K_M.gguf
 
 # Candidate model matrix (status + evidence)
 cargo run -p model-bench -- --list-models
@@ -143,13 +156,24 @@ cargo run -p model-bench -- --list-models
   canonical checksum for CI gating.
 
 ### Speech (`crates/speech`)
-* Real WAV encode/decode and file output.
-* Integrated streaming/buffer metric (`audio-seconds / wall-seconds`,
-  underruns, minimum lead).
-* `DiagnosticToneSynth` clearly labelled **non-neural** — for pipeline tests
-  only.
-* `MissingNeuralBackend` fails loudly with the expected asset path instead of
-  fabricating audio.
+* **Real offline neural TTS and ASR** via `sherpa-onnx`: Kokoro 82M TTS
+  (11 English voices, ~3× real time on CPU) and Whisper tiny.en int8 ASR
+  (~27× real time). See [docs/benchmarks/voice-neural.md](docs/benchmarks/voice-neural.md).
+* SHA-256-pinned, versioned asset manifest with explicit `voice-demo install`;
+  no network access at gameplay time and no weights committed to Git.
+* `cpal` microphone capture and speaker playback with a nonblocking callback
+  and a resampler for arbitrary device rates.
+* `DiagnosticToneSynth` remains a clearly labelled **non-neural** pipeline test
+  device for CI, and `MissingNeuralBackend` fails loudly with the expected asset
+  path instead of fabricating audio.
+
+### Graphical client (`apps/bevy-game`)
+* Bevy 0.20 2D renderer that consumes immutable simulation `Snapshot`s and
+  submits validated `Command`s. The simulation never depends on Bevy.
+* Town map, player/NPC sprites, proximity-aware talk targeting, offers,
+  inventory, save/load (`F5`/`F9`) and a toggleable diagnostics overlay (`F3`).
+* Voice turn (`V`) runs mic → VAD → ASR → local LLM → validation → neural TTS
+  → playback on a worker thread, so a slow model turn never blocks the window.
 
 ## Workspace layout
 
@@ -168,6 +192,9 @@ crates/
   eval/          simulated players, 10 acceptance scenarios, metrics
 apps/
   game/          playable text client
+  bevy-game/     graphical Bevy 0.20 client (renderer + input only)
+  voice-play/    offline voice conversation loop (mic/WAV -> ASR -> LLM -> TTS)
+  voice-demo/    neural speech harness (install/list/bench/roundtrip/mic)
   scenario-runner/  headless CI gate
   model-bench/   model matrix + integrated speech benchmark
 docs/
@@ -198,16 +225,19 @@ ports without touching gameplay.
 
 ## Honest limitations
 
-1. **No neural voice yet.** The pipeline, WAV output and metrics are real; the
-   neural backends are ports with clear failure modes. Installing a compliant
-   local TTS/ASR model is the next integration step.
+1. **Whole-utterance neural TTS only.** Real Kokoro TTS and Whisper ASR are
+   integrated and measured, but Kokoro exposes no incremental audio, so first
+   audio arrives after synthesis completes (no streaming/barge-in yet). Live
+   microphone/speaker I/O is implemented but unverified on hosts without audio
+   devices; WAV fixtures cover CI.
 2. **The 0.8B model is the only measured LLM.** Real GGUF inference,
    grammar-constrained tool decisions and the playable loop work, but raw
    0.8B decision quality is limited; larger models (2B+) are NOT TESTED. The
    simulation enforces knowledge boundaries, satisfied obligations and the
    designed bargain regardless of what the model proposes.
-3. **No Bevy renderer.** The text client proves the gameplay loop; the
-   simulation is already renderer-agnostic.
+3. **Bevy client is a first pass.** `apps/bevy-game` renders the town and drives
+   the authoritative simulation, but actors are flat coloured rectangles with no
+   sprite art or walk animation, and the developer overlays are partial.
 4. **No hardware matrix.** All numbers in `docs/benchmarks/` are from the
    development host and are explicitly labelled; Deck/GPU tiers are NOT TESTED.
 
