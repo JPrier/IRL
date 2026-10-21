@@ -92,4 +92,9 @@ jobs:
         run: rm -rf target/sherpa-onnx-prebuilt
       - run: cargo test --workspace
       - run: cargo run -q -p scenario-runner -- --seed 2026
-      - run: cargo run -q -p model-bench -- --speech
+      # Diagnostic (non-neural) speech/WAV buffer benchmark. Run through
+      # `rpg_speech` rather than `model-bench`: the latter links llama.cpp and
+      # the static onnxruntime together, whose initialisers abort with
+      # `std::bad_alloc` on some Linux runners before `main` runs. This example
+      # exercises the identical WAV/buffer-accounting path.
+      - run: cargo run -q -p rpg_speech --example speech_bench
