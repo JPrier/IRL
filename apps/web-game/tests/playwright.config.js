@@ -48,9 +48,16 @@ module.exports = defineConfig({
       use: {
         ...devices["Desktop Firefox"],
         viewport: { width: 1280, height: 800 },
+        // Headless Firefox exposes no WebGL2 on GPU-less machines; CI runs it
+        // headed under Xvfb with Mesa's software GL instead
+        // (IRL_FIREFOX_HEADED=1).
+        headless: process.env.IRL_FIREFOX_HEADED !== "1",
         launchOptions: {
-          // Headless Firefox on GPU-less CI disables WebGL unless forced.
-          firefoxUserPrefs: { "webgl.force-enabled": true, "webgl.disabled": false },
+          firefoxUserPrefs: {
+            "webgl.force-enabled": true,
+            "webgl.disabled": false,
+            "webgl.enable-webgl2": true,
+          },
         },
       },
     },
