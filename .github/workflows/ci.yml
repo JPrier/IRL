@@ -167,10 +167,9 @@ jobs:
         run: npx playwright test smoke.spec.js perf.spec.js --project=chromium 2>&1 | tee playwright-output.txt; exit ${PIPESTATUS[0]}
         shell: bash
       # Firefox needs a display for WebGL2 on a GPU-less runner: headed under
-      # Xvfb with Mesa software GL. Reported, but not yet a merge gate.
+      # Xvfb with Mesa software GL.
       - name: Browser smoke tests (Firefox, Xvfb)
         if: always()
-        continue-on-error: true
         working-directory: apps/web-game/tests
         env:
           IRL_FIREFOX_HEADED: "1"

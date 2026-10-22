@@ -298,6 +298,16 @@ responses and the last error.
 | Performance | `npx playwright test perf.spec.js` | writes `perf-<browser>.json` |
 | Real OpenRouter (billable, opt-in) | `OPENROUTER_API_KEY=… cargo test -p rpg_openrouter --test real_openrouter -- --ignored --nocapture` and `IRL_REAL_OPENROUTER=1 OPENROUTER_API_KEY=… npx playwright test real-openrouter.spec.js` | manual workflow `openrouter-real.yml`, gated by the `openrouter-test` environment; never on PRs |
 
+## Browser compatibility
+
+| Browser | Status |
+|---|---|
+| Chromium (Playwright 1.56, headless, SwiftShader software WebGL2) | tested: 16/16 smoke tests locally and in CI |
+| Firefox (Playwright 1.56, headed under Xvfb, Mesa software GL) | tested: 16/16 in CI. Headless Firefox on a GPU-less machine exposes no WebGL2 |
+| Real desktop Chromium-based browser (Claude desktop browser pane) | cross-origin OpenRouter calls verified (authenticated POST readable, catalog, OAuth exchange endpoint); the game page itself not yet loaded there |
+| Safari, mobile browsers, GPU-accelerated frame rates | unverified |
+| WebGPU | not built (WebGL2 only) |
+
 ## Known limitations
 
 * The page must be visible to run at full speed: browsers throttle
