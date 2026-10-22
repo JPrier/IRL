@@ -282,19 +282,85 @@ pub fn spoken_line(action: &Action) -> Option<String> {
 /// Like [`spoken_line`], but also renders actions whose words live in the world
 /// model.
 ///
-/// `ShareClaim` is how an NPC discloses a fact they believe. Its audible text is
-/// the fact's canonical `statement`; the simulation only accepts the claim when
-/// the speaker actually believes it, so speaking the statement never leaks a
-/// secret the character could not know.
+/// * `ShareClaim` is how an NPC discloses a fact they believe. Its audible text
+///   is the fact's canonical `statement`; the simulation only accepts the claim
+///   when the speaker actually believes it, so this never leaks a secret the
+///   character could not know.
+/// * `MakeOffer` normally carries the speaker's own `note`, but the local model
+///   frequently leaves it empty. That made the offer **completely silent** in
+///   the voice clients even though a real bargain had been offered. When the
+///   note is empty the committed terms are rendered into a short sentence. This
+///   is a deterministic paraphrase of the accepted action's own fields (the same
+///   data the UI shows), never invented dialogue.
 pub fn spoken_line_in(world: &rpg_domain::world::World, action: &Action) -> Option<String> {
-    if let Action::ShareClaim { fact, .. } = action {
-        return world
+    match action {
+        Action::ShareClaim { fact, .. } => world
             .facts
             .get(fact)
             .map(|f| f.statement.trim().to_string())
-            .filter(|s| !s.is_empty());
+            .filter(|s| !s.is_empty()),
+        Action::MakeOffer {
+            note,
+            give,
+            want,
+            disclose,
+            ..
+        } => {
+            let note = note.trim();
+            if note.is_empty() {
+                Some(describe_offer(world, give, want, disclose.is_some()))
+            } else {
+                Some(note.to_string())
+            }
+        }
+        _ => spoken_line(action),
     }
-    spoken_line(action)
+}
+
+/// Human names for an item-stack list, e.g. "medicine" or "medicine and a ledger".
+fn names_of(world: &rpg_domain::world::World, stacks: &[rpg_domain::world::ItemStack]) -> String {
+    stacks
+        .iter()
+        .map(|s| {
+            let name = world
+                .items
+                .get(&s.item)
+                .map(|i| i.name.clone())
+                .unwrap_or_else(|| s.item.as_str().to_string());
+            if s.qty > 1 {
+                format!("{name} x{}", s.qty)
+            } else {
+                name
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" and ")
+}
+
+/// Render an offer's committed terms as a short spoken sentence.
+fn describe_offer(
+    world: &rpg_domain::world::World,
+    give: &[rpg_domain::world::ItemStack],
+    want: &[rpg_domain::world::ItemStack],
+    discloses: bool,
+) -> String {
+    let want_s = names_of(world, want);
+    let give_s = names_of(world, give);
+    if !want_s.is_empty() {
+        if discloses {
+            format!("Bring me {want_s} and I will tell you what I know.")
+        } else if !give_s.is_empty() {
+            format!("Bring me {want_s} and I will give you {give_s}.")
+        } else {
+            format!("Bring me {want_s} and we have a deal.")
+        }
+    } else if !give_s.is_empty() {
+        format!("I can offer you {give_s}.")
+    } else if discloses {
+        "There is something I could tell you, for the right price.".to_string()
+    } else {
+        "Let us make a deal.".to_string()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -995,6 +1061,27 @@ mod tests {
             target: InvestigateTarget::Location(LocationId::new("plaza")),
         };
         assert!(spoken_line_in(&session.sim.world, &silent).is_none());
+    }
+
+    #[test]
+    fn empty_offer_note_still_speaks_the_terms() {
+        let session = Session::new(2026);
+        let offer = Action::MakeOffer {
+            target: ActorId::new(PLAYER),
+            give: vec![],
+            want: vec![rpg_domain::world::ItemStack {
+                item: ItemId::new("medicine"),
+                qty: 1,
+            }],
+            condition: None,
+            disclose: Some(FactId::new("f_grocer_ledger")),
+            note: String::new(),
+        };
+        let line = spoken_line_in(&session.sim.world, &offer).expect("offer should speak");
+        assert!(
+            line.to_lowercase().contains("medicine"),
+            "unexpected line: {line}"
+        );
     }
 
     #[test]

@@ -450,9 +450,17 @@ impl Worker {
                 self.speak(npc.as_str(), &line);
             }
             None => {
+                // The NPC heard the player but the committed action carries no
+                // spoken words (or it was rejected). Show what the simulation
+                // actually did, so silence is never mistaken for broken audio.
+                let trace = self.session.trace.last().cloned().unwrap_or_default();
                 self.dialogue.push(DialogueLine {
                     speaker: npc.as_str().to_string(),
-                    text: "(no spoken reply; the accepted action was not `speak`)".into(),
+                    text: if trace.is_empty() {
+                        "(no spoken reply)".to_string()
+                    } else {
+                        format!("(no spoken reply) {trace}")
+                    },
                     kind: LineKind::System,
                 });
             }
