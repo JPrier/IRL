@@ -24,8 +24,12 @@
 //! * [`neural::SherpaAsr`] is real offline neural speech recognition.
 //! * [`neural::VadSegmenter`] segments a live microphone stream into utterances.
 //! * [`audio`] provides real microphone capture and speaker playback via `cpal`.
+//!
+//! [`dsp`] (downmixing, resampling, metering) has no native dependencies and
+//! is always available; it also documents the audio data contract.
 
 pub mod assets;
+pub mod dsp;
 
 #[cfg(feature = "neural")]
 pub mod audio;
@@ -36,8 +40,8 @@ pub mod neural;
 pub use audio::{AudioCapture, AudioDeviceInfo, AudioPlayback, CaptureConfig, PlaybackConfig};
 #[cfg(feature = "neural")]
 pub use neural::{
-    default_bundle_for, CancelToken, SherpaAsr, SherpaTts, SpeechSegmentAudio, VadSegmenter,
-    DEFAULT_ASR_BUNDLE, DEFAULT_TTS_BUNDLE, DEFAULT_VAD_BUNDLE,
+    default_bundle_for, CancelToken, SherpaAsr, SherpaTts, SpeechSegmentAudio, StreamStats,
+    VadSegmenter, DEFAULT_ASR_BUNDLE, DEFAULT_TTS_BUNDLE, DEFAULT_VAD_BUNDLE,
 };
 
 use rpg_domain::ports::{SpeechAudio, SpeechError, SpeechRequest, SpeechSynthesizer, VoiceInfo};
