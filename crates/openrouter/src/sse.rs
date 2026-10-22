@@ -216,6 +216,9 @@ impl StreamAccumulator {
                 "stream ended before completion (connection interrupted)".into(),
             ));
         }
+        if self.finish_reason.as_deref() == Some("length") {
+            return Err(crate::truncated());
+        }
         if self.text.trim().is_empty() {
             return Err(OpenRouterError::Protocol(format!(
                 "stream finished without content (finish_reason {})",

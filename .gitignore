@@ -6,3 +6,8 @@ agentic_rpg_save.json
 
 .cache/
 /dist/
+node_modules/
+apps/web-game/tests/test-results/
+apps/web-game/tests/playwright-report/
+.env
+.env.*

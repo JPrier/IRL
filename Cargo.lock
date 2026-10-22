@@ -479,10 +479,12 @@ name = "bevy-game"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "irl_client",
  "rpg_agents",
  "rpg_domain",
  "rpg_eval",
  "rpg_inference",
+ "rpg_openrouter",
  "rpg_runtime",
  "rpg_speech",
 ]
@@ -3632,6 +3634,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "irl_client"
+version = "0.1.0"
+dependencies = [
+ "bevy",
+ "rpg_domain",
+ "rpg_eval",
+ "rpg_runtime",
+]
+
+[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5467,6 +5479,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "rpg_web_runtime"
+version = "0.1.0"
+dependencies = [
+ "js-sys",
+ "rpg_domain",
+ "rpg_eval",
+ "rpg_openrouter",
+ "rpg_runtime",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
 name = "rsqlite-vfs"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6674,6 +6702,25 @@ checksum = "5eba2ec791141b0bf4db542f6b038a8f9310cee33e076cb181245780b09a24ff"
 dependencies = [
  "cfg-if",
  "hashbrown 0.16.1",
+]
+
+[[package]]
+name = "web-game"
+version = "0.1.0"
+dependencies = [
+ "bevy",
+ "getrandom 0.3.4",
+ "irl_client",
+ "js-sys",
+ "rpg_domain",
+ "rpg_eval",
+ "rpg_openrouter",
+ "rpg_runtime",
+ "rpg_web_runtime",
+ "serde_json",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]

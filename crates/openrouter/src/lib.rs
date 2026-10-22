@@ -185,6 +185,12 @@ pub struct OpenRouterConfig {
     /// Send the request seed. Providers may ignore it; it never makes remote
     /// output deterministic.
     pub send_seed: bool,
+    /// Send `temperature`. Turned off for models that do not list it, since
+    /// `require_parameters` would otherwise route to no endpoint.
+    pub send_temperature: bool,
+    /// Name of the output-token limit parameter the model accepts
+    /// (`max_tokens`, or `max_completion_tokens` for models listing only it).
+    pub max_tokens_param: String,
     pub structured: StructuredMode,
     /// Use SSE streaming (enables early cancellation on providers that
     /// support it, and progress feedback).
@@ -211,6 +217,8 @@ impl Default for OpenRouterConfig {
             max_output_tokens: 400,
             temperature: None,
             send_seed: true,
+            send_temperature: true,
+            max_tokens_param: "max_tokens".into(),
             structured: StructuredMode::JsonSchema,
             stream: true,
             timeout_ms: 40_000,
@@ -286,11 +294,19 @@ pub fn chat_body(cfg: &OpenRouterConfig, req: &InferenceRequest, stream: bool) -
             {"role": "system", "content": req.system},
             {"role": "user", "content": req.prompt},
         ],
-        "max_tokens": cfg.max_output_tokens.max(16),
-        "temperature": cfg.temperature.unwrap_or(req.temperature).clamp(0.0, 2.0),
         "stream": stream,
     });
     let obj = body.as_object_mut().expect("object");
+    obj.insert(
+        cfg.max_tokens_param.clone(),
+        json!(cfg.max_output_tokens.max(16)),
+    );
+    if cfg.send_temperature {
+        obj.insert(
+            "temperature".into(),
+            json!(cfg.temperature.unwrap_or(req.temperature).clamp(0.0, 2.0)),
+        );
+    }
     if cfg.send_seed {
         // Keep the seed in the positive 32-bit range every provider accepts.
         obj.insert("seed".into(), json!(req.seed & 0x7fff_ffff));
@@ -396,6 +412,9 @@ pub fn parse_completion(body: &str) -> Result<Completion, OpenRouterError> {
             "provider reported finish_reason \"error\"".into(),
         ));
     }
+    if finish.as_deref() == Some("length") {
+        return Err(truncated());
+    }
     let message = choice.get("message");
     let text = message
         .and_then(|m| m.get("content"))
@@ -427,6 +446,15 @@ pub fn parse_completion(body: &str) -> Result<Completion, OpenRouterError> {
         streamed: false,
         first_token_ms: None,
     })
+}
+
+/// The answer hit the output-token cap before it was complete.
+pub(crate) fn truncated() -> OpenRouterError {
+    OpenRouterError::Protocol(
+        "answer truncated at the output-token limit (raise max output tokens, or the model \
+         spent them reasoning)"
+            .into(),
+    )
 }
 
 /// Message content is usually a string, but may be an array of parts.
@@ -648,8 +676,7 @@ fn classify(status: u16, message: String, retry_after_ms: Option<u64>) -> OpenRo
     let lower = message.to_ascii_lowercase();
     let structured_hint = lower.contains("structured")
         || lower.contains("response_format")
-        || lower.contains("json_schema")
-        || (lower.contains("no endpoints") && lower.contains("support"));
+        || lower.contains("json_schema");
     match status {
         401 => OpenRouterError::Auth(message),
         402 => OpenRouterError::InsufficientCredits(message),
@@ -865,6 +892,49 @@ pub fn check_model(model: &ModelInfo, cfg: &OpenRouterConfig) -> Result<(), Open
         )));
     }
     Ok(())
+}
+
+/// Check `model` against `cfg` and drop optional parameters the model does
+/// not list, so `provider.require_parameters` never leaves no endpoint to
+/// route to. Returns the names of the parameters that were dropped or
+/// renamed. Structured outputs are never dropped silently: an unsupported
+/// model is an error (see [`check_model`]).
+pub fn adapt_to_model(
+    cfg: &mut OpenRouterConfig,
+    model: &ModelInfo,
+) -> Result<Vec<String>, OpenRouterError> {
+    check_model(model, cfg)?;
+    let mut changed = Vec::new();
+    if model.supported_parameters.is_empty() {
+        return Ok(changed); // catalog says nothing; send the defaults
+    }
+    if cfg.send_seed && !model.supports("seed") {
+        cfg.send_seed = false;
+        changed.push("seed".into());
+    }
+    if cfg.send_temperature && !model.supports("temperature") {
+        cfg.send_temperature = false;
+        changed.push("temperature".into());
+    }
+    if cfg.reasoning_effort.is_some() && !model.supports("reasoning") {
+        cfg.reasoning_effort = None;
+        changed.push("reasoning".into());
+    }
+    if !model.supports(&cfg.max_tokens_param) {
+        if let Some(alt) = ["max_tokens", "max_completion_tokens"]
+            .into_iter()
+            .find(|p| model.supports(p))
+        {
+            changed.push(format!("{} -> {alt}", cfg.max_tokens_param));
+            cfg.max_tokens_param = alt.into();
+        } else {
+            return Err(OpenRouterError::BadRequest(format!(
+                "{} lists no output-token limit parameter; IRL needs one to cap cost",
+                model.id
+            )));
+        }
+    }
+    Ok(changed)
 }
 
 /// The relevant fields of `GET /key`.
@@ -1124,6 +1194,48 @@ mod tests {
             ..cfg
         };
         assert!(check_model(&models[1], &compat).is_ok());
+    }
+
+    #[test]
+    fn unsupported_optional_parameters_are_dropped_not_sent() {
+        let model = ModelInfo {
+            id: "r/reasoner".into(),
+            supported_parameters: vec![
+                "response_format".into(),
+                "structured_outputs".into(),
+                "max_completion_tokens".into(),
+            ],
+            ..ModelInfo::default()
+        };
+        let mut cfg = OpenRouterConfig {
+            reasoning_effort: Some("low".into()),
+            ..OpenRouterConfig::default()
+        };
+        let changed = adapt_to_model(&mut cfg, &model).unwrap();
+        assert_eq!(changed.len(), 4, "{changed:?}");
+        let body = chat_body(&cfg, &req(), false);
+        for absent in ["seed", "temperature", "reasoning", "max_tokens"] {
+            assert!(body.get(absent).is_none(), "{absent} still sent");
+        }
+        assert_eq!(body["max_completion_tokens"], 400);
+        // A generic routing 404 is not misreported as missing structured outputs.
+        assert!(matches!(
+            classify_http_error(
+                404,
+                r#"{"error":{"code":404,"message":"No endpoints found that support all the requested parameters"}}"#,
+                None
+            ),
+            OpenRouterError::BadRequest(_)
+        ));
+    }
+
+    #[test]
+    fn truncated_answers_are_reported_as_such() {
+        let e = parse_completion(
+            r#"{"choices":[{"finish_reason":"length","message":{"content":"{\"action\":\"sp"}}]}"#,
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("truncated"), "{e}");
     }
 
     #[test]

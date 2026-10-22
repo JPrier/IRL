@@ -67,6 +67,14 @@ pub enum Command {
     /// Show a system line in the dialogue log (platform notices such as
     /// "saved to browser storage" or a connection error).
     Notice(String),
+    /// The platform reports voice components that are off or unsupported
+    /// (browser voice toggles). Typed dialogue is unaffected.
+    VoiceUnavailable {
+        mic: bool,
+        asr: bool,
+        tts: bool,
+        why: String,
+    },
     /// Record raw microphone PCM to a WAV file, bypassing VAD/ASR/LLM/TTS.
     MicSelfTest {
         path: String,

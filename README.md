@@ -33,6 +33,12 @@ still requires model assets or hardware we did not have.
 > * `cargo run -p bevy-game -- --model .cache/models/Qwen3.5-0.8B-Q4_K_M.gguf`
 >   → **graphical Bevy 0.20 client**: walk the town, press `V` to speak, watch
 >   the authoritative simulation change.
+> * `./scripts/web-dev.sh` → **the same game in the browser** (WebAssembly +
+>   WebGL2): bring your own OpenRouter key, or play with the deterministic
+>   policy. See [docs/web.md](docs/web.md).
+> * `OPENROUTER_API_KEY=… cargo run -p bevy-game -- --provider openrouter` →
+>   the native client with an **optional remote model**; local GGUF stays the
+>   default and needs no key or network.
 >
 > **Not yet verified / NOT TESTED**
 > * **Streaming neural TTS / barge-in.** Kokoro is whole-utterance, so first
@@ -122,6 +128,34 @@ Microphone trouble? `bevy-game --mic-selftest` records raw device audio to
 audio at all. `bevy-game --voice-check [--mic-wav file.wav]` runs full voice
 turns through the real runtime and reports simulation ticks per voice stage.
 See [docs/voice-runtime.md](docs/voice-runtime.md).
+
+### Browser build (WebAssembly)
+
+```bash
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli --version 0.2.129 --locked
+./scripts/web-dev.sh            # build + serve at http://127.0.0.1:8080/
+./scripts/web-build.sh          # static site in dist/web (GitHub Pages ready)
+```
+
+The browser build shares the simulation, NPC policy, validation, saves and
+the Bevy presentation with the native client. NPC decisions use OpenRouter
+with a key you paste into the page (kept in memory only), or the
+deterministic policy. Details, security model and limits: [docs/web.md](docs/web.md).
+
+### Choosing the inference provider (native)
+
+```bash
+cargo run -p bevy-game -- --model model.gguf                     # local llama.cpp (default)
+cargo run -p bevy-game -- --provider heuristic                   # deterministic policy
+export OPENROUTER_API_KEY=sk-or-...                              # never on the command line
+cargo run -p bevy-game -- --provider openrouter --openrouter-model openai/gpt-6-luna \
+    --openrouter-max-requests 50 --openrouter-max-cost 0.25
+```
+
+OpenRouter runs on the inference worker like the local model and goes through
+the same contract validation, canonical policy and simulation commit. Speech
+stays the offline sherpa-onnx stack.
 
 ### Text-only client
 
@@ -232,6 +266,22 @@ cargo run -p model-bench -- --list-models
   device for CI, and `MissingNeuralBackend` fails loudly with the expected asset
   path instead of fabricating audio.
 
+### OpenRouter (`crates/openrouter`)
+* Optional remote provider behind `InferenceEngine`, shared by the native and
+  browser clients: request bodies with the strict JSON-schema rendering of the
+  shared action contract and `provider.require_parameters`, response/usage/
+  cost parsing, SSE streaming, error classification, bounded retries, budgets
+  and the model catalog.
+* Native transport (`ureq`) on the inference worker with immediate
+  cancellation; browser transport (`fetch` + `AbortController`).
+* Mock-server tests; an opt-in billable integration test.
+
+### Browser client (`apps/web-game`, `crates/web-runtime`, `crates/client`)
+* The shared Bevy presentation (`irl_client`) over the shared `SimCore`,
+  driven from the browser event loop; OpenRouter, speech and storage as
+  nonblocking futures. Bring-your-own-key UI, budgets, IndexedDB saves with
+  export/import, optional browser speech, diagnostics. See [docs/web.md](docs/web.md).
+
 ### Graphical client (`apps/bevy-game`)
 * Bevy 0.20 2D renderer that consumes immutable simulation `Snapshot`s and
   submits validated `Command`s. The simulation never depends on Bevy.
@@ -255,12 +305,16 @@ crates/
   inference/     resident llama.cpp backend, model profiles, JSON grammar
   speech/        WAV I/O, diagnostic synth, streaming metrics, neural port
   persistence/   JSON snapshots + SQLite event store
-  runtime/       fixed-tick authoritative sim + mic/ASR/LLM/TTS workers
+  runtime/       authoritative SimCore (shared) + native fixed-tick thread and mic/ASR/LLM/TTS workers
+  openrouter/    optional OpenRouter provider: shared protocol, native + browser transports
+  client/        the shared Bevy presentation (native and browser)
+  web-runtime/   browser driver for SimCore: event-loop ticks, fetch/speech/storage dispatch
   content/       the handcrafted Hidden Mafia town (8 locations, 14 NPCs)
   eval/          simulated players, 10 acceptance scenarios, metrics
 apps/
   game/          playable text client
   bevy-game/     graphical Bevy 0.20 client (renderer + input only)
+  web-game/      the same client for the browser (WASM + WebGL2), page and Playwright tests
   voice-play/    offline voice conversation loop (mic/WAV -> ASR -> LLM -> TTS)
   voice-demo/    neural speech harness (install/list/bench/roundtrip/mic)
   scenario-runner/  headless CI gate
@@ -271,6 +325,7 @@ docs/
   benchmarks/    reproducible evidence and NOT-TESTED list
   architecture.md
   testing.md
+  web.md         browser build, OpenRouter, security model
   playtest.md
 ```
 

@@ -384,6 +384,12 @@ impl SimCore {
                 Err(e) => self.system(&format!("load failed ({label}): {e}")),
             },
             Command::Notice(text) => self.system(&text),
+            Command::VoiceUnavailable { mic, asr, tts, why } => {
+                if mic && self.stage() == VoiceStage::Listening {
+                    self.cancel_active("voice input turned off");
+                }
+                self.mark_unavailable(mic, asr, tts, &why);
+            }
             Command::PushToTalk(true) => self.ptt_down(),
             Command::PushToTalk(false) => self.ptt_up(),
             Command::Say(text) => self.typed(text),

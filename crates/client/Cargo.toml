@@ -1,0 +1,22 @@
+[package]
+name = "irl_client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Agentic RPG: the shared Bevy presentation (world, HUD, dialogue, offers, inventory, diagnostics) used by the native and browser clients. Renders snapshots; never owns game rules."
+
+[dependencies]
+rpg_domain.workspace = true
+rpg_runtime.workspace = true
+
+# Bevy 0.20 requires Rust >= 1.97.1 (see rust-toolchain.toml). Only the
+# 2D/UI feature set is enabled; each app adds its platform features
+# (`multi_threaded`/`png` natively, `web` in the browser build).
+[dependencies.bevy]
+version = "0.20"
+default-features = false
+features = ["2d", "ui", "default_font"]
+
+[dev-dependencies]
+rpg_eval.workspace = true

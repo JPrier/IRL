@@ -208,6 +208,33 @@ mod tests {
     }
 
     #[test]
+    fn hand_written_schema_matches_the_field_table() {
+        // ACTION_SCHEMA (fed to llama.cpp's grammar) and FIELDS (the strict
+        // rendering and the validator) must describe the same contract.
+        let canon = action_schema();
+        let props = canon["properties"].as_object().unwrap();
+        for (name, kind) in FIELDS {
+            let p = &props[name];
+            let (ty, values): (&str, Option<Vec<&str>>) = match kind {
+                FieldKind::Action => ("string", Some(ACTIONS.to_vec())),
+                FieldKind::Str => ("string", None),
+                FieldKind::Bool => ("boolean", None),
+                FieldKind::StrArray => ("array", None),
+                FieldKind::Loudness => ("string", Some(LOUDNESS.to_vec())),
+            };
+            assert_eq!(p["type"], ty, "{name} type");
+            if kind == FieldKind::StrArray {
+                assert_eq!(p["items"]["type"], "string", "{name} items");
+            }
+            match values {
+                Some(v) => assert_eq!(p["enum"], serde_json::json!(v), "{name} enum"),
+                None => assert!(p.get("enum").is_none(), "{name} enum"),
+            }
+        }
+        assert_eq!(canon["additionalProperties"], Value::Bool(false));
+    }
+
+    #[test]
     fn strict_schema_requires_every_field_and_is_closed() {
         let s = strict_action_schema();
         assert_eq!(s["additionalProperties"], Value::Bool(false));

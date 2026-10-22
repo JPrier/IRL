@@ -47,6 +47,10 @@ rpg_sim::Simulation::apply ◄────┘
 | `rpg_persistence` | snapshots, SQLite event store | gameplay rules |
 | `rpg_content` | the town and story data | rules |
 | `rpg_eval` | simulated players, scenarios, metrics | production rules |
+| `rpg_runtime` | `SimCore` (conversation state machine, staleness, commit), native threaded runtime | rules (delegates to `rpg_sim`) |
+| `rpg_openrouter` | OpenRouter request/response/SSE/errors/budget, native + browser transports | world state |
+| `irl_client` | the Bevy presentation shared by native and browser | game rules |
+| `rpg_web_runtime` | driving `SimCore` from the browser event loop | game rules |
 
 ## Determinism
 
@@ -138,6 +142,29 @@ pub trait InferenceEngine: Send {
 implementations. A real backend must be resident and warmed; spawning a process
 per utterance is explicitly forbidden by the design.
 
+Backends: `rpg_inference::LlamaEngine` (local GGUF, the native default) and
+`rpg_openrouter::native::OpenRouterEngine` (explicit `--provider openrouter`);
+the browser calls OpenRouter through `rpg_openrouter::web`. All of them are
+asked for the same action contract (`rpg_domain::contract`), and every answer
+is validated against it, resolved by the canonical policy and validated by
+the simulation before anything is committed. Remote answers carry
+`RemoteProvenance` (gateway, model, provider, generation id, reported vs
+estimated cost, latency).
+
+## Platforms
+
+The same gameplay runs on two drivers (see [web.md](web.md)):
+
+* **native** — `rpg_runtime::spawn`: `SimCore` on a fixed-tick thread, with
+  microphone, ASR, inference and TTS on worker threads;
+* **browser** — `rpg_web_runtime::WebRuntime`: the same `SimCore`, pumped from
+  the browser event loop, with inference/speech/storage as futures.
+
+`SimCore` is pure with respect to time and I/O, so both drivers (and the
+deterministic tests) share its conversation state machine, correlation ids,
+stale-response rejection, timeouts and save/load. Only `rpg_persistence`'s
+SQLite store and the native workers are excluded from the browser build.
+
 ## Speech ports
 
 ```rust
@@ -172,6 +199,8 @@ latency and real-time factors.
 
 ## Save format
 
-`SaveFile { version, seed, world, events }`, serialized as JSON. The SQLite
-store keeps the same event log and periodic world snapshots. `SAVE_VERSION` is
+`SaveFile { version, seed, world, events }`, serialized as JSON
+(`to_json_string`/`from_json_str`; files on native, IndexedDB and
+export/import in the browser). The SQLite store (native only) keeps the same
+event log and periodic world snapshots. `SAVE_VERSION` is
 checked on load; schema changes must add an explicit migration.

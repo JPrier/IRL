@@ -1,0 +1,31 @@
+[package]
+name = "web-game"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Agentic RPG: the browser (WebAssembly + WebGL2) client. Same simulation, gameplay and Bevy presentation as the native game; OpenRouter for NPC decisions."
+
+[[bin]]
+name = "web-game"
+path = "src/main.rs"
+
+# Everything below is wasm-only: on native targets this binary is a stub that
+# points to the real native client, so `cargo build --workspace` neither pulls
+# browser crates into native builds nor needs a wasm toolchain.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+irl_client.workspace = true
+rpg_domain.workspace = true
+rpg_eval.workspace = true
+rpg_openrouter.workspace = true
+rpg_runtime.workspace = true
+rpg_web_runtime.workspace = true
+serde_json.workspace = true
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["Window", "Location", "UrlSearchParams", "console"] }
+# Bevy's browser platform layer (WebGL2 is part of the `2d` platform set).
+bevy = { version = "0.20", default-features = false, features = ["2d", "ui", "default_font", "web", "webgl2"] }
+# Entropy for hash seeds etc. comes from the browser's crypto API.
+getrandom = { version = "0.3", features = ["wasm_js"] }

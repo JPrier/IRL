@@ -1,0 +1,51 @@
+name: web-pages
+
+# Publish the browser build to GitHub Pages from `main` (or on demand).
+# Requires Pages to be enabled with "GitHub Actions" as the source
+# (Settings → Pages). Nothing secret is built in: players bring their own
+# OpenRouter key at runtime.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - run: rustup target add wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: web
+      - name: Install wasm-bindgen CLI (matching Cargo.lock)
+        run: |
+          WANT=$(awk '/^name = "wasm-bindgen"$/{getline; gsub(/"/,"",$3); print $3; exit}' Cargo.lock)
+          cargo install wasm-bindgen-cli --version "$WANT" --locked
+      - run: sudo apt-get update && sudo apt-get install -y binaryen
+      - run: ./scripts/web-build.sh
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist/web
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

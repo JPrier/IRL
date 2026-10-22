@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="strict-origin-when-cross-origin">
+  <title>IRL — Hidden Mafia (browser)</title>
+  <link rel="stylesheet" href="./style.css">
+  <script src="./host.js"></script>
+  <script type="module" src="./app.js"></script>
+</head>
+<body>
+  <header class="bar">
+    <div class="brand">IRL <span>— Hidden Mafia</span></div>
+    <div class="pill" id="provider-pill" data-state="heuristic">deterministic policy</div>
+    <div class="spacer"></div>
+    <div class="hint">Click the town, then <kbd>WASD</kbd> to walk · <kbd>Enter</kbd> to talk · <kbd>F3</kbd> diagnostics</div>
+  </header>
+
+  <main class="layout">
+    <section class="stage">
+      <div class="canvas-wrap">
+      <canvas id="irl-canvas" tabindex="0" aria-label="IRL game view"></canvas>
+      <div id="loading" class="overlay">
+        <div class="card">
+          <div class="title">Loading IRL…</div>
+          <div class="progress"><div id="load-bar"></div></div>
+          <div id="load-text" class="muted">downloading the game (no model weights are downloaded)</div>
+        </div>
+      </div>
+      <div id="fatal" class="overlay" hidden>
+        <div class="card error">
+          <div class="title">IRL could not start</div>
+          <pre class="msg"></pre>
+          <div class="muted">This build needs WebAssembly and WebGL2 (a current Chrome, Edge or Firefox). Reload to try again.</div>
+        </div>
+      </div>
+      </div>
+      <form id="say-form" class="say" autocomplete="off">
+        <input id="say" type="text" maxlength="300" placeholder="Say something to the nearest person… (Enter)" aria-label="Say">
+        <button type="submit">Say</button>
+        <button type="button" data-action="cancel" title="Cancel the current turn (C)">Cancel</button>
+      </form>
+    </section>
+
+    <aside class="panel">
+      <details open id="provider-box">
+        <summary>AI for NPC decisions</summary>
+        <p class="muted small">Without a key, NPCs use IRL's deterministic policy. With an <a href="https://openrouter.ai/" target="_blank" rel="noopener">OpenRouter</a> key, a remote model proposes their actions — the game still validates and commits every action itself.</p>
+        <div class="warn small">
+          <strong>Requests are billed to your OpenRouter account.</strong>
+          Use a disposable key with a low spending limit. The key is kept only in this tab's memory: it is not saved, not put in the URL, and not part of saves. A web page cannot hide a key from browser extensions or developer tools — don't use a key you can't revoke.
+        </div>
+        <div id="connect-form" class="connect">
+          <label>OpenRouter API key
+            <input id="api-key" type="password" name="irl-openrouter-key" autocomplete="new-password" data-1p-ignore data-lpignore="true" spellcheck="false" placeholder="sk-or-v1-…" aria-label="OpenRouter API key">
+          </label>
+          <label>Model
+            <input id="model" type="text" list="models" spellcheck="false" aria-label="Model">
+            <datalist id="models"></datalist>
+          </label>
+          <div class="muted small" id="model-hint">Loading models with structured-output support…</div>
+          <details class="advanced">
+            <summary>Limits &amp; options</summary>
+            <label>Max output tokens / request <input id="max-tokens" type="number" min="16" max="4096" value="400"></label>
+            <label>Request budget this session <input id="max-requests" type="number" min="0" value="40"></label>
+            <label>Cost cap this session (USD) <input id="max-cost" type="number" min="0" step="0.01" value="0.10"></label>
+            <label>Structured output
+              <select id="structured">
+                <option value="json_schema">JSON schema, strict (recommended)</option>
+                <option value="json_object">JSON object — compatibility, no schema guarantee</option>
+              </select>
+            </label>
+            <label class="check"><input id="stream" type="checkbox" checked> Stream responses (enables early cancel)</label>
+          </details>
+          <div class="row">
+            <button type="button" id="connect" class="primary">Connect &amp; test</button>
+            <button type="button" id="disconnect">Disconnect</button>
+          </div>
+          <button type="button" id="oauth" class="link">or sign in with OpenRouter (creates a key for this tab)</button>
+        </div>
+        <div id="conn-status" class="status small" role="status">Not connected — deterministic policy.</div>
+        <div id="usage" class="usage small"></div>
+      </details>
+
+      <details open>
+        <summary>Game</summary>
+        <div class="grid">
+          <button data-action="save" title="K or F5">Save</button>
+          <button data-action="load" title="L or F9">Load</button>
+          <button data-action="export">Export save</button>
+          <label class="button">Import save<input id="import" type="file" accept="application/json,.json" hidden></label>
+          <button data-action="accept" title="Y">Accept offer</button>
+          <button data-action="reject" title="N">Reject offer</button>
+          <button data-action="investigate" title="E">Investigate</button>
+        </div>
+        <p class="muted small">Saves go to this browser's storage (IndexedDB). Export/Import moves the same versioned save file the desktop game uses.</p>
+      </details>
+
+      <details>
+        <summary>Voice (optional)</summary>
+        <label class="check"><input id="tts" type="checkbox"> Speak NPC lines (browser speech synthesis)</label>
+        <label class="check"><input id="asr" type="checkbox"> Hold <kbd>V</kbd> to talk (browser speech recognition)</label>
+        <p class="muted small" id="voice-note">Browser speech recognition may send audio to an online service (it does in Chrome). Typing always works. The desktop game's offline neural voice is unchanged.</p>
+      </details>
+
+      <details open>
+        <summary>Diagnostics</summary>
+        <pre id="diag" class="diag small">waiting for the game…</pre>
+      </details>
+    </aside>
+  </main>
+</body>
+</html>

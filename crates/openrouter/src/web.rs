@@ -295,7 +295,16 @@ pub async fn complete_once(
         };
         let t = (now_ms() - start) as f32;
         for ev in &events {
-            match acc.apply(ev, t)? {
+            let step = match acc.apply(ev, t) {
+                Ok(step) => step,
+                Err(e) => {
+                    // A mid-stream error: stop downloading (and, where the
+                    // provider supports it, generating) right away.
+                    let _ = reader.cancel();
+                    return Err(e);
+                }
+            };
+            match step {
                 StreamStep::Done => {
                     let _ = reader.cancel();
                     return acc.finish();
@@ -316,17 +325,21 @@ pub async fn complete_once(
 /// [`complete_once`] with the bounded transient-error retry the native
 /// engine uses. Never retries more than `cfg.max_retries` times, never waits
 /// out a long `Retry-After`, never switches models.
+///
+/// `before_attempt` runs before every HTTP attempt (the first and any
+/// retry): it enforces the session budget and counts the request, so the
+/// browser accounts exactly like the native engine.
 pub async fn complete(
     cfg: &OpenRouterConfig,
     key: &ApiKey,
     req: &InferenceRequest,
     abort: &Abort,
     progress: &mut dyn FnMut(u32),
-    attempts: &mut u32,
+    before_attempt: &mut dyn FnMut() -> Result<(), OpenRouterError>,
 ) -> Result<Completion, OpenRouterError> {
     let mut retries = 0;
     loop {
-        *attempts += 1;
+        before_attempt()?;
         match complete_once(cfg, key, req, abort, progress).await {
             Ok(c) => return Ok(c),
             Err(e) => {

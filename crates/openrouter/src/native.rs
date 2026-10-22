@@ -24,7 +24,7 @@ use rpg_domain::ports::{InferenceEngine, InferenceError, InferenceRequest, Infer
 
 use crate::sse::{SseParser, StreamAccumulator, StreamStep};
 use crate::{
-    chat_body, check_model, classify_http_error, parse_completion, parse_key_info, parse_models,
+    adapt_to_model, chat_body, classify_http_error, parse_completion, parse_key_info, parse_models,
     to_inference_response, ApiKey, Completion, KeyInfo, ModelInfo, OpenRouterConfig,
     OpenRouterError, UsageMeter, API_KEY_ENV,
 };
@@ -147,11 +147,9 @@ impl OpenRouterEngine {
                     self.cfg.model
                 ))
             })?;
-        check_model(&model, &self.cfg)?;
-        if self.cfg.send_seed && !model.supports("seed") {
-            // `require_parameters` would otherwise route to no endpoint.
-            self.cfg.send_seed = false;
-        }
+        // Drops parameters the model does not list, so `require_parameters`
+        // never leaves no endpoint to route to.
+        adapt_to_model(&mut self.cfg, &model)?;
         self.model = Some(model);
         Ok(())
     }
