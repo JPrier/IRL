@@ -242,7 +242,16 @@ type HudTextQuery<'w, 's> = Query<
 // ---------------------------------------------------------------------------
 
 fn setup(mut commands: Commands, platform: Res<Platform>) {
-    commands.spawn((Camera2d, Transform::from_xyz(0.0, 0.0, 1000.0)));
+    // Flat rectangles and text need neither MSAA nor tonemapping. Both are
+    // full-screen per-pixel work; turning them off keeps the frame cheap on
+    // integrated GPUs and is what makes software WebGL (CI, GPU-blocklisted
+    // browsers) usable. Colours render exactly as specified.
+    commands.spawn((
+        Camera2d,
+        bevy::render::view::Msaa::Off,
+        bevy::render::view::Tonemapping::None,
+        Transform::from_xyz(0.0, 0.0, 1000.0),
+    ));
 
     let text_font = |size: f32| TextFont {
         font_size: size.into(),
@@ -569,10 +578,16 @@ fn sync_world(
         match spawned.locations.get(&loc.id).copied() {
             Some(entity) => {
                 if let Ok((mut transform, mut sprite)) = locations.get_mut(entity) {
-                    transform.translation.x = screen.x;
-                    transform.translation.y = screen.y;
-                    sprite.color = color;
-                    sprite.custom_size = Some(size);
+                    // Write only on change, so unchanged sprites are not
+                    // re-extracted every frame.
+                    let at = bevy::math::Vec3::new(screen.x, screen.y, transform.translation.z);
+                    if transform.translation != at {
+                        transform.translation = at;
+                    }
+                    if sprite.color != color || sprite.custom_size != Some(size) {
+                        sprite.color = color;
+                        sprite.custom_size = Some(size);
+                    }
                 }
             }
             None => {
@@ -613,9 +628,13 @@ fn sync_world(
         match spawned.actors.get(&actor.id).copied() {
             Some(entity) => {
                 if let Ok((mut transform, mut sprite)) = actors.get_mut(entity) {
-                    transform.translation.x = screen.x;
-                    transform.translation.y = screen.y;
-                    sprite.color = color;
+                    let at = bevy::math::Vec3::new(screen.x, screen.y, transform.translation.z);
+                    if transform.translation != at {
+                        transform.translation = at;
+                    }
+                    if sprite.color != color {
+                        sprite.color = color;
+                    }
                 }
             }
             None => {
@@ -665,10 +684,13 @@ fn update_ui(latest: Res<Latest>, ui: Res<UiState>, mut texts: HudTextQuery) {
 
     for (mut text, clock, status, voice, dialogue) in &mut texts {
         if clock.is_some() {
-            text.0 = format!(
-                "IRL - Hidden Mafia          Day {}  {}",
-                snap.day,
-                snap.clock()
+            set_text(
+                &mut text,
+                format!(
+                    "IRL - Hidden Mafia          Day {}  {}",
+                    snap.day,
+                    snap.clock()
+                ),
             );
         } else if status.is_some() {
             let here = loc_names
@@ -679,7 +701,7 @@ fn update_ui(latest: Res<Latest>, ui: Res<UiState>, mut texts: HudTextQuery) {
                 Some(id) => names.get(id).copied().unwrap_or(id).to_string(),
                 None => "nobody in earshot".to_string(),
             };
-            text.0 = format!(
+            set_text(&mut text, format!(
                 "{}  |  tick {}  |  at {}  |  near {}\n{} ({})  |  decisions: {} model / {} canonical / {} fallback",
                 snap.status,
                 snap.tick,
@@ -690,11 +712,11 @@ fn update_ui(latest: Res<Latest>, ui: Res<UiState>, mut texts: HudTextQuery) {
                 snap.model_decisions,
                 snap.canonical_decisions,
                 snap.fallback_decisions,
-            );
+            ));
         } else if voice.is_some() {
-            text.0 = voice_hud(snap, &ui, &names);
+            set_text(&mut text, voice_hud(snap, &ui, &names));
         } else if dialogue.is_some() {
-            text.0 = dialogue_text(snap, &names);
+            set_text(&mut text, dialogue_text(snap, &names));
         }
     }
 }
@@ -793,7 +815,7 @@ fn update_offers(latest: Res<Latest>, mut texts: Query<&mut Text, With<OffersTex
         return;
     };
     for mut text in &mut texts {
-        text.0 = offers_text(snap);
+        set_text(&mut text, offers_text(snap));
     }
 }
 
@@ -823,7 +845,10 @@ fn update_inventory(latest: Res<Latest>, mut texts: Query<&mut Text, With<Invent
             .iter()
             .map(|i| format!("{} x{}", i.name, i.qty))
             .collect();
-        text.0 = format!("Money: {}\n{}", snap.money, items.join("\n"));
+        set_text(
+            &mut text,
+            format!("Money: {}\n{}", snap.money, items.join("\n")),
+        );
     }
 }
 
@@ -840,10 +865,19 @@ fn update_diagnostics(
     };
     for mut text in &mut texts {
         if !ui.diagnostics {
-            text.0.clear();
+            set_text(&mut text, String::new());
             continue;
         }
-        text.0 = diagnostics_text(snap, ui.fps);
+        set_text(&mut text, diagnostics_text(snap, ui.fps));
+    }
+}
+
+/// Replace a text only when its content changed. Assigning through `Mut`
+/// marks the text changed even when it is identical, which makes Bevy
+/// re-shape and re-upload every glyph every frame.
+fn set_text(text: &mut Mut<Text>, value: String) {
+    if text.0 != value {
+        text.0 = value;
     }
 }
 
