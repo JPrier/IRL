@@ -7,12 +7,10 @@
 //! * Schema migrations are explicit and idempotent.
 //! * Raw audio is *not* stored by default.
 
-use rpg_domain::events::{Event, EventLog};
-use rpg_domain::ids::EventId;
+use rpg_domain::events::EventLog;
 use rpg_domain::rng::DeterministicRng;
 use rpg_domain::world::World;
 use rpg_sim::{SimConfig, SimOp, SimTransient, Simulation};
-use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use thiserror::Error;
@@ -25,6 +23,7 @@ pub enum PersistenceError {
     Io(#[from] std::io::Error),
     #[error("serialization error: {0}")]
     Json(#[from] serde_json::Error),
+    #[cfg(not(target_arch = "wasm32"))]
     #[error("database error: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error("unsupported save version {found} (expected {expected})")]
@@ -68,21 +67,37 @@ impl SaveFile {
 }
 
 pub fn save_json(save: &SaveFile, path: impl AsRef<Path>) -> Result<()> {
-    let text = serde_json::to_string_pretty(save)?;
-    std::fs::write(path, text)?;
+    std::fs::write(path, to_json_string(save)?)?;
     Ok(())
 }
 
 pub fn load_json(path: impl AsRef<Path>) -> Result<SaveFile> {
-    let text = std::fs::read_to_string(path)?;
-    let save: SaveFile = serde_json::from_str(&text)?;
-    if save.version != SAVE_VERSION {
-        return Err(PersistenceError::Version {
-            found: save.version,
-            expected: SAVE_VERSION,
-        });
+    from_json_str(&std::fs::read_to_string(path)?)
+}
+
+/// Serialize a save to the canonical versioned JSON text. This is the one
+/// save format on every platform: native files, browser storage and
+/// exported/imported saves all carry exactly this text.
+pub fn to_json_string(save: &SaveFile) -> Result<String> {
+    Ok(serde_json::to_string_pretty(save)?)
+}
+
+/// Parse and version-check canonical save JSON.
+pub fn from_json_str(text: &str) -> Result<SaveFile> {
+    // Check the version before deserializing the whole world, so a save from
+    // an incompatible build reports its version instead of a field error.
+    let probe: serde_json::Value = serde_json::from_str(text)?;
+    match probe.get("version").and_then(serde_json::Value::as_u64) {
+        Some(v) if v == SAVE_VERSION as u64 => {}
+        Some(v) => {
+            return Err(PersistenceError::Version {
+                found: v as u32,
+                expected: SAVE_VERSION,
+            })
+        }
+        None => return Err(PersistenceError::Corrupt("no save version".into())),
     }
-    Ok(save)
+    Ok(serde_json::from_value(probe)?)
 }
 
 /// Restore a `Simulation` from a save file, preserving live RNG and transient
@@ -114,153 +129,15 @@ pub fn replay(save: &SaveFile, config: SimConfig) -> Simulation {
 }
 
 // ---------------------------------------------------------------------------
-// SQLite event store
+// SQLite event store (native only)
 // ---------------------------------------------------------------------------
 
-/// A local, transactional event store. One embedded database per save slot.
-pub struct SqliteStore {
-    conn: Connection,
-}
-
-impl SqliteStore {
-    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let conn = Connection::open(path)?;
-        let store = Self { conn };
-        store.migrate()?;
-        Ok(store)
-    }
-
-    pub fn open_in_memory() -> Result<Self> {
-        let conn = Connection::open_in_memory()?;
-        let store = Self { conn };
-        store.migrate()?;
-        Ok(store)
-    }
-
-    /// Idempotent schema setup with explicit versioning.
-    pub fn migrate(&self) -> Result<()> {
-        self.conn.execute_batch(
-            r#"
-            PRAGMA journal_mode = WAL;
-            PRAGMA foreign_keys = ON;
-            CREATE TABLE IF NOT EXISTS schema_meta (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS events (
-                id INTEGER PRIMARY KEY,
-                tick INTEGER NOT NULL,
-                sim_minute INTEGER NOT NULL,
-                actor TEXT,
-                kind_json TEXT NOT NULL,
-                caused_by_json TEXT NOT NULL,
-                observed_by_json TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS snapshots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                tick INTEGER NOT NULL,
-                world_json TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            );
-            "#,
-        )?;
-        self.conn.execute(
-            "INSERT INTO schema_meta(key, value) VALUES ('version', ?1)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![SAVE_VERSION.to_string()],
-        )?;
-        Ok(())
-    }
-
-    pub fn append_event(&mut self, event: &Event) -> Result<()> {
-        let kind = serde_json::to_string(&event.kind)?;
-        let caused = serde_json::to_string(&event.caused_by)?;
-        let observed = serde_json::to_string(&event.observed_by)?;
-        self.conn.execute(
-            "INSERT OR REPLACE INTO events(id, tick, sim_minute, actor, kind_json, caused_by_json, observed_by_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                event.id.raw() as i64,
-                event.tick as i64,
-                event.sim_minute as i64,
-                event.actor.as_ref().map(|a| a.as_str()),
-                kind,
-                caused,
-                observed
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub fn append_events(&mut self, events: &EventLog) -> Result<()> {
-        let tx = self.conn.transaction()?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT OR REPLACE INTO events(id, tick, sim_minute, actor, kind_json, caused_by_json, observed_by_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            )?;
-            for e in events.all() {
-                stmt.execute(params![
-                    e.id.raw() as i64,
-                    e.tick as i64,
-                    e.sim_minute as i64,
-                    e.actor.as_ref().map(|a| a.as_str()),
-                    serde_json::to_string(&e.kind)?,
-                    serde_json::to_string(&e.caused_by)?,
-                    serde_json::to_string(&e.observed_by)?
-                ])?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub fn event_count(&self) -> Result<u64> {
-        let n: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))?;
-        Ok(n as u64)
-    }
-
-    pub fn max_event_id(&self) -> Result<Option<EventId>> {
-        let v: Option<i64> = self
-            .conn
-            .query_row("SELECT MAX(id) FROM events", [], |r| r.get(0))?;
-        Ok(v.map(|n| EventId(n as u64)))
-    }
-
-    /// Persist a world snapshot inside a transaction.
-    pub fn save_snapshot(&mut self, world: &World) -> Result<()> {
-        let json = serde_json::to_string(world)?;
-        self.conn.execute(
-            "INSERT INTO snapshots(tick, world_json) VALUES (?1, ?2)",
-            params![world.tick as i64, json],
-        )?;
-        Ok(())
-    }
-
-    pub fn latest_snapshot(&self) -> Result<Option<World>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT world_json FROM snapshots ORDER BY id DESC LIMIT 1")?;
-        let mut rows = stmt.query([])?;
-        if let Some(row) = rows.next()? {
-            let json: String = row.get(0)?;
-            Ok(Some(serde_json::from_str(&json)?))
-        } else {
-            Ok(None)
-        }
-    }
-
-    pub fn schema_version(&self) -> Result<u32> {
-        let v: String = self.conn.query_row(
-            "SELECT value FROM schema_meta WHERE key = 'version'",
-            [],
-            |r| r.get(0),
-        )?;
-        Ok(v.parse().unwrap_or(0))
-    }
-}
+// The browser build has no filesystem and must not link SQLite; it stores the
+// same versioned `SaveFile` JSON through a platform adapter instead.
+#[cfg(not(target_arch = "wasm32"))]
+mod sqlite;
+#[cfg(not(target_arch = "wasm32"))]
+pub use sqlite::SqliteStore;
 
 #[cfg(test)]
 mod tests {
@@ -387,5 +264,29 @@ mod tests {
             "proposal replay did not reconstruct the world"
         );
         assert_eq!(s.events.checksum(), replayed.events.checksum());
+    }
+
+    #[test]
+    fn json_text_roundtrip_is_version_checked() {
+        let sim = sim();
+        let text = to_json_string(&SaveFile::from_sim(&sim)).unwrap();
+        let back = from_json_str(&text).unwrap();
+        assert_eq!(back.events.checksum(), sim.events.checksum());
+
+        let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        v["version"] = serde_json::json!(SAVE_VERSION + 1);
+        assert!(matches!(
+            from_json_str(&v.to_string()),
+            Err(PersistenceError::Version { .. })
+        ));
+        v.as_object_mut().unwrap().remove("version");
+        assert!(matches!(
+            from_json_str(&v.to_string()),
+            Err(PersistenceError::Corrupt(_))
+        ));
+        assert!(matches!(
+            from_json_str("not json"),
+            Err(PersistenceError::Json(_))
+        ));
     }
 }

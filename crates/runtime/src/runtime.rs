@@ -134,6 +134,9 @@ impl WorkerLinks {
         for effect in effects {
             match effect {
                 Effect::SetAudioEpoch(e) => self.audio_epoch.store(e, Ordering::Release),
+                // Native saves go through `Command::Save(path)`; export to a
+                // platform store is only requested by the browser client.
+                Effect::SaveData { .. } => {}
                 Effect::Mic(req) => {
                     let conv = match &req {
                         MicRequest::Start { conv } | MicRequest::Stop { conv } => Some(*conv),
@@ -355,6 +358,7 @@ fn run_sim(
     let publish = |core: &SimCore| {
         let mut snap = core.snapshot();
         snap.diagnostics.target_ticks_per_second = target_tps;
+        snap.diagnostics.platform = std::env::consts::OS.to_string();
         if snapshots.try_send(snap).is_err() {
             links
                 .telemetry

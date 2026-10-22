@@ -12,6 +12,10 @@ rpg_sim.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+
+# SQLite is a native-only store; the browser build keeps the same versioned
+# JSON save format and must not link C code.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rusqlite.workspace = true
 
 [dev-dependencies]

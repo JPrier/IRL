@@ -65,6 +65,42 @@ pub struct InferenceResponse {
     pub decode_ms: f32,
     /// Whether the backend applied constrained/structured decoding.
     pub structured: bool,
+    /// Where a remote completion came from and what it cost. `None` for
+    /// local and deterministic engines.
+    #[serde(default)]
+    pub remote: Option<RemoteProvenance>,
+}
+
+/// Provenance and accounting reported by a remote provider for one
+/// completion. Every field is what the provider *reported*; nothing here is
+/// inferred locally except `estimated_cost_usd`, which is labelled as such.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct RemoteProvenance {
+    /// Gateway, e.g. `"openrouter"`.
+    pub gateway: String,
+    /// Model slug that was requested.
+    pub requested_model: String,
+    /// Model the provider says actually answered.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Upstream provider that served the request, when reported.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Gateway generation id, for correlating with the provider's logs.
+    #[serde(default)]
+    pub generation_id: Option<String>,
+    /// Cost in USD as reported by the provider.
+    #[serde(default)]
+    pub reported_cost_usd: Option<f64>,
+    /// Cost in USD estimated locally from published per-token prices.
+    #[serde(default)]
+    pub estimated_cost_usd: Option<f64>,
+    /// Whether the response arrived as a stream.
+    #[serde(default)]
+    pub streamed: bool,
+    /// Wall-clock latency of the whole request, in ms.
+    #[serde(default)]
+    pub latency_ms: f32,
 }
 
 impl InferenceResponse {

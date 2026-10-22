@@ -5374,6 +5374,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "rpg_openrouter"
+version = "0.1.0"
+dependencies = [
+ "js-sys",
+ "rpg_agents",
+ "rpg_domain",
+ "rpg_eval",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "ureq",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
 name = "rpg_perception"
 version = "0.1.0"
 dependencies = [
@@ -5407,6 +5424,7 @@ dependencies = [
  "rpg_persistence",
  "rpg_sim",
  "rpg_speech",
+ "serde_json",
 ]
 
 [[package]]

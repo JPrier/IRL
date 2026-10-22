@@ -24,18 +24,33 @@
 //! controllable fakes so the production pipeline runs in ordinary CI without
 //! devices or model weights.
 
+//!
+//! ## Platforms
+//!
+//! [`core::SimCore`], [`protocol`], [`telemetry`] and [`backends`] are
+//! platform-independent and compile for `wasm32-unknown-unknown`: the browser
+//! client drives the very same `SimCore` from its event loop. The threaded
+//! runtime ([`runtime`], [`workers`], [`wav_mic`], [`testing`]) uses native
+//! threads and blocking channels and exists only on native targets.
+
 pub mod backends;
 pub mod core;
 pub mod protocol;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod runtime;
 pub mod telemetry;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod testing;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod wav_mic;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod workers;
 
-pub use crate::core::{CoreConfig, Counters, SimCore, TALK_RADIUS};
+pub use crate::core::{CoreConfig, Counters, InferenceStats, SimCore, TALK_RADIUS};
 pub use backends::Backends;
 pub use protocol::*;
+#[cfg(not(target_arch = "wasm32"))]
 pub use runtime::{spawn, RuntimeConfig, RuntimeHandle, ShutdownReport};
 pub use telemetry::Telemetry;
+#[cfg(not(target_arch = "wasm32"))]
 pub use workers::{MicConfig, ASR_RATE};

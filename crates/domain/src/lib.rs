@@ -9,6 +9,7 @@
 //! desktop client alike.
 
 pub mod action;
+pub mod contract;
 pub mod events;
 pub mod geom;
 pub mod ids;

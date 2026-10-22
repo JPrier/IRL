@@ -606,7 +606,26 @@ pub fn spawn_inference(
             tel.active_inference.store(job.request_id, Ordering::SeqCst);
             let start = Instant::now();
             let result = match engine.as_mut() {
-                Some(e) => e.complete(&job.request),
+                Some(e) => {
+                    // Streamed progress is reported as a count only, at most
+                    // every 100 ms; the text itself is validated as a whole
+                    // by the simulation once the answer is complete.
+                    let mut chunks = 0u32;
+                    let mut last = Instant::now() - Duration::from_secs(1);
+                    let progress_out = out.clone();
+                    let mut sink = |_: &str| {
+                        chunks += 1;
+                        if last.elapsed() >= Duration::from_millis(100) {
+                            last = Instant::now();
+                            let _ = progress_out.send(Inbox::Infer(InferEvent::Progress {
+                                conv: job.conv,
+                                request_id: job.request_id,
+                                chunks,
+                            }));
+                        }
+                    };
+                    e.complete_streaming(&job.request, &mut sink)
+                }
                 None => Err(InferenceError::NotLoaded("model failed to load".into())),
             };
             tel.active_inference.store(NONE, Ordering::SeqCst);

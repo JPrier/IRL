@@ -13,6 +13,7 @@ members = [
     "crates/eval",
     "crates/inference",
     "crates/runtime",
+    "crates/openrouter",
     "apps/scenario-runner",
     "apps/game",
     "apps/model-bench",
@@ -40,6 +41,7 @@ rpg_content = { path = "crates/content" }
 rpg_eval = { path = "crates/eval" }
 rpg_inference = { path = "crates/inference" }
 rpg_runtime = { path = "crates/runtime" }
+rpg_openrouter = { path = "crates/openrouter" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

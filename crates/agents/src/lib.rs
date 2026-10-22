@@ -176,6 +176,7 @@ impl InferenceEngine for ScriptedEngine {
             decode_ms: 0.0,
             structured: false,
             text,
+            remote: None,
         })
     }
 }
@@ -332,6 +333,15 @@ If you need something before you help, make a conditional offer: condition "has_
     out
 }
 
+/// Deserialize an optional list where an explicit `null` (the strict
+/// structured-output rendering of an absent field) means empty.
+fn null_as_empty<'de, D>(de: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<String>>::deserialize(de)?.unwrap_or_default())
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 struct DecisionJson {
     #[serde(default)]
@@ -344,9 +354,9 @@ struct DecisionJson {
     fact: Option<String>,
     #[serde(default)]
     assertive: Option<bool>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty")]
     give: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty")]
     want: Vec<String>,
     #[serde(default)]
     note: Option<String>,
@@ -366,12 +376,8 @@ fn parse_decision(
     npc: &ActorId,
     speaker: &ActorId,
 ) -> Option<Action> {
-    let start = text.find('{')?;
-    let end = text.rfind('}')?;
-    if end < start {
-        return None;
-    }
-    let d: DecisionJson = serde_json::from_str(&text[start..=end]).ok()?;
+    let raw = rpg_domain::contract::extract_json_object(text)?;
+    let d: DecisionJson = serde_json::from_str(raw).ok()?;
     // Ground the target: a hallucinated actor id is repaired to the person the
     // NPC is actually addressing. The simulation still validates every field.
     let target = match d.target.as_deref() {
@@ -680,7 +686,7 @@ impl NpcPolicy {
             // temperature drifts between valid but unrelated actions.
             temperature: 0.0,
             seed: request_id,
-            response_contract: Some("action-json-v1".into()),
+            response_contract: Some(rpg_domain::contract::ACTION_CONTRACT_ID.into()),
         }
     }
 
@@ -742,6 +748,14 @@ impl NpcPolicy {
         };
         if std::env::var("RPG_DEBUG_DECISION").is_ok() {
             eprintln!("--- decision raw ---\n{}\n--- end decision ---", resp.text);
+        }
+        // The answer is untrusted whatever the backend promised: check it
+        // against the shared action contract before interpreting any field.
+        if let Err(why) = rpg_domain::contract::validate_action_json(&resp.text) {
+            return fallback(format!(
+                "model output violated the action contract ({why}): {}",
+                preview(&resp.text)
+            ));
         }
         let Some(mut action) = parse_decision(&resp.text, Some(world), npc, speaker) else {
             return fallback(format!(

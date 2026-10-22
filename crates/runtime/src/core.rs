@@ -136,6 +136,67 @@ pub struct Counters {
     pub interrupted: u64,
 }
 
+/// Session-wide accounting of every decision request answered by an
+/// inference backend, stale or not (a late answer still cost tokens).
+///
+/// Costs keep the provider's *reported* figure apart from the local
+/// *estimate*; they are never summed together.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct InferenceStats {
+    /// Requests handed to the inference backend.
+    pub requests: u64,
+    /// Answers that arrived (successful completions).
+    pub completed: u64,
+    /// Requests that ended in an error (network, provider, timeout, cancel).
+    pub errors: u64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    /// Sum of provider-reported costs, when any were reported.
+    pub reported_cost_usd: Option<f64>,
+    /// Sum of locally estimated costs, when any were estimated.
+    pub estimated_cost_usd: Option<f64>,
+    /// End-to-end latency of the most recent request.
+    pub last_latency_ms: Option<f32>,
+    /// Gateway/provider/model of the most recent remote answer.
+    pub last_remote: Option<String>,
+    /// The most recent inference error, for the diagnostics overlay.
+    pub last_error: Option<String>,
+}
+
+impl InferenceStats {
+    fn record(&mut self, done: &InferDone) {
+        self.last_latency_ms = Some(done.infer_ms);
+        match &done.result {
+            Ok(resp) => {
+                self.completed += 1;
+                self.prompt_tokens += resp.prompt_tokens as u64;
+                self.completion_tokens += resp.completion_tokens as u64;
+                if let Some(r) = &resp.remote {
+                    if let Some(c) = r.reported_cost_usd {
+                        *self.reported_cost_usd.get_or_insert(0.0) += c;
+                    }
+                    if let Some(c) = r.estimated_cost_usd {
+                        *self.estimated_cost_usd.get_or_insert(0.0) += c;
+                    }
+                    self.last_remote = Some(format!(
+                        "{} / {}{}",
+                        r.gateway,
+                        r.model.as_deref().unwrap_or(&r.requested_model),
+                        r.provider
+                            .as_deref()
+                            .map(|p| format!(" via {p}"))
+                            .unwrap_or_default()
+                    ));
+                }
+            }
+            Err(e) => {
+                self.errors += 1;
+                self.last_error = Some(e.to_string());
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct LastTurn {
     transcript: Option<String>,
@@ -145,6 +206,8 @@ struct LastTurn {
     tts_first_ms: Option<f32>,
     tts_synth_ms: Option<f32>,
     recorded_seconds: f32,
+    stream_chunks: Option<u32>,
+    llm_first_ms: Option<f32>,
 }
 
 pub struct SimCore {
@@ -165,6 +228,9 @@ pub struct SimCore {
     dialogue: Vec<DialogueLine>,
     status: String,
     counters: Counters,
+    inference: InferenceStats,
+    rejected_actions: u64,
+    last_decision: Option<String>,
     last: LastTurn,
     transitions: VecDeque<(ConvId, VoiceStage)>,
     effects: Vec<Effect>,
@@ -192,6 +258,9 @@ impl SimCore {
             dialogue: Vec::new(),
             status: "ready — hold V to talk, Enter to type, WASD to walk".into(),
             counters: Counters::default(),
+            inference: InferenceStats::default(),
+            rejected_actions: 0,
+            last_decision: None,
             last: LastTurn::default(),
             transitions: VecDeque::new(),
             effects: Vec::new(),
@@ -250,6 +319,10 @@ impl SimCore {
         &self.counters
     }
 
+    pub fn inference_stats(&self) -> &InferenceStats {
+        &self.inference
+    }
+
     pub fn stage(&self) -> VoiceStage {
         self.conv
             .as_ref()
@@ -305,6 +378,12 @@ impl SimCore {
             }
             Command::Save(path) => self.save(&path),
             Command::Load(path) => self.load(&path),
+            Command::ExportSave { slot } => self.export_save(slot),
+            Command::ImportSave { label, json } => match rpg_persistence::from_json_str(&json) {
+                Ok(save) => self.restore_save(save, &label),
+                Err(e) => self.system(&format!("load failed ({label}): {e}")),
+            },
+            Command::Notice(text) => self.system(&text),
             Command::PushToTalk(true) => self.ptt_down(),
             Command::PushToTalk(false) => self.ptt_up(),
             Command::Say(text) => self.typed(text),
@@ -474,6 +553,8 @@ impl SimCore {
             });
         }
         self.set_stage(VoiceStage::Deciding);
+        self.inference.requests += 1;
+        self.last.stream_chunks = None;
         self.status = format!("{} is thinking…", actor_name(&self.session.sim.world, &npc));
         self.effects
             .push(Effect::Infer(InferRequest::Decide(InferJob {
@@ -488,7 +569,9 @@ impl SimCore {
     fn commit(&mut self, npc: ActorId, decision: rpg_agents::NpcDecision, from_model: bool) {
         let name = actor_name(&self.session.sim.world, &npc);
         let commit = self.session.commit_npc_decision(npc.as_str(), decision);
+        self.last_decision = Some(commit.source.label());
         if let ValidationOutcome::Rejected(reason) = &commit.outcome {
+            self.rejected_actions += 1;
             let can_retry = from_model
                 && self
                     .conv
@@ -693,11 +776,34 @@ impl SimCore {
                 ));
                 self.engine = EngineState::Failed(e);
             }
+            InferEvent::Progress {
+                conv,
+                request_id,
+                chunks,
+            } => {
+                let current = self.conv.as_ref().is_some_and(|c| {
+                    c.id == conv
+                        && c.stage == VoiceStage::Deciding
+                        && c.pending
+                            .as_ref()
+                            .is_some_and(|p| p.request_id == request_id)
+                });
+                if current {
+                    self.last.stream_chunks = Some(chunks);
+                    if let Some(npc) = self.conv.as_ref().and_then(|c| c.npc.clone()) {
+                        let name = actor_name(&self.session.sim.world, &npc);
+                        self.status = format!("{name} is thinking… (answer arriving)");
+                    }
+                }
+            }
             InferEvent::Done(done) => self.on_decision(done),
         }
     }
 
     fn on_decision(&mut self, done: InferDone) {
+        // Account for every answer, including stale ones: a late answer was
+        // still generated (and, for a remote provider, billed).
+        self.inference.record(&done);
         let current = self.conv.as_ref().is_some_and(|c| {
             c.id == done.conv
                 && c.stage == VoiceStage::Deciding
@@ -711,6 +817,7 @@ impl SimCore {
         }
         self.last.llm_queue_ms = Some(done.queue_ms);
         self.last.llm_infer_ms = Some(done.infer_ms);
+        self.last.llm_first_ms = done.result.as_ref().ok().map(|r| r.first_token_ms);
         self.resolve_pending(done.result);
     }
 
@@ -982,21 +1089,34 @@ impl SimCore {
     /// answers are recognised as stale) and queued audio is silenced.
     fn load(&mut self, path: &str) {
         match rpg_persistence::load_json(path) {
-            Ok(save) => {
-                self.abort_active("loaded a save");
-                self.bump_audio_epoch();
-                self.world_epoch += 1;
-                let config = rpg_sim::SimConfig {
-                    enable_background: true,
-                    enable_director: true,
-                    ..rpg_sim::SimConfig::default()
-                };
-                self.session.sim = rpg_persistence::restore(save, config);
-                self.dialogue.clear();
-                self.system(&format!("loaded from {path}"));
-            }
+            Ok(save) => self.restore_save(save, path),
             Err(e) => self.system(&format!("load failed: {e}")),
         }
+    }
+
+    /// The platform-neutral half of [`SimCore::save`]: produce the canonical
+    /// save JSON and hand it to the platform to store.
+    fn export_save(&mut self, slot: String) {
+        let save = rpg_persistence::SaveFile::from_sim(&self.session.sim);
+        match rpg_persistence::to_json_string(&save) {
+            Ok(json) => self.effects.push(Effect::SaveData { slot, json }),
+            Err(e) => self.system(&format!("save failed: {e}")),
+        }
+    }
+
+    /// Replace the canonical state with a validated save, on any platform.
+    fn restore_save(&mut self, save: rpg_persistence::SaveFile, label: &str) {
+        self.abort_active("loaded a save");
+        self.bump_audio_epoch();
+        self.world_epoch += 1;
+        let config = rpg_sim::SimConfig {
+            enable_background: true,
+            enable_director: true,
+            ..rpg_sim::SimConfig::default()
+        };
+        self.session.sim = rpg_persistence::restore(save, config);
+        self.dialogue.clear();
+        self.system(&format!("loaded from {label}"));
     }
 
     // -----------------------------------------------------------------
@@ -1206,6 +1326,7 @@ impl SimCore {
         };
         let active = t.active_inference.load(Ordering::Relaxed);
         let diagnostics = Diagnostics {
+            platform: String::new(),
             ticks_per_second: t.ticks_per_second.get(),
             target_ticks_per_second: 0.0,
             tick_delay_ms: t.tick_delay_ms.get(),
@@ -1233,6 +1354,12 @@ impl SimCore {
             active_inference: (active != NONE).then_some(active),
             llm_queue_ms: self.last.llm_queue_ms,
             llm_infer_ms: self.last.llm_infer_ms,
+            llm_first_token_ms: self.last.llm_first_ms,
+            llm_stream_chunks: self.last.stream_chunks,
+            pending_inference: usize::from(self.pending_request_id().is_some()),
+            inference: self.inference.clone(),
+            last_decision: self.last_decision.clone(),
+            rejected_actions: self.rejected_actions,
             tts_first_audio_ms: self.last.tts_first_ms,
             tts_synth_ms: self.last.tts_synth_ms,
             playback: t.playback_status(),

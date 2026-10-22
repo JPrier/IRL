@@ -12,7 +12,11 @@ rpg_agents.workspace = true
 rpg_eval.workspace = true
 rpg_sim.workspace = true
 rpg_persistence.workspace = true
-# Only the device-independent parts (WAV I/O and `dsp`) are used here; the
-# native backends are wired in by the client, so this crate and its tests
-# never link onnxruntime or llama.cpp themselves.
+serde_json.workspace = true
+
+# Only the device-independent parts (WAV I/O and `dsp`) are used here, by the
+# native threaded workers; the native backends are wired in by the client, so
+# this crate and its tests never link onnxruntime or llama.cpp themselves. The
+# browser build drives `SimCore` directly and needs none of it.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rpg_speech = { path = "../speech", default-features = false }
