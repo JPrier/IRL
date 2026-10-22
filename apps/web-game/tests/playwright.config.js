@@ -45,7 +45,14 @@ module.exports = defineConfig({
     },
     {
       name: "firefox",
-      use: { ...devices["Desktop Firefox"], viewport: { width: 1280, height: 800 } },
+      use: {
+        ...devices["Desktop Firefox"],
+        viewport: { width: 1280, height: 800 },
+        launchOptions: {
+          // Headless Firefox on GPU-less CI disables WebGL unless forced.
+          firefoxUserPrefs: { "webgl.force-enabled": true, "webgl.disabled": false },
+        },
+      },
     },
   ],
   webServer: {

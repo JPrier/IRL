@@ -111,7 +111,17 @@ async function boot(page) {
   page.on("pageerror", (e) => errors.push(String(e)));
   page.on("request", (r) => urls.push(r.url()));
   await page.goto("./");
-  await page.waitForFunction(() => window.irlGame && window.irlGame.debugState().ready, null, { timeout: 90_000 });
+  // Ready, or the page's fatal overlay (no WebGL2, failed init): fail fast
+  // with the page's own message instead of waiting out the timeout.
+  await page.waitForFunction(
+    () => (window.irlGame && window.irlGame.debugState().ready) || !document.getElementById("fatal").hidden,
+    null,
+    { timeout: 90_000 },
+  );
+  const fatal = page.locator("#fatal");
+  if (await fatal.isVisible()) {
+    throw new Error(`the game reported a fatal error: ${await fatal.locator(".msg").textContent()}`);
+  }
   await expect(page.locator("#loading")).toBeHidden();
   return { logs, errors, urls };
 }
