@@ -4,3 +4,5 @@
 # workspace deterministic and satisfies Bevy. See docs/testing.md.
 channel = "1.98.1"
 components = ["rustfmt", "clippy"]
+# The browser build (apps/web-game) compiles to WebAssembly.
+targets = ["wasm32-unknown-unknown"]

@@ -71,6 +71,34 @@ example links only the speech stack and covers the same WAV/buffer-accounting
 path, so no coverage is lost. `model-bench --speech` remains the documented
 developer command.
 
+### 5. OpenRouter, browser runtime and browser build
+
+* `rpg_openrouter` unit tests: strict schema rendering, request bodies,
+  completion/usage/cost parsing, error classification and `Retry-After`,
+  budgets, catalog checks, the SSE parser (every line ending, any chunking,
+  split UTF-8, keep-alives, usage chunk, `[DONE]`, mid-stream errors,
+  interrupted streams).
+* `crates/openrouter/tests/native_mock.rs`: the native engine against a local
+  mock HTTP server — streaming and non-streaming, 401/402/429/502, retries,
+  dropped connections, prompt cancellation, deadlines, budgets, structured-
+  output support checks, and remote decisions through the canonical commit
+  path (including contract violations and impossible disclosures).
+* `crates/runtime/tests/platform_neutral_core.rs`: save export/import,
+  notices, streamed progress, inference accounting, delayed/duplicate/
+  cancelled answers — the `SimCore` paths the browser relies on.
+* `crates/web-runtime`: the browser scheduler and runtime with a fake
+  dispatcher (fixed ticks vs frame rate, stall recovery, a 10 s outstanding
+  request, cancel → stale, errors, saves, movement during inference).
+* `apps/web-game/tests` (Playwright): the built site under `/IRL/` in
+  Chromium (and Firefox in CI) — WASM init, WebGL2 canvas content, town and
+  actors, ticking, walking, typed dialogue, the OpenRouter panel, mocked
+  remote decisions committed canonically, invalid proposals, save/load/
+  export/import, a 10 s delayed response, cancellation, API errors, budgets,
+  and a key-leak sweep. `perf.spec.js` records performance numbers.
+* Opt-in billable tests: `real_openrouter.rs` (`--ignored`) and
+  `real-openrouter.spec.js` (`IRL_REAL_OPENROUTER=1`), run only by the manual
+  `openrouter-real` workflow.
+
 ## Commands
 
 ```bash
@@ -90,6 +118,12 @@ cargo run -p rpg_speech --example speech_bench   # diagnostic WAV/buffer account
 * `test` job (Ubuntu + Windows): `cargo test --workspace`, then
   `cargo run -p scenario-runner`, then the diagnostic speech benchmark via
   `cargo run -p rpg_speech --example speech_bench` (see §4).
+* `web` job: browser dependency-isolation check, `clippy` for
+  `wasm32-unknown-unknown`, `./scripts/web-build.sh`, then the Playwright
+  smoke and performance specs against the built site; uploads the site
+  (`irl-web`) and the Playwright report/traces.
+* `web-pages.yml` deploys the site from `main`; `openrouter-real.yml` is
+  manual and environment-gated.
 
 Real-model and neural-voice jobs are intentionally **not** in hosted CI: they
 need multi-GB assets and representative hardware. They belong in a self-hosted

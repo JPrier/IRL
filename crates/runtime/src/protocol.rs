@@ -52,6 +52,29 @@ pub enum Command {
     Save(String),
     /// Load canonical state from a JSON save file.
     Load(String),
+    /// Serialize canonical state to the versioned save JSON and hand it to the
+    /// platform as [`Effect::SaveData`] (browser storage, export).
+    ExportSave {
+        slot: String,
+    },
+    /// Load canonical state from versioned save JSON provided by the platform
+    /// (browser storage, an imported file). `label` names the source in
+    /// messages; the JSON is validated exactly like a native save file.
+    ImportSave {
+        label: String,
+        json: String,
+    },
+    /// Show a system line in the dialogue log (platform notices such as
+    /// "saved to browser storage" or a connection error).
+    Notice(String),
+    /// The platform reports voice components that are off or unsupported
+    /// (browser voice toggles). Typed dialogue is unaffected.
+    VoiceUnavailable {
+        mic: bool,
+        asr: bool,
+        tts: bool,
+        why: String,
+    },
     /// Record raw microphone PCM to a WAV file, bypassing VAD/ASR/LLM/TTS.
     MicSelfTest {
         path: String,
@@ -148,6 +171,13 @@ pub enum Effect {
     Tts(TtsRequest),
     /// Publish a new playback epoch: stale audio stops immediately.
     SetAudioEpoch(u64),
+    /// Canonical save JSON produced by [`Command::ExportSave`], for the
+    /// platform to store. Never contains credentials: it is exactly
+    /// `rpg_persistence::SaveFile`.
+    SaveData {
+        slot: String,
+        json: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -299,6 +329,13 @@ pub enum InferEvent {
         is_real_model: bool,
     },
     LoadFailed(String),
+    /// The backend is streaming an answer for this request. Carries only a
+    /// count: partial, unvalidated output is never shown or acted on.
+    Progress {
+        conv: ConvId,
+        request_id: u64,
+        chunks: u32,
+    },
     Done(InferDone),
 }
 
@@ -508,6 +545,8 @@ pub struct VoiceView {
 /// is in capture, VAD, ASR, inference, the simulation or playback.
 #[derive(Clone, Debug, Default)]
 pub struct Diagnostics {
+    /// `windows`, `linux`, `macos` or `browser`; filled in by the driver.
+    pub platform: String,
     // Simulation
     pub ticks_per_second: f32,
     pub target_ticks_per_second: f32,
@@ -531,6 +570,19 @@ pub struct Diagnostics {
     pub active_inference: Option<u64>,
     pub llm_queue_ms: Option<f32>,
     pub llm_infer_ms: Option<f32>,
+    /// Time to the first generated token/streamed byte of the last answer.
+    pub llm_first_token_ms: Option<f32>,
+    /// Streamed chunks received so far for the running request.
+    pub llm_stream_chunks: Option<u32>,
+    /// Decision requests waiting for an answer (0 or 1: one conversation at
+    /// a time).
+    pub pending_inference: usize,
+    /// Session-wide inference accounting.
+    pub inference: crate::core::InferenceStats,
+    /// Provenance label of the most recent committed NPC decision.
+    pub last_decision: Option<String>,
+    /// NPC proposals the simulation rejected (before any regeneration).
+    pub rejected_actions: u64,
     // TTS / playback
     pub tts_first_audio_ms: Option<f32>,
     pub tts_synth_ms: Option<f32>,

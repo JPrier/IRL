@@ -36,29 +36,9 @@ const IM_END: &str = "\u{3c}\u{7c}im_end\u{7c}\u{3e}";
 const THINK_OPEN: &str = "<think>";
 const THINK_CLOSE: &str = "</think>";
 
-/// JSON schema used for constrained tool decisions. The `action` enum is the
-/// only mandatory field; any additional fields are action-specific.
-pub const ACTION_SCHEMA: &str = r#"
-{
-  "type": "object",
-  "properties": {
-    "action": {"type": "string", "enum": ["speak", "share_claim", "offer", "promise", "threaten", "idle"]},
-    "target": {"type": "string"},
-    "text": {"type": "string"},
-    "fact": {"type": "string"},
-    "assertive": {"type": "boolean"},
-    "give": {"type": "array", "items": {"type": "string"}},
-    "want": {"type": "array", "items": {"type": "string"}},
-    "note": {"type": "string"},
-    "terms": {"type": "string"},
-    "condition": {"type": "string"},
-    "demand": {"type": "string"},
-    "loudness": {"type": "string", "enum": ["whisper", "normal", "loud", "shout"]}
-  },
-  "required": ["action"],
-  "additionalProperties": false
-}
-"#;
+/// JSON schema used for constrained tool decisions. It is the shared
+/// platform-independent action contract, re-exported for existing callers.
+pub use rpg_domain::contract::ACTION_SCHEMA;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ModelProfile {
@@ -256,7 +236,7 @@ impl LlamaEngine {
             .response_contract
             .as_deref()
             .or(self.profile.grammar.as_deref())?;
-        if spec == "action-json-v1" {
+        if spec == rpg_domain::contract::ACTION_CONTRACT_ID {
             llama_cpp_2::json_schema_to_grammar(ACTION_SCHEMA).ok()
         } else {
             Some(spec.to_string())
@@ -483,6 +463,7 @@ impl InferenceEngine for LlamaEngine {
             prefill_ms,
             decode_ms,
             structured,
+            remote: None,
         })
     }
 

@@ -4,6 +4,9 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 # Bevy + llama.cpp + sherpa-onnx produce very large debug artifacts. Dropping
 # debuginfo keeps the hosted runners from filling their disk and speeds links.
 env:
@@ -107,3 +110,92 @@ jobs:
       # `std::bad_alloc` on some Linux runners before `main` runs. This example
       # exercises the identical WAV/buffer-accounting path.
       - run: cargo run -q -p rpg_speech --example speech_bench
+
+  # The browser build: compile the real game to WebAssembly, prove the
+  # browser dependency graph has no native-only code, then run the Playwright
+  # smoke suite against the built static site (OpenRouter mocked; no paid
+  # calls, no secrets).
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy
+      # rust-toolchain.toml pins the workspace toolchain; make sure that pinned
+      # toolchain has the wasm target too.
+      - name: Add wasm target to the pinned toolchain
+        run: rustup target add wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: web
+      - name: Install wasm-bindgen CLI (matching Cargo.lock)
+        run: |
+          WANT=$(awk '/^name = "wasm-bindgen"$/{getline; gsub(/"/,"",$3); print $3; exit}' Cargo.lock)
+          if ! command -v wasm-bindgen >/dev/null || [ "$(wasm-bindgen --version | awk '{print $2}')" != "$WANT" ]; then
+            cargo install wasm-bindgen-cli --version "$WANT" --locked --force
+          fi
+      - name: Install binaryen (wasm-opt)
+        run: sudo apt-get update && sudo apt-get install -y binaryen
+      - name: Browser dependency isolation
+        run: |
+          cargo tree -p web-game --target wasm32-unknown-unknown -e normal --prefix none > web-deps.txt
+          if grep -Ei '^(rusqlite|libsqlite3|llama-cpp|sherpa-onnx|onnx|ort|alsa|cpal|ureq|rustls|ring|webpki|rpg_speech|rpg_inference)[-_a-z0-9]* v' web-deps.txt; then
+            echo "native-only crates leaked into the browser build"; exit 1
+          fi
+          echo "$(sort -u web-deps.txt | wc -l) crates in the browser graph, none native-only"
+      - name: Clippy (wasm32)
+        run: cargo clippy -p web-game -p rpg_web_runtime -p rpg_openrouter -p irl_client -p rpg_runtime --target wasm32-unknown-unknown -- -D warnings
+      - name: Build the browser client
+        run: ./scripts/web-build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: irl-web
+          path: dist/web
+          if-no-files-found: error
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install Playwright
+        working-directory: apps/web-game/tests
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium firefox
+      - name: Browser smoke tests
+        working-directory: apps/web-game/tests
+        run: npx playwright test smoke.spec.js perf.spec.js --project=chromium 2>&1 | tee playwright-output.txt; exit ${PIPESTATUS[0]}
+        shell: bash
+      # Firefox needs a display for WebGL2 on a GPU-less runner: headed under
+      # Xvfb with Mesa software GL.
+      - name: Browser smoke tests (Firefox, Xvfb)
+        if: always()
+        working-directory: apps/web-game/tests
+        env:
+          IRL_FIREFOX_HEADED: "1"
+        shell: bash
+        run: |
+          sudo apt-get install -y xvfb libgl1-mesa-dri
+          xvfb-run -a -s "-screen 0 1600x1000x24" npx playwright test smoke.spec.js perf.spec.js --project=firefox 2>&1 | tee -a playwright-output.txt; exit ${PIPESTATUS[0]}
+      - name: Test summary
+        if: always()
+        working-directory: apps/web-game/tests
+        shell: bash
+        run: |
+          {
+            echo '### Browser tests'
+            echo '```'
+            grep -E '✓|✘|passed|failed|flaky|skipped' playwright-output.txt | tail -60 || true
+            echo '```'
+            for f in $(find test-results -name 'perf-*.json' 2>/dev/null); do
+              echo "#### $(basename "$f")"; echo '```json'; cat "$f"; echo '```'
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: irl-web-playwright
+          path: |
+            apps/web-game/tests/playwright-report
+            apps/web-game/tests/test-results
+          if-no-files-found: ignore

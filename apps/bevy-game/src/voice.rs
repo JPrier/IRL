@@ -21,10 +21,28 @@ use rpg_speech::{SherpaAsr, SherpaTts, VadSegmenter};
 
 use crate::paths::{workspace_cache, workspace_manifest};
 
+/// Which inference backend drives NPC decisions.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Provider {
+    /// Resident llama.cpp with `--model` (or the bundled `.gguf`). Without a
+    /// model file this is the deterministic policy, exactly as before.
+    #[default]
+    Local,
+    /// The OpenRouter API, selected explicitly. Requires a key and network.
+    OpenRouter,
+    /// The deterministic policy only.
+    Heuristic,
+}
+
 /// What to load, from the command line.
 #[derive(Clone, Debug, Default)]
 pub struct VoiceOptions {
+    pub provider: Provider,
     pub model_path: Option<String>,
+    /// OpenRouter settings (used only with `Provider::OpenRouter`).
+    pub openrouter: rpg_openrouter::OpenRouterConfig,
+    /// File holding the OpenRouter key; otherwise `$OPENROUTER_API_KEY`.
+    pub openrouter_key_file: Option<PathBuf>,
     /// Fallback Kokoro voice for unnamed speakers.
     pub voice: String,
     pub no_voice: bool,
@@ -35,7 +53,13 @@ pub struct VoiceOptions {
 }
 
 pub fn backends(opts: &VoiceOptions) -> Backends {
-    let engine = engine_factory(opts.model_path.clone());
+    let engine = match opts.provider {
+        Provider::Local => engine_factory(opts.model_path.clone()),
+        Provider::Heuristic => engine_factory(None),
+        Provider::OpenRouter => {
+            openrouter_factory(opts.openrouter.clone(), opts.openrouter_key_file.clone())
+        }
+    };
     if opts.no_voice {
         return Backends {
             engine,
@@ -94,6 +118,31 @@ fn engine_factory(path: Option<String>) -> EngineFactory {
         let mut engine = LlamaEngine::load(profile).map_err(|e| e.to_string())?;
         engine.warm().map_err(|e| e.to_string())?;
         let interrupt = Some(engine.cancel_handle());
+        Ok(LoadedEngine {
+            engine: Box::new(engine),
+            interrupt,
+        })
+    })
+}
+
+/// OpenRouter on the inference worker. The key comes from the environment
+/// or a key file — never from the command line. `warm` checks the key
+/// (`GET /key`, free) and that the model supports structured outputs, so a
+/// misconfiguration is reported at startup and the deterministic policy
+/// answers instead.
+fn openrouter_factory(
+    cfg: rpg_openrouter::OpenRouterConfig,
+    key_file: Option<PathBuf>,
+) -> EngineFactory {
+    Box::new(move || {
+        use rpg_openrouter::native::OpenRouterEngine;
+        let engine = match &key_file {
+            Some(path) => OpenRouterEngine::from_key_file(cfg, path),
+            None => OpenRouterEngine::from_env(cfg),
+        };
+        let mut engine = engine.map_err(|e| format!("OpenRouter: {e}"))?;
+        engine.warm().map_err(|e| e.to_string())?;
+        let interrupt = Some(engine.interrupt_handle());
         Ok(LoadedEngine {
             engine: Box::new(engine),
             interrupt,

@@ -1,0 +1,65 @@
+name: openrouter-real
+
+# Billable, opt-in checks against the real OpenRouter API: the native engine
+# test and the browser end-to-end test. Manual only — never on pushes or
+# pull requests — and gated on the `openrouter-test` environment, so a
+# maintainer must approve each run and the OPENROUTER_API_KEY secret is never
+# exposed to untrusted code. Use a disposable key with a spending limit.
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "OpenRouter model slug (must support structured outputs)"
+        default: "openai/gpt-6-luna"
+
+permissions:
+  contents: read
+
+jobs:
+  real:
+    runs-on: ubuntu-latest
+    environment: openrouter-test
+    env:
+      IRL_OPENROUTER_MODEL: ${{ inputs.model }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - run: rustup target add wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: web
+      - name: Native OpenRouter engine (real request)
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          sudo apt-get update && sudo apt-get install -y libclang-dev clang pkg-config libasound2-dev libudev-dev
+          cargo test -p rpg_openrouter --test real_openrouter -- --ignored --nocapture
+      - name: Install wasm-bindgen CLI (matching Cargo.lock)
+        run: |
+          WANT=$(awk '/^name = "wasm-bindgen"$/{getline; gsub(/"/,"",$3); print $3; exit}' Cargo.lock)
+          cargo install wasm-bindgen-cli --version "$WANT" --locked
+      - run: ./scripts/web-build.sh
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Browser → real OpenRouter
+        working-directory: apps/web-game/tests
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          IRL_REAL_OPENROUTER: "1"
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+          npx playwright test real-openrouter.spec.js --project=chromium
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: openrouter-real-evidence
+          # Evidence JSON only (written without the key) - never traces,
+          # screenshots or reports, which could contain the credential.
+          path: |
+            target/openrouter-evidence.json
+            apps/web-game/tests/test-results/**/real-openrouter-evidence.json
+          if-no-files-found: ignore

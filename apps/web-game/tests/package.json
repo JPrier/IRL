@@ -1,0 +1,13 @@
+{
+  "name": "irl-web-tests",
+  "private": true,
+  "description": "Browser smoke tests for IRL's WebAssembly build (Playwright).",
+  "scripts": {
+    "test": "playwright test",
+    "test:real": "IRL_REAL_OPENROUTER=1 playwright test real-openrouter.spec.js",
+    "perf": "playwright test perf.spec.js"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.56.0"
+  }
+}

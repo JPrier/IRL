@@ -1,0 +1,46 @@
+[package]
+name = "rpg_openrouter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Agentic RPG: OpenRouter inference provider (shared protocol, native and browser transports) behind the domain port."
+
+[dependencies]
+rpg_domain.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+# Native transport: blocking HTTPS on the inference worker (never the
+# simulation thread). Same `ureq` as `rpg_speech`'s asset installer.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ureq = { version = "2", default-features = false, features = ["tls"] }
+
+# Browser transport: the page's own `fetch`, `AbortController` and streams.
+# No native TLS stack or sockets are linked into the WASM build.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
+version = "0.3"
+features = [
+    "AbortController",
+    "AbortSignal",
+    "Headers",
+    "ReadableStream",
+    "ReadableStreamDefaultReader",
+    "Request",
+    "RequestInit",
+    "RequestMode",
+    "RequestCredentials",
+    "Response",
+    "Performance",
+    "Window",
+]
+
+[dev-dependencies]
+rpg_eval.workspace = true
+rpg_agents.workspace = true
