@@ -192,9 +192,8 @@ impl SpeechSynthesizer for SherpaTts {
 
     fn synthesize(&mut self, req: &SpeechRequest) -> Result<SpeechAudio, SpeechError> {
         let sid = self.sid_for(&req.voice_id)?;
-        if self.cancel.is_cancelled() {
-            return Err(SpeechError::Backend("synthesis cancelled".into()));
-        }
+        // A cancel aimed at a previous utterance must not poison this one.
+        self.cancel.reset();
         let gen = GenerationConfig {
             sid,
             speed: 1.0,
@@ -225,6 +224,96 @@ impl SpeechSynthesizer for SherpaTts {
     fn cancel(&mut self) -> bool {
         self.cancel.cancel();
         true
+    }
+}
+
+/// Receives streamed TTS audio; returns `false` to stop generation.
+pub type ChunkSink = Box<dyn FnMut(&[f32]) -> bool>;
+
+/// Timing of one streamed synthesis.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StreamStats {
+    /// Mono samples delivered to the sink, at [`SherpaTts::sample_rate`].
+    pub samples: usize,
+    /// Wall milliseconds until the first chunk reached the sink.
+    pub first_chunk_ms: f32,
+    /// Wall milliseconds for the whole generation.
+    pub synth_ms: f32,
+    /// Number of chunks delivered.
+    pub chunks: usize,
+    /// True when the sink asked generation to stop early.
+    pub stopped: bool,
+}
+
+impl SherpaTts {
+    /// Synthesize `text`, handing audio to `sink` as the model produces it
+    /// (Kokoro emits one chunk per sentence), instead of waiting for the
+    /// whole utterance. `sink` returns `false` to abort generation, which is
+    /// how a cancelled conversation stops spending CPU on stale speech.
+    ///
+    /// The sink receives mono `f32` at [`SherpaTts::sample_rate`]. If the
+    /// backend produces no progress callbacks, the complete audio is delivered
+    /// once at the end, so callers never lose a line.
+    pub fn synthesize_streaming(
+        &mut self,
+        text: &str,
+        voice_id: &str,
+        sink: ChunkSink,
+    ) -> Result<StreamStats, SpeechError> {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let sid = self.sid_for(voice_id)?;
+        self.cancel.reset();
+        let gen = GenerationConfig {
+            sid,
+            speed: 1.0,
+            silence_scale: 0.2,
+            ..Default::default()
+        };
+        let start = Instant::now();
+        // The callback runs synchronously on this thread, so the sink never
+        // has to be `Send` (it may own thread-bound audio handles).
+        let shared = Rc::new(RefCell::new((sink, StreamStats::default())));
+        let cb_shared = shared.clone();
+        let cancel = self.cancel.clone();
+        let generated = self.tts.generate_with_config(
+            text,
+            &gen,
+            Some(move |samples: &[f32], _progress: f32| -> bool {
+                let mut guard = cb_shared.borrow_mut();
+                let (sink, stats) = &mut *guard;
+                if stats.chunks == 0 {
+                    stats.first_chunk_ms = start.elapsed().as_secs_f32() * 1000.0;
+                }
+                stats.chunks += 1;
+                stats.samples += samples.len();
+                let keep_going = !cancel.is_cancelled() && sink(samples);
+                stats.stopped |= !keep_going;
+                keep_going
+            }),
+        );
+        let mut guard = shared.borrow_mut();
+        let (sink, stats) = &mut *guard;
+        if stats.stopped {
+            stats.synth_ms = start.elapsed().as_secs_f32() * 1000.0;
+            return Ok(*stats);
+        }
+        let generated = generated
+            .ok_or_else(|| SpeechError::Backend("tts generation returned no audio".into()))?;
+        if stats.chunks == 0 {
+            let all = generated.samples();
+            if all.iter().all(|s| s.abs() < 1e-6) {
+                return Err(SpeechError::Backend(
+                    "tts produced silent audio (check voice/model assets)".into(),
+                ));
+            }
+            stats.first_chunk_ms = start.elapsed().as_secs_f32() * 1000.0;
+            stats.chunks = 1;
+            stats.samples = all.len();
+            stats.stopped = !sink(all);
+        }
+        stats.synth_ms = start.elapsed().as_secs_f32() * 1000.0;
+        Ok(*stats)
     }
 }
 
@@ -454,8 +543,13 @@ impl VadSegmenter {
         self.vad.detected()
     }
 
+    /// Forget all detector state and any finalized-but-unread segments, so
+    /// the next utterance cannot inherit audio from the previous one.
     pub fn reset(&mut self) {
         self.vad.reset();
+        while self.vad.front().is_some() {
+            self.vad.pop();
+        }
     }
 
     fn drain(&mut self, _flushing: bool) -> Vec<SpeechSegmentAudio> {

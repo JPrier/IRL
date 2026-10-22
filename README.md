@@ -111,9 +111,17 @@ uploads them as artifacts.
 
 ### Controls (graphical client)
 
-`WASD` walk · `V` hold a voice conversation · `Y`/`N` accept/reject an offer ·
-`Tab` next offer · `E` investigate · `F5`/`F9` save/load · `F3` developer
-diagnostics · `Esc` quit.
+`WASD` walk (always — also while an NPC listens, thinks or speaks) ·
+hold `V` to talk, release to send · `C` cancel the turn / interrupt the NPC ·
+`Enter` type a line instead · `Y`/`N` accept/reject an offer · `Tab` next
+offer · `E` investigate · `F5`/`F9` save/load · `F3` developer diagnostics ·
+`F7` switch microphone · `F8` microphone self-test · `Esc` quit.
+
+Microphone trouble? `bevy-game --mic-selftest` records raw device audio to
+`mic_selftest.wav` (no VAD/ASR/LLM/TTS) and says whether the device delivers
+audio at all. `bevy-game --voice-check [--mic-wav file.wav]` runs full voice
+turns through the real runtime and reports simulation ticks per voice stage.
+See [docs/voice-runtime.md](docs/voice-runtime.md).
 
 ### Text-only client
 
@@ -229,8 +237,10 @@ cargo run -p model-bench -- --list-models
   submits validated `Command`s. The simulation never depends on Bevy.
 * Town map, player/NPC sprites, proximity-aware talk targeting, offers,
   inventory, save/load (`F5`/`F9`) and a toggleable diagnostics overlay (`F3`).
-* Voice turn (`V`) runs mic → VAD → ASR → local LLM → validation → neural TTS
-  → playback on a worker thread, so a slow model turn never blocks the window.
+* Push-to-talk (`V`) runs mic → VAD → ASR → local LLM → validation → neural
+  TTS → playback as an explicit, cancellable state machine on dedicated
+  workers ([`crates/runtime`](crates/runtime)); the fixed-tick simulation never
+  waits for any of them. See [docs/voice-runtime.md](docs/voice-runtime.md).
 
 ## Workspace layout
 
@@ -245,6 +255,7 @@ crates/
   inference/     resident llama.cpp backend, model profiles, JSON grammar
   speech/        WAV I/O, diagnostic synth, streaming metrics, neural port
   persistence/   JSON snapshots + SQLite event store
+  runtime/       fixed-tick authoritative sim + mic/ASR/LLM/TTS workers
   content/       the handcrafted Hidden Mafia town (8 locations, 14 NPCs)
   eval/          simulated players, 10 acceptance scenarios, metrics
 apps/

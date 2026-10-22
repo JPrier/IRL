@@ -12,12 +12,11 @@ path = "src/main.rs"
 
 [dependencies]
 rpg_domain.workspace = true
+rpg_agents.workspace = true
 rpg_eval.workspace = true
 rpg_inference.workspace = true
+rpg_runtime.workspace = true
 rpg_speech.workspace = true
-rpg_sim.workspace = true
-rpg_persistence.workspace = true
-serde_json.workspace = true
 
 # Bevy 0.20 requires Rust >= 1.97.1; the workspace pins 1.98.1 (see
 # rust-toolchain.toml). Only the 2D/UI feature set is enabled so the build

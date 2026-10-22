@@ -635,6 +635,10 @@ pub struct NpcPolicy;
 impl NpcPolicy {
     /// Ask the engine for a decision and report how it was produced. A real
     /// model failure falls back to the deterministic policy *and says so*.
+    ///
+    /// This is the synchronous composition of [`NpcPolicy::request`] and
+    /// [`NpcPolicy::resolve`]. Realtime clients run those two halves on
+    /// different threads so the simulation never waits for the model.
     pub fn decide(
         &self,
         world: &World,
@@ -644,153 +648,187 @@ impl NpcPolicy {
         engine: &mut dyn InferenceEngine,
         request_id: u64,
     ) -> NpcDecision {
-        let prompt = render_npc_context(world, npc, speaker, utterance);
-        let make_fallback = |prompt: &str, reason: Option<String>| {
-            let label = reason
-                .clone()
-                .unwrap_or_else(|| "deterministic policy".into());
-            NpcDecision {
-                proposal: ActionProposal {
-                    actor: npc.clone(),
-                    action: heuristic_decision(world, npc, speaker, utterance),
-                    source: ProposalSource::NpcPolicy,
-                    rationale: label,
-                },
-                source: match reason {
-                    Some(r) => DecisionSource::HeuristicFallback { reason: r },
-                    None => DecisionSource::HeuristicEngine,
-                },
-                prompt: prompt.to_string(),
-                raw: None,
-            }
-        };
-
         if !engine.is_real_model() {
-            return make_fallback(&prompt, None);
+            return self.heuristic(world, npc, speaker, utterance, None);
         }
+        let req = self.request(world, npc, speaker, utterance, request_id);
+        let result = engine.complete(&req);
+        let model_id = engine.model_id();
+        self.resolve(world, npc, speaker, utterance, req, result, &model_id)
+    }
 
-        let req = InferenceRequest {
+    /// Build the model request for one NPC decision.
+    ///
+    /// The request carries only the NPC's scoped, rendered context — never a
+    /// reference to the mutable world — so it can be handed to an inference
+    /// worker while the simulation keeps running.
+    pub fn request(
+        &self,
+        world: &World,
+        npc: &ActorId,
+        speaker: &ActorId,
+        utterance: &str,
+        request_id: u64,
+    ) -> InferenceRequest {
+        InferenceRequest {
             id: request_id,
             role: InferenceRole::NpcDecision,
             system: "You are a character in a grounded social RPG. Stay in character. Never invent facts you were not told. Reply with one JSON object only.".into(),
-            prompt: prompt.clone(),
+            prompt: render_npc_context(world, npc, speaker, utterance),
             max_tokens: 160,
             // Tool decisions are deterministic: a small model asked at higher
             // temperature drifts between valid but unrelated actions.
             temperature: 0.0,
             seed: request_id,
             response_contract: Some("action-json-v1".into()),
+        }
+    }
+
+    /// The deterministic policy's decision. `reason` is `Some` when a real
+    /// model was configured but could not be used, so the provenance records
+    /// a fallback rather than an explicit heuristic engine.
+    pub fn heuristic(
+        &self,
+        world: &World,
+        npc: &ActorId,
+        speaker: &ActorId,
+        utterance: &str,
+        reason: Option<String>,
+    ) -> NpcDecision {
+        let label = reason
+            .clone()
+            .unwrap_or_else(|| "deterministic policy".into());
+        NpcDecision {
+            proposal: ActionProposal {
+                actor: npc.clone(),
+                action: heuristic_decision(world, npc, speaker, utterance),
+                source: ProposalSource::NpcPolicy,
+                rationale: label,
+            },
+            source: match reason {
+                Some(r) => DecisionSource::HeuristicFallback { reason: r },
+                None => DecisionSource::HeuristicEngine,
+            },
+            prompt: render_npc_context(world, npc, speaker, utterance),
+            raw: None,
+        }
+    }
+
+    /// Turn a model result into a decision.
+    ///
+    /// `world` is the world *at resolution time*, which may be later than the
+    /// world `req` was rendered from: parsing, the canonical agenda and the
+    /// canonical obligations are all checked against the current state, and
+    /// the caller must still validate the proposal before committing it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn resolve(
+        &self,
+        world: &World,
+        npc: &ActorId,
+        speaker: &ActorId,
+        utterance: &str,
+        req: InferenceRequest,
+        result: Result<InferenceResponse, InferenceError>,
+        model_id: &str,
+    ) -> NpcDecision {
+        let fallback = |reason: String| {
+            let mut d = self.heuristic(world, npc, speaker, utterance, Some(reason));
+            d.prompt = req.prompt.clone();
+            d
         };
-        match engine.complete(&req) {
-            Ok(resp) => {
-                if std::env::var("RPG_DEBUG_DECISION").is_ok() {
-                    eprintln!("--- decision raw ---\n{}\n--- end decision ---", resp.text);
+        let resp = match result {
+            Ok(resp) => resp,
+            Err(e) => return fallback(format!("inference error: {e}")),
+        };
+        if std::env::var("RPG_DEBUG_DECISION").is_ok() {
+            eprintln!("--- decision raw ---\n{}\n--- end decision ---", resp.text);
+        }
+        let Some(mut action) = parse_decision(&resp.text, Some(world), npc, speaker) else {
+            return fallback(format!(
+                "model output was not a valid action: {}",
+                preview(&resp.text)
+            ));
+        };
+        // Canonical agenda: an NPC with an unmet item need should not give up
+        // a private fact for free. If the model did not initiate the designed
+        // bargain, the policy does.
+        if let Some((fact, item)) = canonical_bargain(world, npc, speaker, utterance) {
+            match &mut action {
+                Action::MakeOffer {
+                    condition,
+                    disclose,
+                    ..
+                } => {
+                    *condition = Some(QuestPredicate::HasItem {
+                        actor: npc.clone(),
+                        item: item.clone(),
+                        qty: 1,
+                    });
+                    *disclose = Some(fact.clone());
                 }
-                match parse_decision(&resp.text, Some(world), npc, speaker) {
-                    Some(action) => {
-                        let mut action = action;
-                        // Canonical agenda: an NPC with an unmet item need should not
-                        // give up a private fact for free. If the model did not
-                        // initiate the designed bargain, the policy does.
-                        if let Some((fact, item)) =
-                            canonical_bargain(world, npc, speaker, utterance)
-                        {
-                            match &mut action {
-                                Action::MakeOffer {
-                                    condition,
-                                    disclose,
-                                    ..
-                                } => {
-                                    *condition = Some(QuestPredicate::HasItem {
-                                        actor: npc.clone(),
-                                        item: item.clone(),
-                                        qty: 1,
-                                    });
-                                    *disclose = Some(fact.clone());
-                                }
-                                Action::ShareClaim { .. } => {}
-                                _ => {
-                                    return NpcDecision {
-                                        proposal: ActionProposal {
-                                            actor: npc.clone(),
-                                            action: Action::MakeOffer {
-                                                target: speaker.clone(),
-                                                give: vec![],
-                                                want: vec![],
-                                                condition: Some(QuestPredicate::HasItem {
-                                                    actor: npc.clone(),
-                                                    item: item.clone(),
-                                                    qty: 1,
-                                                }),
-                                                disclose: Some(fact.clone()),
-                                                note: format!(
-                                                "Bring me {item} and I will tell you what I know."
-                                            ),
-                                            },
-                                            source: ProposalSource::NpcPolicy,
-                                            rationale: format!(
-                                                "designed bargain ({item} for {fact})"
-                                            ),
-                                        },
-                                        source: DecisionSource::CanonicalAgenda {
-                                            reason: format!("needs {item} before sharing {fact}"),
-                                        },
-                                        prompt: req.prompt,
-                                        raw: Some(resp),
-                                    };
-                                }
-                            }
-                        }
-                        // Canonical obligation: a satisfied deal the NPC owes the
-                        // player must be honoured. A small model often stalls with
-                        // another offer here; the simulation authority does not.
-                        if let Some(fact) = owed_disclosure(world, npc, speaker, utterance) {
-                            if !matches!(action, Action::ShareClaim { .. }) {
-                                return NpcDecision {
-                                    proposal: ActionProposal {
-                                        actor: npc.clone(),
-                                        action: Action::ShareClaim {
-                                            target: speaker.clone(),
-                                            fact: fact.clone(),
-                                            assertive: true,
-                                        },
-                                        source: ProposalSource::NpcPolicy,
-                                        rationale: format!("honouring a satisfied deal ({fact})"),
-                                    },
-                                    source: DecisionSource::CanonicalObligation {
-                                        reason: format!("satisfied deal requires {fact}"),
-                                    },
-                                    prompt: req.prompt,
-                                    raw: Some(resp),
-                                };
-                            }
-                        }
-                        NpcDecision {
-                            proposal: ActionProposal {
-                                actor: npc.clone(),
-                                action,
-                                source: ProposalSource::NpcModel,
-                                rationale: format!(
-                                    "{} completion_tokens={}",
-                                    engine.model_id(),
-                                    resp.completion_tokens
-                                ),
+                Action::ShareClaim { .. } => {}
+                _ => {
+                    return NpcDecision {
+                        proposal: ActionProposal {
+                            actor: npc.clone(),
+                            action: Action::MakeOffer {
+                                target: speaker.clone(),
+                                give: vec![],
+                                want: vec![],
+                                condition: Some(QuestPredicate::HasItem {
+                                    actor: npc.clone(),
+                                    item: item.clone(),
+                                    qty: 1,
+                                }),
+                                disclose: Some(fact.clone()),
+                                note: format!("Bring me {item} and I will tell you what I know."),
                             },
-                            source: DecisionSource::Model,
-                            prompt: req.prompt,
-                            raw: Some(resp),
-                        }
-                    }
-                    None => make_fallback(
-                        &prompt,
-                        Some(format!(
-                            "model output was not a valid action: {}",
-                            preview(&resp.text)
-                        )),
-                    ),
+                            source: ProposalSource::NpcPolicy,
+                            rationale: format!("designed bargain ({item} for {fact})"),
+                        },
+                        source: DecisionSource::CanonicalAgenda {
+                            reason: format!("needs {item} before sharing {fact}"),
+                        },
+                        prompt: req.prompt,
+                        raw: Some(resp),
+                    };
                 }
             }
-            Err(e) => make_fallback(&prompt, Some(format!("inference error: {e}"))),
+        }
+        // Canonical obligation: a satisfied deal the NPC owes the player must
+        // be honoured. A small model often stalls with another offer here; the
+        // simulation authority does not.
+        if let Some(fact) = owed_disclosure(world, npc, speaker, utterance) {
+            if !matches!(action, Action::ShareClaim { .. }) {
+                return NpcDecision {
+                    proposal: ActionProposal {
+                        actor: npc.clone(),
+                        action: Action::ShareClaim {
+                            target: speaker.clone(),
+                            fact: fact.clone(),
+                            assertive: true,
+                        },
+                        source: ProposalSource::NpcPolicy,
+                        rationale: format!("honouring a satisfied deal ({fact})"),
+                    },
+                    source: DecisionSource::CanonicalObligation {
+                        reason: format!("satisfied deal requires {fact}"),
+                    },
+                    prompt: req.prompt,
+                    raw: Some(resp),
+                };
+            }
+        }
+        NpcDecision {
+            proposal: ActionProposal {
+                actor: npc.clone(),
+                action,
+                source: ProposalSource::NpcModel,
+                rationale: format!("{model_id} completion_tokens={}", resp.completion_tokens),
+            },
+            source: DecisionSource::Model,
+            prompt: req.prompt,
+            raw: Some(resp),
         }
     }
 

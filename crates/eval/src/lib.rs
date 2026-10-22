@@ -128,22 +128,35 @@ impl Session {
     /// said. Returns `None` when the speech did not reach the NPC or the NPC
     /// chose a non-verbal action.
     pub fn say(&mut self, target: &str, text: &str) -> Option<String> {
-        let target_id = ActorId::new(target);
+        // An NPC can only answer speech that actually reached them (in range
+        // and audible). Rejected speech must not burn inference or produce an
+        // impossible response.
+        if matches!(self.player_speak(target, text), ValidationOutcome::Accepted) {
+            self.npc_respond(target, text)
+        } else {
+            None
+        }
+    }
+
+    /// The player's half of a conversational turn: commit the utterance as a
+    /// `Speak` action addressed to `target`. Only an `Accepted` outcome means
+    /// the NPC heard it and may answer.
+    pub fn player_speak(&mut self, target: &str, text: &str) -> ValidationOutcome {
         let out = self.player_do(Action::Speak {
-            target: Some(target_id.clone()),
+            target: Some(ActorId::new(target)),
             text: text.into(),
             loudness: Loudness::Normal,
         });
         self.trace
             .push(format!("player -> {target}: {text} [{out:?}]"));
-        // An NPC can only answer speech that actually reached them (in range
-        // and audible). Rejected speech must not burn inference or produce an
-        // impossible response.
-        if matches!(out, ValidationOutcome::Accepted) {
-            self.npc_respond(target, text)
-        } else {
-            None
-        }
+        out
+    }
+
+    /// Allocate the correlation id for the next NPC decision request.
+    pub fn next_request_id(&mut self) -> u64 {
+        let id = self.next_request;
+        self.next_request += 1;
+        id
     }
 
     /// Run the NPC decision for a heard utterance and return the line the NPC
@@ -160,29 +173,48 @@ impl Session {
     pub fn npc_respond(&mut self, npc: &str, text: &str) -> Option<String> {
         let npc_id = ActorId::new(npc);
         let player = ActorId::new(PLAYER);
-        let policy = NpcPolicy;
-        let decision = policy.decide(
+        let request_id = self.next_request_id();
+        let decision = NpcPolicy.decide(
             &self.sim.world,
             &npc_id,
             &player,
             text,
             self.engine.as_mut(),
-            self.next_request,
+            request_id,
         );
-        self.next_request += 1;
+        self.commit_npc_decision(npc, decision).spoken
+    }
+
+    /// Validate and commit an NPC decision against the *current* world.
+    ///
+    /// This is the single commit path for NPC replies: the synchronous
+    /// [`Session::npc_respond`] and the realtime client (whose decision was
+    /// produced by a model running while the world kept moving) both end
+    /// here, so provenance and the spoken line are recorded identically.
+    pub fn commit_npc_decision(
+        &mut self,
+        npc: &str,
+        decision: rpg_agents::NpcDecision,
+    ) -> NpcCommit {
         let kind = decision.proposal.action.kind_name().to_string();
         let source = decision.source.clone();
         let spoken = spoken_line_in(&self.sim.world, &decision.proposal.action);
         let out = self.sim.apply(&decision.proposal);
         self.trace
             .push(format!("{npc} -> {kind} [{}]: {out:?}", source.label()));
-        self.decisions.push((npc.to_string(), source));
+        self.decisions.push((npc.to_string(), source.clone()));
         // A `Pending` outcome means the offer/promise was recorded and awaits
         // acceptance — the character still spoke the line. Only a rejection
         // means nothing was said.
-        match out {
+        let spoken = match out {
             ValidationOutcome::Rejected(_) => None,
             _ => spoken,
+        };
+        NpcCommit {
+            outcome: out,
+            spoken,
+            kind,
+            source,
         }
     }
 
@@ -251,6 +283,18 @@ impl Session {
             n += 1;
         }
     }
+}
+
+/// The outcome of committing one NPC decision.
+#[derive(Clone, Debug)]
+pub struct NpcCommit {
+    pub outcome: ValidationOutcome,
+    /// The words the character actually said; `None` for a rejected or
+    /// silent action. Only this text may be voiced.
+    pub spoken: Option<String>,
+    /// The committed action's kind, for traces and diagnostics.
+    pub kind: String,
+    pub source: rpg_agents::DecisionSource,
 }
 
 // ---------------------------------------------------------------------------

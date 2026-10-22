@@ -1,0 +1,18 @@
+[package]
+name = "rpg_runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Agentic RPG: realtime runtime. A fixed-tick authoritative simulation plus independent microphone, ASR, inference and TTS workers that can never stall it."
+
+[dependencies]
+rpg_domain.workspace = true
+rpg_agents.workspace = true
+rpg_eval.workspace = true
+rpg_sim.workspace = true
+rpg_persistence.workspace = true
+# Only the device-independent parts (WAV I/O and `dsp`) are used here; the
+# native backends are wired in by the client, so this crate and its tests
+# never link onnxruntime or llama.cpp themselves.
+rpg_speech = { path = "../speech", default-features = false }
