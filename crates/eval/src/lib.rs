@@ -171,6 +171,18 @@ impl Session {
     /// authoritative simulation; the voice client reads exactly this text and
     /// never invents dialogue.
     pub fn npc_respond(&mut self, npc: &str, text: &str) -> Option<String> {
+        self.npc_respond_with_history(npc, text, &[])
+    }
+
+    /// Run the NPC decision for a heard utterance with explicit conversation
+    /// history. The history is rendered into the model prompt so the NPC can
+    /// resolve follow-up references.
+    pub fn npc_respond_with_history(
+        &mut self,
+        npc: &str,
+        text: &str,
+        history: &[(ActorId, String)],
+    ) -> Option<String> {
         let npc_id = ActorId::new(npc);
         let player = ActorId::new(PLAYER);
         let request_id = self.next_request_id();
@@ -181,6 +193,7 @@ impl Session {
             text,
             self.engine.as_mut(),
             request_id,
+            history,
         );
         self.commit_npc_decision(npc, decision).spoken
     }
@@ -990,6 +1003,7 @@ fn knowledge_boundaries(seed: u64) -> ScenarioResult {
         &ActorId::new("grocer"),
         &ActorId::new(PLAYER),
         "Who leads the mafia?",
+        &[],
     );
     check(
         &mut checks,

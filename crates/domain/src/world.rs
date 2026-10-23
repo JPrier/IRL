@@ -245,6 +245,10 @@ pub struct Actor {
     pub facing: f32,
     pub personality: Personality,
     pub values: Vec<String>,
+    /// A compact, authored biography used to ground the character's voice and
+    /// knowledge. Empty for procedurally generated actors.
+    #[serde(default)]
+    pub biography: String,
     pub affiliations: Vec<FactionId>,
     pub capabilities: Capabilities,
     pub inventory: Inventory,
@@ -662,6 +666,21 @@ pub struct ContainerCommit {
 // The canonical world container
 // ---------------------------------------------------------------------------
 
+/// Structured, authored lore about the settlement. Shared public knowledge
+/// that every resident may draw on; personal knowledge stays on [`Actor`].
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct WorldLore {
+    pub settlement_name: String,
+    pub geography: String,
+    pub history: String,
+    pub culture: String,
+    pub landmarks: Vec<String>,
+    pub economy: String,
+    pub institutions: String,
+    pub recent_events: String,
+    pub everyday_knowledge: String,
+}
+
 /// All canonical, authoritative game state. The `sim` crate owns the logic
 /// that mutates this; every other layer only reads it (or proposes changes).
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -698,6 +717,9 @@ pub struct World {
     pub next_offer_id: u64,
     pub next_rumor_id: u64,
     pub next_goal_id: u64,
+    /// Authored, shared lore for the settlement.
+    #[serde(default)]
+    pub lore: WorldLore,
 }
 
 impl World {
@@ -846,6 +868,7 @@ mod tests {
             next_offer_id: 1,
             next_rumor_id: 1,
             next_goal_id: 1,
+            lore: WorldLore::default(),
         }
     }
 

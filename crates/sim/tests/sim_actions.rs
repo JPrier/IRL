@@ -13,7 +13,7 @@ use rpg_domain::social::{CommitmentState, OfferState};
 use rpg_domain::world::{
     Actor, ActorKind, ActorStatus, Capabilities, ContainerKind, Fact, FactCategory, Inventory,
     Item, Location, LocationKind, MysteryMode, NavGrid, Personality, Sensitivity, StoryAnchor,
-    StoryState, Tile, World,
+    StoryState, Tile, World, WorldLore,
 };
 use rpg_narrative::NarrativeChange;
 use rpg_sim::{SimConfig, Simulation};
@@ -43,6 +43,7 @@ fn actor(id: &str, kind: ActorKind, location: &str, pos: Vec2) -> Actor {
         facing: 0.0,
         personality: Personality::default(),
         values: vec![],
+        biography: String::new(),
         affiliations: vec![],
         capabilities: Capabilities::default(),
         inventory: Inventory::default(),
@@ -90,6 +91,7 @@ pub fn test_world() -> World {
         next_offer_id: 1,
         next_rumor_id: 1,
         next_goal_id: 1,
+        lore: WorldLore::default(),
     };
     w.locations.insert(
         LocationId::new("shop"),

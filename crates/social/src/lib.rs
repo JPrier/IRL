@@ -544,7 +544,7 @@ pub fn apply_harm(world: &mut World, victim: &ActorId, culprit: &ActorId, severi
 mod tests {
     use super::*;
     use rpg_domain::world::{
-        Actor, ActorKind, ActorStatus, Capabilities, NavGrid, Personality, StoryState,
+        Actor, ActorKind, ActorStatus, Capabilities, NavGrid, Personality, StoryState, WorldLore,
     };
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -581,6 +581,7 @@ mod tests {
             next_offer_id: 1,
             next_rumor_id: 1,
             next_goal_id: 1,
+            lore: WorldLore::default(),
         }
     }
 
@@ -595,6 +596,7 @@ mod tests {
             facing: 0.0,
             personality: Personality::default(),
             values: Vec::new(),
+            biography: String::new(),
             affiliations: Vec::new(),
             capabilities: Capabilities::default(),
             inventory: Default::default(),
