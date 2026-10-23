@@ -226,6 +226,7 @@ pub fn render_npc_context(
     npc: &ActorId,
     speaker: &ActorId,
     utterance: &str,
+    history: &[(ActorId, String)],
 ) -> String {
     let Some(a) = world.actor(npc) else {
         return String::new();
@@ -256,6 +257,30 @@ pub fn render_npc_context(
         .map(|l| l.name.as_str())
         .unwrap_or("somewhere");
     out.push_str(&format!("You are at {loc}.\n"));
+
+    if !a.biography.is_empty() {
+        out.push_str(&format!("Your background: {}\n", a.biography));
+    }
+
+    // Shared world lore available to every resident.
+    if !world.lore.settlement_name.is_empty() {
+        out.push_str(&format!(
+            "About {}: {}\n",
+            world.lore.settlement_name, world.lore.geography
+        ));
+        out.push_str(&format!("History: {}\n", world.lore.history));
+        out.push_str(&format!("Culture: {}\n", world.lore.culture));
+        out.push_str(&format!("Economy: {}\n", world.lore.economy));
+        out.push_str(&format!("Institutions: {}\n", world.lore.institutions));
+        out.push_str(&format!("Recent events: {}\n", world.lore.recent_events));
+        out.push_str(&format!(
+            "Everyday knowledge: {}\n",
+            world.lore.everyday_knowledge
+        ));
+        if !world.lore.landmarks.is_empty() {
+            out.push_str(&format!("Landmarks: {}\n", world.lore.landmarks.join("; ")));
+        }
+    }
 
     let rel = a.relationship(speaker);
     out.push_str(&format!(
@@ -313,11 +338,23 @@ pub fn render_npc_context(
         );
     }
 
+    if !history.is_empty() {
+        out.push_str("\nRecent conversation:\n");
+        for (who, said) in history {
+            out.push_str(&format!("{}: \"{}\"\n", who, said));
+        }
+    }
+
     out.push_str(&format!("\n{} says: \"{}\"\n", speaker, utterance));
     out.push_str(
-        "Rules: never invent facts; never reveal a fact you would not trade; if the \
-         player asks for something and you need something first, make a conditional \
-         offer.\n",
+        "Rules:\n\
+         - You are a person with goals, memories, and relationships. Respond naturally as your character would.\n\
+         - Use the recent conversation to understand references like 'here', 'that', or 'him'.\n\
+         - Never invent facts you do not know. If you do not know, say so or express uncertainty.\n\
+         - You may share facts you believe, but only if you are willing to. You can refuse, deflect, lie, or bargain.\n\
+         - Ordinary greetings, small talk, and questions about the town or your work should get a natural spoken reply.\n\
+         - Only make an offer, promise, or threat when it fits the conversation and your goals.\n\
+         - Keep replies brief unless the player asks for substantial information.\n",
     );
     out.push_str(
         r#"Respond with ONE JSON object, no prose. Allowed shapes:
@@ -653,11 +690,12 @@ impl NpcPolicy {
         utterance: &str,
         engine: &mut dyn InferenceEngine,
         request_id: u64,
+        history: &[(ActorId, String)],
     ) -> NpcDecision {
         if !engine.is_real_model() {
             return self.heuristic(world, npc, speaker, utterance, None);
         }
-        let req = self.request(world, npc, speaker, utterance, request_id);
+        let req = self.request(world, npc, speaker, utterance, request_id, history);
         let result = engine.complete(&req);
         let model_id = engine.model_id();
         self.resolve(world, npc, speaker, utterance, req, result, &model_id)
@@ -675,12 +713,13 @@ impl NpcPolicy {
         speaker: &ActorId,
         utterance: &str,
         request_id: u64,
+        history: &[(ActorId, String)],
     ) -> InferenceRequest {
         InferenceRequest {
             id: request_id,
             role: InferenceRole::NpcDecision,
             system: "You are a character in a grounded social RPG. Stay in character. Never invent facts you were not told. Reply with one JSON object only.".into(),
-            prompt: render_npc_context(world, npc, speaker, utterance),
+            prompt: render_npc_context(world, npc, speaker, utterance, history),
             max_tokens: 160,
             // Tool decisions are deterministic: a small model asked at higher
             // temperature drifts between valid but unrelated actions.
@@ -715,7 +754,7 @@ impl NpcPolicy {
                 Some(r) => DecisionSource::HeuristicFallback { reason: r },
                 None => DecisionSource::HeuristicEngine,
             },
-            prompt: render_npc_context(world, npc, speaker, utterance),
+            prompt: render_npc_context(world, npc, speaker, utterance, &[]),
             raw: None,
         }
     }
@@ -856,7 +895,7 @@ impl NpcPolicy {
         engine: &mut dyn InferenceEngine,
         request_id: u64,
     ) -> ActionProposal {
-        self.decide(world, npc, speaker, utterance, engine, request_id)
+        self.decide(world, npc, speaker, utterance, engine, request_id, &[])
             .proposal
     }
 }
@@ -1079,7 +1118,7 @@ pub fn retrieve_beliefs(
 mod tests {
     use super::*;
     use rpg_domain::world::{
-        Actor, ActorStatus, Belief, Capabilities, Inventory, Personality, Provenance,
+        Actor, ActorStatus, Belief, Capabilities, Inventory, Personality, Provenance, WorldLore,
     };
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -1095,6 +1134,7 @@ mod tests {
             facing: 0.0,
             personality: Personality::default(),
             values: vec![],
+            biography: String::new(),
             affiliations: vec![FactionId::new("merchants")],
             capabilities: Capabilities::default(),
             inventory: Inventory::default(),
@@ -1155,6 +1195,7 @@ mod tests {
             next_offer_id: 1,
             next_rumor_id: 1,
             next_goal_id: 1,
+            lore: WorldLore::default(),
         };
         w.locations.insert(
             LocationId::new("shop"),
@@ -1181,6 +1222,7 @@ mod tests {
                 facing: 0.0,
                 personality: Personality::default(),
                 values: vec![],
+                biography: String::new(),
                 affiliations: vec![],
                 capabilities: Capabilities::default(),
                 inventory: Inventory::default(),
@@ -1340,6 +1382,7 @@ mod tests {
             &ActorId::new("grocer"),
             &ActorId::new(PLAYER),
             "who leads it?",
+            &[],
         );
         assert!(!prompt.contains("SELENE"));
     }
@@ -1366,5 +1409,58 @@ mod tests {
         // Remaining P2 tasks pop FIFO: Memory(id 1) before Director(id 3).
         assert_eq!(s.pop().unwrap().id, 1);
         assert_eq!(s.pop().unwrap().id, 3);
+    }
+
+    #[test]
+    fn test_prompt_includes_dialogue_history() {
+        let w = world_with_grocer();
+        let npc = ActorId::new("grocer");
+        let player = ActorId::new(PLAYER);
+        let history = vec![
+            (player.clone(), "Hello there!".to_string()),
+            (npc.clone(), "Good day to you.".to_string()),
+            (player.clone(), "I was wondering about the ledger.".to_string()),
+        ];
+        let prompt = render_npc_context(
+            &w,
+            &npc,
+            &player,
+            "What do you think about it?",
+            &history,
+        );
+        assert!(prompt.contains("Recent conversation:"));
+        assert!(prompt.contains("Hello there!"));
+        assert!(prompt.contains("Good day to you."));
+        assert!(prompt.contains("I was wondering about the ledger."));
+    }
+
+    #[test]
+    fn test_prompt_includes_world_knowledge_and_biography() {
+        let mut w = world_with_grocer();
+        w.actor_mut(&ActorId::new("grocer")).unwrap().biography =
+            "Marta has run the shop for twenty years and knows everyone's business.".into();
+        w.lore = WorldLore {
+            settlement_name: "Ashwick".into(),
+            geography: "A river town at the edge of the Northern Marches.".into(),
+            history: "Founded as a trading post three centuries ago.".into(),
+            culture: "Practical and tight-knit.".into(),
+            landmarks: vec!["The Market Plaza".into()],
+            economy: "Grain and timber.".into(),
+            institutions: "The Watch and the Temple.".into(),
+            recent_events: "A recent warehouse fire.".into(),
+            everyday_knowledge: "Bread is baked daily at the plaza bakery.".into(),
+        };
+        let prompt = render_npc_context(
+            &w,
+            &ActorId::new("grocer"),
+            &ActorId::new(PLAYER),
+            "What do you know about this place?",
+            &[],
+        );
+        assert!(prompt.contains("Marta has run the shop for twenty years"));
+        assert!(prompt.contains("Ashwick"));
+        assert!(prompt.contains("A river town at the edge of the Northern Marches"));
+        assert!(prompt.contains("Founded as a trading post three centuries ago"));
+        assert!(prompt.contains("The Market Plaza"));
     }
 }

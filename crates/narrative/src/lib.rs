@@ -395,7 +395,7 @@ mod tests {
     use rpg_domain::geom::{Rect, Vec2};
     use rpg_domain::world::{
         Actor, ActorKind, ActorStatus, Capabilities, Fact, FactCategory, Location, LocationKind,
-        MysteryMode, NavGrid, Personality, Sensitivity, StoryAnchor, StoryState,
+        MysteryMode, NavGrid, Personality, Sensitivity, StoryAnchor, StoryState, WorldLore,
     };
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -410,6 +410,7 @@ mod tests {
             facing: 0.0,
             personality: Personality::default(),
             values: vec![],
+            biography: String::new(),
             affiliations: vec![],
             capabilities: Capabilities::default(),
             inventory: Default::default(),
@@ -457,6 +458,7 @@ mod tests {
             next_offer_id: 1,
             next_rumor_id: 1,
             next_goal_id: 1,
+            lore: WorldLore::default(),
         };
         w.locations.insert(
             LocationId::new("plaza"),
