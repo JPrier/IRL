@@ -11,9 +11,9 @@ use rpg_domain::geom::{GridPos, Rect, Vec2};
 use rpg_domain::ids::*;
 use rpg_domain::social::{CommitmentState, OfferState};
 use rpg_domain::world::{
-    Actor, ActorKind, ActorStatus, Capabilities, ContainerKind, Fact, FactCategory, Inventory,
-    Item, Location, LocationKind, MysteryMode, NavGrid, Personality, Sensitivity, StoryAnchor,
-    StoryState, Tile, World, WorldLore,
+    Actor, ActorKind, ActorStatus, Belief, Capabilities, ContainerKind, Fact, FactCategory,
+    Inventory, Item, Location, LocationKind, MysteryMode, NavGrid, Personality, Provenance,
+    Sensitivity, StoryAnchor, StoryState, Tile, World, WorldLore,
 };
 use rpg_narrative::NarrativeChange;
 use rpg_sim::{SimConfig, Simulation};
@@ -44,6 +44,7 @@ fn actor(id: &str, kind: ActorKind, location: &str, pos: Vec2) -> Actor {
         personality: Personality::default(),
         values: vec![],
         biography: String::new(),
+        private_biography: String::new(),
         affiliations: vec![],
         capabilities: Capabilities::default(),
         inventory: Inventory::default(),
@@ -531,4 +532,144 @@ fn world_and_events_roundtrip_through_json() {
         serde_json::to_string(&s.world).unwrap()
     );
     assert_eq!(e2.checksum(), s.events.checksum());
+}
+
+// ---------------------------------------------------------------------------
+// Canonical disclosure rules
+// ---------------------------------------------------------------------------
+//
+// Knowing a fact is not the same as being permitted to share it. These tests
+// pin the disclosure tiers enforced by `Simulation::validate_disclosure`.
+
+/// Give `actor` a believed belief in `fact`, regardless of whether the world
+/// names them as a canonical holder.
+fn teach(s: &mut Simulation, actor: &str, fact: &str) {
+    s.world
+        .actor_mut(&ActorId::new(actor))
+        .expect("actor exists")
+        .beliefs
+        .insert(
+            FactId::new(fact),
+            Belief {
+                fact: FactId::new(fact),
+                believes_true: true,
+                confidence: 0.9,
+                source: Provenance::Assumed,
+                acquired_tick: 0,
+            },
+        );
+}
+
+/// Move `actor` next to the player so range checks pass.
+fn bring_to_player(s: &mut Simulation, actor: &str) {
+    let player_pos = s.world.actor(&ActorId::new(PLAYER)).unwrap().pos;
+    let player_loc = s
+        .world
+        .actor(&ActorId::new(PLAYER))
+        .unwrap()
+        .location
+        .clone();
+    let a = s.world.actor_mut(&ActorId::new(actor)).unwrap();
+    a.location = player_loc;
+    a.pos = player_pos;
+}
+
+#[test]
+fn outsider_cannot_disclose_secret_fact() {
+    let mut s = sim();
+    // `shipment` is Secret and its canonical holder is only the grocer.
+    teach(&mut s, "guard", "shipment");
+    bring_to_player(&mut s, "guard");
+    let out = s.apply(&proposal(
+        "guard",
+        Action::ShareClaim {
+            target: ActorId::new(PLAYER),
+            fact: FactId::new("shipment"),
+            assertive: true,
+        },
+    ));
+    assert!(
+        matches!(
+            out,
+            ValidationOutcome::Rejected(RejectReason::NotPermittedToDisclose(_))
+        ),
+        "an outsider who merely believes a secret must not be able to disclose it: {out:?}"
+    );
+}
+
+#[test]
+fn canonical_holder_can_disclose_secret_fact() {
+    let mut s = sim();
+    // The grocer is the canonical holder of the secret shipment fact.
+    teach(&mut s, "grocer", "shipment");
+    bring_to_player(&mut s, "grocer");
+    let out = s.apply(&proposal(
+        "grocer",
+        Action::ShareClaim {
+            target: ActorId::new(PLAYER),
+            fact: FactId::new("shipment"),
+            assertive: true,
+        },
+    ));
+    assert_eq!(
+        out,
+        ValidationOutcome::Accepted,
+        "the canonical holder may disclose the secret"
+    );
+}
+
+#[test]
+fn inner_circle_fact_requires_flag_and_holder() {
+    let mut s = sim();
+    // Add an inner-circle fact whose only canonical holder is the guard.
+    s.world.facts.insert(
+        FactId::new("f_leader"),
+        Fact {
+            id: FactId::new("f_leader"),
+            statement: "The guild head leads the mafia.".into(),
+            truth: true,
+            sensitivity: Sensitivity::InnerCircle,
+            category: FactCategory::Identity,
+            prerequisites: vec![],
+            eligible_holders: vec![ActorId::new("guard")],
+            eligible_containers: vec![],
+            committed: false,
+            placed_at: None,
+        },
+    );
+    teach(&mut s, "guard", "f_leader");
+    bring_to_player(&mut s, "guard");
+
+    // Holder without the inner-circle flag is refused.
+    let denied = s.apply(&proposal(
+        "guard",
+        Action::ShareClaim {
+            target: ActorId::new(PLAYER),
+            fact: FactId::new("f_leader"),
+            assertive: true,
+        },
+    ));
+    assert!(
+        matches!(
+            denied,
+            ValidationOutcome::Rejected(RejectReason::NotPermittedToDisclose(_))
+        ),
+        "an inner-circle fact needs the flag as well as holder status: {denied:?}"
+    );
+
+    // Granting the flag makes the same disclosure authorized.
+    s.world
+        .actor_mut(&ActorId::new("guard"))
+        .unwrap()
+        .flags
+        .insert("inner_circle".into());
+    let allowed = s.apply(&proposal(
+        "guard",
+        Action::ShareClaim {
+            target: ActorId::new(PLAYER),
+            fact: FactId::new("f_leader"),
+            assertive: true,
+        },
+    ));
+    assert_eq!(allowed, ValidationOutcome::Accepted);
 }

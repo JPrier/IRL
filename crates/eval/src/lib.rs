@@ -8,7 +8,7 @@
 //! Every scenario is seeded and deterministic; replaying the same script must
 //! produce the same canonical event checksum.
 
-use rpg_agents::{HeuristicEngine, NpcPolicy};
+use rpg_agents::{HeuristicEngine, NpcPolicy, NpcRequestContext};
 use rpg_content::build_town;
 use rpg_domain::action::{
     Action, ActionProposal, InvestigateTarget, Loudness, ProposalSource, QuestPredicate,
@@ -186,15 +186,14 @@ impl Session {
         let npc_id = ActorId::new(npc);
         let player = ActorId::new(PLAYER);
         let request_id = self.next_request_id();
-        let decision = NpcPolicy.decide(
-            &self.sim.world,
-            &npc_id,
-            &player,
-            text,
-            self.engine.as_mut(),
-            request_id,
+        let ctx = NpcRequestContext {
+            world: &self.sim.world,
+            npc: &npc_id,
+            speaker: &player,
+            utterance: text,
             history,
-        );
+        };
+        let decision = NpcPolicy.decide(&ctx, request_id, self.engine.as_mut());
         self.commit_npc_decision(npc, decision).spoken
     }
 

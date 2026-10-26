@@ -246,9 +246,17 @@ pub struct Actor {
     pub personality: Personality,
     pub values: Vec<String>,
     /// A compact, authored biography used to ground the character's voice and
-    /// knowledge. Empty for procedurally generated actors.
+    /// knowledge. Empty for procedurally generated actors. This is the public
+    /// persona: safe to render into prompts and to share in ordinary speech.
     #[serde(default)]
     pub biography: String,
+    /// Information the actor knows but must not share freely: hidden
+    /// allegiances, secret identities, protected confessions. It informs
+    /// behaviour (evasion, deflection, bargaining) but is never a permitted
+    /// public assertion, so it is rendered separately from the public
+    /// biography and kept out of ordinary spoken lines.
+    #[serde(default)]
+    pub private_biography: String,
     pub affiliations: Vec<FactionId>,
     pub capabilities: Capabilities,
     pub inventory: Inventory,

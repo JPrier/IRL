@@ -411,6 +411,7 @@ mod tests {
             personality: Personality::default(),
             values: vec![],
             biography: String::new(),
+            private_biography: String::new(),
             affiliations: vec![],
             capabilities: Capabilities::default(),
             inventory: Default::default(),

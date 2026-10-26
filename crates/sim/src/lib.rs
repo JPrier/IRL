@@ -417,8 +417,19 @@ impl Simulation {
         Ok(())
     }
 
-    /// A fact may only be disclosed if the actor believes it and is permitted
-    /// by its sensitivity (inner-circle secrets require inner-circle status).
+    /// A fact may only be disclosed if the actor believes it *and* is
+    /// canonically authorised to share it.
+    ///
+    /// Knowledge is not permission. A character who merely overheard a secret
+    /// must not be able to blab it in ordinary dialogue. The canonical
+    /// authorisation tiers are:
+    ///
+    /// * `Public` / `Restricted` — freely shareable by any believer.
+    /// * `Private` / `Secret` — only canonical holders (the actors named in
+    ///   `eligible_holders`) may disclose. An empty holder list places no
+    ///   canonical restriction on the fact.
+    /// * `InnerCircle` — holders must additionally carry the `inner_circle`
+    ///   flag, so an outsider who learned the secret cannot spread it.
     fn validate_disclosure(&self, actor: &Actor, fact: &FactId) -> Result<(), RejectReason> {
         let Some(f) = self.world.fact(fact) else {
             return Err(RejectReason::UnknownFact(fact.clone()));
@@ -426,7 +437,13 @@ impl Simulation {
         if !self.world.believes(&actor.id, fact) {
             return Err(RejectReason::LacksKnowledge(fact.clone()));
         }
-        if f.sensitivity == Sensitivity::InnerCircle && !actor.has_flag("inner_circle") {
+        let holder = f.eligible_holders.is_empty() || f.eligible_holders.contains(&actor.id);
+        let authorized = match f.sensitivity {
+            Sensitivity::Public | Sensitivity::Restricted => true,
+            Sensitivity::Private | Sensitivity::Secret => holder,
+            Sensitivity::InnerCircle => actor.has_flag("inner_circle") && holder,
+        };
+        if !authorized {
             return Err(RejectReason::NotPermittedToDisclose(fact.clone()));
         }
         Ok(())

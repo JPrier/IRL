@@ -57,6 +57,7 @@ fn npc(
         personality,
         values: vec![],
         biography: String::new(),
+        private_biography: String::new(),
         affiliations: affiliations.iter().map(|a| FactionId::new(*a)).collect(),
         capabilities: Capabilities::default(),
         inventory: Inventory::default(),
@@ -84,12 +85,24 @@ fn populate_npc_lore(actors: &mut BTreeMap<ActorId, Actor>) {
     };
 
     if let Some(a) = actors.get_mut(&ActorId::new("grocer")) {
-        a.biography = "Marta Voss runs Voss & Daughter's, a modest grocer in the Market Plaza. A widow, she is fiercely protective of her sick daughter, Lena. Her shop is struggling, and she has recently been pressured by the mafia.".into();
+        a.biography = "Marta Voss runs Voss & Daughter's, a modest grocer in the Market Plaza. A widow, she is fiercely protective of her sick daughter, Lena.".into();
+        a.private_biography =
+            "Her shop is struggling, and she has recently been pressured by the mafia.".into();
         a.goals = vec![
             goal(1, "Keep Lena healthy and safe", GoalKind::Protect, 10.0),
-            goal(2, "Keep the shop open and profitable", GoalKind::Wealth, 8.0),
+            goal(
+                2,
+                "Keep the shop open and profitable",
+                GoalKind::Wealth,
+                8.0,
+            ),
             goal(3, "Avoid angering the mafia", GoalKind::Safety, 7.0),
-            goal(4, "Protect the Voss family reputation", GoalKind::Status, 5.0),
+            goal(
+                4,
+                "Protect the Voss family reputation",
+                GoalKind::Status,
+                5.0,
+            ),
         ];
     }
 
@@ -97,16 +110,34 @@ fn populate_npc_lore(actors: &mut BTreeMap<ActorId, Actor>) {
         a.biography = "Lena Voss is Marta's teenage daughter. She suffers from a chronic illness and rarely leaves the backroom of the grocer. She is observant and bright, but physically frail.".into();
         a.goals = vec![
             goal(1, "Recover from illness", GoalKind::Survival, 10.0),
-            goal(2, "Keep mother from worrying too much", GoalKind::Affection, 7.0),
-            goal(3, "Understand the strange visitors to the shop", GoalKind::Investigate, 4.0),
+            goal(
+                2,
+                "Keep mother from worrying too much",
+                GoalKind::Affection,
+                7.0,
+            ),
+            goal(
+                3,
+                "Understand the strange visitors to the shop",
+                GoalKind::Investigate,
+                4.0,
+            ),
         ];
     }
 
     if let Some(a) = actors.get_mut(&ActorId::new("guard_captain")) {
-        a.biography = "Captain Ilse Renn commands the local Watch. She is a stern, practical woman who has spent years trying to curb the mafia's influence. Recently, she has been frustrated by a lack of evidence and political interference.".into();
+        a.biography = "Captain Ilse Renn commands the local Watch. She is a stern, practical woman who has spent years trying to curb the mafia's influence.".into();
+        a.private_biography =
+            "Recently, she has been frustrated by a lack of evidence and political interference."
+                .into();
         a.goals = vec![
             goal(1, "Maintain public order", GoalKind::Duty, 9.0),
-            goal(2, "Find evidence against the mafia", GoalKind::Investigate, 8.0),
+            goal(
+                2,
+                "Find evidence against the mafia",
+                GoalKind::Investigate,
+                8.0,
+            ),
             goal(3, "Keep her deputies safe", GoalKind::Safety, 7.0),
             goal(4, "Advance her career", GoalKind::Status, 6.0),
         ];
@@ -122,16 +153,23 @@ fn populate_npc_lore(actors: &mut BTreeMap<ActorId, Actor>) {
     }
 
     if let Some(a) = actors.get_mut(&ActorId::new("dockworker")) {
-        a.biography = "Old Tarn has worked the docks for decades. He is gruff and secretive, having seen too much over the years. He is rumored to know things about the mafia's shipments.".into();
+        a.biography = "Old Tarn has worked the docks for decades. He is gruff and secretive, having seen too much over the years.".into();
+        a.private_biography = "He is rumored to know things about the mafia's shipments.".into();
         a.goals = vec![
             goal(1, "Keep his head down", GoalKind::Survival, 9.0),
             goal(2, "Earn enough to retire", GoalKind::Wealth, 8.0),
-            goal(3, "Hide what he knows about the mafia", GoalKind::Conceal, 7.0),
+            goal(
+                3,
+                "Hide what he knows about the mafia",
+                GoalKind::Conceal,
+                7.0,
+            ),
         ];
     }
 
     if let Some(a) = actors.get_mut(&ActorId::new("courier")) {
-        a.biography = "Pell is a nervous courier who runs errands for various merchants. He secretly works for the mafia, carrying messages and small packages. He is constantly worried about being caught.".into();
+        a.biography = "Pell is a nervous courier who runs errands for various merchants.".into();
+        a.private_biography = "He secretly works for the mafia, carrying messages and small packages. He is constantly worried about being caught.".into();
         a.goals = vec![
             goal(1, "Avoid getting caught", GoalKind::Safety, 10.0),
             goal(2, "Hide his mafia ties", GoalKind::Conceal, 9.0),
@@ -140,9 +178,15 @@ fn populate_npc_lore(actors: &mut BTreeMap<ActorId, Actor>) {
     }
 
     if let Some(a) = actors.get_mut(&ActorId::new("merchant_head")) {
-        a.biography = "Selene Voss is the public head of the merchants' guild and secretly the leader of the mafia. She is charming, ambitious, and utterly ruthless. She views the town as a game to be won.".into();
+        a.biography = "Selene Voss is the public head of the merchants' guild. She is charming, ambitious, and utterly ruthless. She views the town as a game to be won.".into();
+        a.private_biography = "She is secretly the leader of the mafia.".into();
         a.goals = vec![
-            goal(1, "Consolidate power over the town", GoalKind::Ambition, 10.0),
+            goal(
+                1,
+                "Consolidate power over the town",
+                GoalKind::Ambition,
+                10.0,
+            ),
             goal(2, "Expand mafia operations", GoalKind::Wealth, 9.0),
             goal(3, "Protect her secret identity", GoalKind::Conceal, 8.0),
             goal(4, "Maintain her public reputation", GoalKind::Status, 7.0),
@@ -150,7 +194,8 @@ fn populate_npc_lore(actors: &mut BTreeMap<ActorId, Actor>) {
     }
 
     if let Some(a) = actors.get_mut(&ActorId::new("mafia_lieutenant")) {
-        a.biography = "Halden Rook is the mafia's dockmaster and Selene's right hand. He is brutal, efficient, and fiercely loyal to Selene. He handles the smuggling operations.".into();
+        a.biography = "Halden Rook is a dockmaster and Selene's right hand. He is brutal, efficient, and fiercely loyal to Selene.".into();
+        a.private_biography = "He handles the mafia's smuggling operations.".into();
         a.goals = vec![
             goal(1, "Execute Selene's orders", GoalKind::Duty, 9.0),
             goal(2, "Keep the shipments running", GoalKind::Wealth, 8.0),
@@ -159,7 +204,8 @@ fn populate_npc_lore(actors: &mut BTreeMap<ActorId, Actor>) {
     }
 
     if let Some(a) = actors.get_mut(&ActorId::new("accountant")) {
-        a.biography = "Corvin Ashe is the mafia's bookkeeper. He is meticulous, anxious, and deeply involved in the mafia's financial crimes. He knows too much, making him both valuable and a liability.".into();
+        a.biography = "Corvin Ashe is a meticulous, anxious bookkeeper.".into();
+        a.private_biography = "He is the mafia's bookkeeper and is deeply involved in their financial crimes. He knows too much, making him both valuable and a liability.".into();
         a.goals = vec![
             goal(1, "Keep himself useful and alive", GoalKind::Safety, 9.0),
             goal(2, "Manage the mafia's finances", GoalKind::Wealth, 8.0),
@@ -168,16 +214,25 @@ fn populate_npc_lore(actors: &mut BTreeMap<ActorId, Actor>) {
     }
 
     if let Some(a) = actors.get_mut(&ActorId::new("spy")) {
-        a.biography = "Nessa Quill is a mafia spy who poses as a simple shopper and gossip. She is quiet, observant, and gathers intelligence for Selene. She has no loyalty to anyone but herself.".into();
+        a.biography =
+            "Nessa Quill poses as a simple shopper and gossip. She is quiet and observant.".into();
+        a.private_biography = "She is a mafia spy who gathers intelligence for Selene. She has no loyalty to anyone but herself.".into();
         a.goals = vec![
-            goal(1, "Gather information on town figures", GoalKind::Investigate, 9.0),
+            goal(
+                1,
+                "Gather information on town figures",
+                GoalKind::Investigate,
+                9.0,
+            ),
             goal(2, "Maintain her cover as a gossip", GoalKind::Conceal, 8.0),
             goal(3, "Earn Selene's favor", GoalKind::Status, 6.0),
         ];
     }
 
     if let Some(a) = actors.get_mut(&ActorId::new("priest")) {
-        a.biography = "Father Alden is the town's elderly, kind-hearted priest. He tends to the sick and the poor, offering comfort and advice. He knows many secrets from confessions but keeps them sacred.".into();
+        a.biography = "Father Alden is the town's elderly, kind-hearted priest. He tends to the sick and the poor, offering comfort and advice.".into();
+        a.private_biography =
+            "He knows many secrets from confessions but keeps them sacred.".into();
         a.goals = vec![
             goal(1, "Comfort the sick and poor", GoalKind::Duty, 9.0),
             goal(2, "Protect his congregation", GoalKind::Safety, 8.0),
