@@ -192,7 +192,11 @@ pub fn share_claim(
         - 0.35 * suspicion
         - 0.15 * rel.fear;
     p = p.clamp(0.05, 0.97);
-    let believed = rng.chance(p);
+    // Assertive claims are definitive disclosures backed by the speaker's
+    // canonical knowledge (e.g., honouring a bargain); they are believed
+    // deterministically regardless of the relationship roll. Hearsay is
+    // still gated on the relationship roll.
+    let believed = if assertive { true } else { rng.chance(p) };
     // Even when not fully believed, the recipient records an uncertain belief
     // with provenance so the rumor can still propagate as a claim.
     let newly = record_belief(
