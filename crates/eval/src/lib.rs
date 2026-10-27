@@ -1165,6 +1165,25 @@ mod tests {
         }
     }
 
+    /// Autonomy regression: every scenario must keep passing across many
+    /// seeds now that NPCs autonomously pursue goals between ticks. Goals
+    /// (Marta's protective watch, Renn's investigation) may fire during any
+    /// scenario, so this guards against autonomy disturbing scripted
+    /// expectations or breaking deterministic replay.
+    #[test]
+    fn all_scenarios_pass_across_seeds_with_autonomy() {
+        for seed in [1u64, 7, 42, 2026, 98765] {
+            for result in run_all(seed) {
+                assert!(
+                    result.passed(),
+                    "scenario {} failed at seed {}\n{result:?}",
+                    result.name,
+                    seed
+                );
+            }
+        }
+    }
+
     /// No-weights regression test for the real-model interaction shape: a
     /// scripted model that only "speaks" still gets the canonical bargain,
     /// and the satisfied deal is honoured on the next turn.

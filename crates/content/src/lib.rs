@@ -75,6 +75,8 @@ fn npc(
 /// Populate biographies and goals for the named NPCs. Called once when the
 /// canonical town is built; goals remain persistent game-state entities.
 fn populate_npc_lore(actors: &mut BTreeMap<ActorId, Actor>) {
+    // A goal with no pursuit target is prompt flavour only: it shapes the
+    // NPC's voice but never drives movement.
     let goal = |id: u64, description: &str, kind: GoalKind, priority: f32| Goal {
         id,
         description: description.into(),
@@ -82,6 +84,26 @@ fn populate_npc_lore(actors: &mut BTreeMap<ActorId, Actor>) {
         priority,
         status: GoalStatus::Active,
         predicate: None,
+        target_location: None,
+        target_actor: None,
+    };
+    // A goal with a pursuit target becomes autonomous behaviour: the actor
+    // independently walks to the target and acts there, without player
+    // interaction.
+    let goal_t = |id: u64,
+                  description: &str,
+                  kind: GoalKind,
+                  priority: f32,
+                  target_location: Option<&str>,
+                  target_actor: Option<&str>| Goal {
+        id,
+        description: description.into(),
+        kind,
+        priority,
+        status: GoalStatus::Active,
+        predicate: None,
+        target_location: target_location.map(LocationId::new),
+        target_actor: target_actor.map(ActorId::new),
     };
 
     if let Some(a) = actors.get_mut(&ActorId::new("grocer")) {
@@ -89,7 +111,14 @@ fn populate_npc_lore(actors: &mut BTreeMap<ActorId, Actor>) {
         a.private_biography =
             "Her shop is struggling, and she has recently been pressured by the mafia.".into();
         a.goals = vec![
-            goal(1, "Keep Lena healthy and safe", GoalKind::Protect, 10.0),
+            goal_t(
+                1,
+                "Keep Lena healthy and safe",
+                GoalKind::Protect,
+                10.0,
+                None,
+                Some("grocer_daughter"),
+            ),
             goal(
                 2,
                 "Keep the shop open and profitable",
@@ -132,11 +161,13 @@ fn populate_npc_lore(actors: &mut BTreeMap<ActorId, Actor>) {
                 .into();
         a.goals = vec![
             goal(1, "Maintain public order", GoalKind::Duty, 9.0),
-            goal(
+            goal_t(
                 2,
                 "Find evidence against the mafia",
                 GoalKind::Investigate,
                 8.0,
+                Some("warehouse"),
+                None,
             ),
             goal(3, "Keep her deputies safe", GoalKind::Safety, 7.0),
             goal(4, "Advance her career", GoalKind::Status, 6.0),

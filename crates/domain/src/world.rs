@@ -150,6 +150,13 @@ pub struct Goal {
     /// Optional stable predicate that marks the goal satisfied.
     #[serde(default)]
     pub predicate: Option<crate::action::QuestPredicate>,
+    /// Optional pursuit target: a location the actor will visit for this
+    /// goal. Authored content fills these; the autonomy layer consumes them.
+    #[serde(default)]
+    pub target_location: Option<LocationId>,
+    /// Optional pursuit target: another actor the goal is about.
+    #[serde(default)]
+    pub target_actor: Option<ActorId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
