@@ -10,9 +10,9 @@ use rpg_domain::geom::{GridPos, Rect, Vec2};
 use rpg_domain::ids::*;
 use rpg_domain::world::{
     Actor, ActorKind, ActorStatus, Belief, Capabilities, Checkpoint, CheckpointState,
-    ContainerKind, Fact, FactCategory, Faction, FactionKind, FactionPriority, Inventory, Item,
-    Location, LocationKind, MysteryMode, NavGrid, Personality, Provenance, ScheduleEntry,
-    Sensitivity, StoryAnchor, StoryState, Tile, World,
+    ContainerKind, Fact, FactCategory, Faction, FactionKind, FactionPriority, Goal, GoalKind,
+    GoalStatus, Inventory, Item, Location, LocationKind, MysteryMode, NavGrid, Personality,
+    Provenance, ScheduleEntry, Sensitivity, StoryAnchor, StoryState, Tile, World, WorldLore,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -56,6 +56,8 @@ fn npc(
         facing: 0.0,
         personality,
         values: vec![],
+        biography: String::new(),
+        private_biography: String::new(),
         affiliations: affiliations.iter().map(|a| FactionId::new(*a)).collect(),
         capabilities: Capabilities::default(),
         inventory: Inventory::default(),
@@ -67,6 +69,231 @@ fn npc(
         flags: flags.iter().map(|f| f.to_string()).collect(),
         secret_allegiance: secret.map(FactionId::new),
         in_private_conversation_with: None,
+    }
+}
+
+/// Populate biographies and goals for the named NPCs. Called once when the
+/// canonical town is built; goals remain persistent game-state entities.
+fn populate_npc_lore(actors: &mut BTreeMap<ActorId, Actor>) {
+    // A goal with no pursuit target is prompt flavour only: it shapes the
+    // NPC's voice but never drives movement.
+    let goal = |id: u64, description: &str, kind: GoalKind, priority: f32| Goal {
+        id,
+        description: description.into(),
+        kind,
+        priority,
+        status: GoalStatus::Active,
+        predicate: None,
+        target_location: None,
+        target_actor: None,
+    };
+    // A goal with a pursuit target becomes autonomous behaviour: the actor
+    // independently walks to the target and acts there, without player
+    // interaction.
+    let goal_t = |id: u64,
+                  description: &str,
+                  kind: GoalKind,
+                  priority: f32,
+                  target_location: Option<&str>,
+                  target_actor: Option<&str>| Goal {
+        id,
+        description: description.into(),
+        kind,
+        priority,
+        status: GoalStatus::Active,
+        predicate: None,
+        target_location: target_location.map(LocationId::new),
+        target_actor: target_actor.map(ActorId::new),
+    };
+
+    if let Some(a) = actors.get_mut(&ActorId::new("grocer")) {
+        a.biography = "Marta Voss runs Voss & Daughter's, a modest grocer in the Market Plaza. A widow, she is fiercely protective of her sick daughter, Lena.".into();
+        a.private_biography =
+            "Her shop is struggling, and she has recently been pressured by the mafia.".into();
+        a.goals = vec![
+            goal_t(
+                1,
+                "Keep Lena healthy and safe",
+                GoalKind::Protect,
+                10.0,
+                None,
+                Some("grocer_daughter"),
+            ),
+            goal(
+                2,
+                "Keep the shop open and profitable",
+                GoalKind::Wealth,
+                8.0,
+            ),
+            goal(3, "Avoid angering the mafia", GoalKind::Safety, 7.0),
+            goal(
+                4,
+                "Protect the Voss family reputation",
+                GoalKind::Status,
+                5.0,
+            ),
+        ];
+    }
+
+    if let Some(a) = actors.get_mut(&ActorId::new("grocer_daughter")) {
+        a.biography = "Lena Voss is Marta's teenage daughter. She suffers from a chronic illness and rarely leaves the backroom of the grocer. She is observant and bright, but physically frail.".into();
+        a.goals = vec![
+            goal(1, "Recover from illness", GoalKind::Survival, 10.0),
+            goal(
+                2,
+                "Keep mother from worrying too much",
+                GoalKind::Affection,
+                7.0,
+            ),
+            goal(
+                3,
+                "Understand the strange visitors to the shop",
+                GoalKind::Investigate,
+                4.0,
+            ),
+        ];
+    }
+
+    if let Some(a) = actors.get_mut(&ActorId::new("guard_captain")) {
+        a.biography = "Captain Ilse Renn commands the local Watch. She is a stern, practical woman who has spent years trying to curb the mafia's influence.".into();
+        a.private_biography =
+            "Recently, she has been frustrated by a lack of evidence and political interference."
+                .into();
+        a.goals = vec![
+            goal(1, "Maintain public order", GoalKind::Duty, 9.0),
+            goal_t(
+                2,
+                "Find evidence against the mafia",
+                GoalKind::Investigate,
+                8.0,
+                Some("warehouse"),
+                None,
+            ),
+            goal(3, "Keep her deputies safe", GoalKind::Safety, 7.0),
+            goal(4, "Advance her career", GoalKind::Status, 6.0),
+        ];
+    }
+
+    if let Some(a) = actors.get_mut(&ActorId::new("guard_rookie")) {
+        a.biography = "Deputy Bram is a young, eager Watchman who serves under Captain Renn. He is idealistic but naive, often patrolling the plaza and hoping to make a difference.".into();
+        a.goals = vec![
+            goal(1, "Do a good job for the Captain", GoalKind::Duty, 8.0),
+            goal(2, "Prove himself", GoalKind::Status, 7.0),
+            goal(3, "Stay out of trouble", GoalKind::Safety, 5.0),
+        ];
+    }
+
+    if let Some(a) = actors.get_mut(&ActorId::new("dockworker")) {
+        a.biography = "Old Tarn has worked the docks for decades. He is gruff and secretive, having seen too much over the years.".into();
+        a.private_biography = "He is rumored to know things about the mafia's shipments.".into();
+        a.goals = vec![
+            goal(1, "Keep his head down", GoalKind::Survival, 9.0),
+            goal(2, "Earn enough to retire", GoalKind::Wealth, 8.0),
+            goal(
+                3,
+                "Hide what he knows about the mafia",
+                GoalKind::Conceal,
+                7.0,
+            ),
+        ];
+    }
+
+    if let Some(a) = actors.get_mut(&ActorId::new("courier")) {
+        a.biography = "Pell is a nervous courier who runs errands for various merchants.".into();
+        a.private_biography = "He secretly works for the mafia, carrying messages and small packages. He is constantly worried about being caught.".into();
+        a.goals = vec![
+            goal(1, "Avoid getting caught", GoalKind::Safety, 10.0),
+            goal(2, "Hide his mafia ties", GoalKind::Conceal, 9.0),
+            goal(3, "Earn enough to leave town", GoalKind::Wealth, 7.0),
+        ];
+    }
+
+    if let Some(a) = actors.get_mut(&ActorId::new("merchant_head")) {
+        a.biography = "Selene Voss is the public head of the merchants' guild. She is charming, ambitious, and utterly ruthless. She views the town as a game to be won.".into();
+        a.private_biography = "She is secretly the leader of the mafia.".into();
+        a.goals = vec![
+            goal(
+                1,
+                "Consolidate power over the town",
+                GoalKind::Ambition,
+                10.0,
+            ),
+            goal(2, "Expand mafia operations", GoalKind::Wealth, 9.0),
+            goal(3, "Protect her secret identity", GoalKind::Conceal, 8.0),
+            goal(4, "Maintain her public reputation", GoalKind::Status, 7.0),
+        ];
+    }
+
+    if let Some(a) = actors.get_mut(&ActorId::new("mafia_lieutenant")) {
+        a.biography = "Halden Rook is a dockmaster and Selene's right hand. He is brutal, efficient, and fiercely loyal to Selene.".into();
+        a.private_biography = "He handles the mafia's smuggling operations.".into();
+        a.goals = vec![
+            goal(1, "Execute Selene's orders", GoalKind::Duty, 9.0),
+            goal(2, "Keep the shipments running", GoalKind::Wealth, 8.0),
+            goal(3, "Eliminate loose ends", GoalKind::Safety, 7.0),
+        ];
+    }
+
+    if let Some(a) = actors.get_mut(&ActorId::new("accountant")) {
+        a.biography = "Corvin Ashe is a meticulous, anxious bookkeeper.".into();
+        a.private_biography = "He is the mafia's bookkeeper and is deeply involved in their financial crimes. He knows too much, making him both valuable and a liability.".into();
+        a.goals = vec![
+            goal(1, "Keep himself useful and alive", GoalKind::Safety, 9.0),
+            goal(2, "Manage the mafia's finances", GoalKind::Wealth, 8.0),
+            goal(3, "Hide the ledgers", GoalKind::Conceal, 7.0),
+        ];
+    }
+
+    if let Some(a) = actors.get_mut(&ActorId::new("spy")) {
+        a.biography =
+            "Nessa Quill poses as a simple shopper and gossip. She is quiet and observant.".into();
+        a.private_biography = "She is a mafia spy who gathers intelligence for Selene. She has no loyalty to anyone but herself.".into();
+        a.goals = vec![
+            goal(
+                1,
+                "Gather information on town figures",
+                GoalKind::Investigate,
+                9.0,
+            ),
+            goal(2, "Maintain her cover as a gossip", GoalKind::Conceal, 8.0),
+            goal(3, "Earn Selene's favor", GoalKind::Status, 6.0),
+        ];
+    }
+
+    if let Some(a) = actors.get_mut(&ActorId::new("priest")) {
+        a.biography = "Father Alden is the town's elderly, kind-hearted priest. He tends to the sick and the poor, offering comfort and advice.".into();
+        a.private_biography =
+            "He knows many secrets from confessions but keeps them sacred.".into();
+        a.goals = vec![
+            goal(1, "Comfort the sick and poor", GoalKind::Duty, 9.0),
+            goal(2, "Protect his congregation", GoalKind::Safety, 8.0),
+            goal(3, "Keep confessions secret", GoalKind::Conceal, 10.0),
+        ];
+    }
+
+    if let Some(a) = actors.get_mut(&ActorId::new("tavern_keeper")) {
+        a.biography = "Bess Marlow owns the local tavern. She is boisterous, sharp-witted, and knows everyone's business. Her tavern is the town's gossip hub.".into();
+        a.goals = vec![
+            goal(1, "Keep the tavern thriving", GoalKind::Wealth, 8.0),
+            goal(2, "Be the center of town gossip", GoalKind::Status, 7.0),
+            goal(3, "Avoid trouble from the mafia", GoalKind::Safety, 6.0),
+        ];
+    }
+
+    if let Some(a) = actors.get_mut(&ActorId::new("neighbor")) {
+        a.biography = "Ivo Prat is a quiet, middle-aged neighbor who minds his own business. He lives near the plaza and often observes the daily life of the town without interfering.".into();
+        a.goals = vec![
+            goal(1, "Live peacefully", GoalKind::Survival, 7.0),
+            goal(2, "Stay out of mafia affairs", GoalKind::Safety, 8.0),
+        ];
+    }
+
+    if let Some(a) = actors.get_mut(&ActorId::new("child")) {
+        a.biography = "Pip is an energetic child who plays in the plaza. Curious and friendly, they see the town as a big playground and notice more than adults expect.".into();
+        a.goals = vec![
+            goal(1, "Make friends and have fun", GoalKind::Affection, 8.0),
+            goal(2, "Discover interesting things", GoalKind::Investigate, 5.0),
+        ];
     }
 }
 
@@ -868,6 +1095,9 @@ pub fn build_town() -> World {
         ),
     );
 
+    // Populate biographies and goals for named NPCs.
+    populate_npc_lore(&mut actors);
+
     // --- Initial beliefs --------------------------------------------
     // Public facts everyone knows.
     for a in actors.values_mut() {
@@ -1010,6 +1240,23 @@ pub fn build_town() -> World {
         next_offer_id: 1,
         next_rumor_id: 1,
         next_goal_id: 1,
+        lore: WorldLore {
+            settlement_name: "Ashwick".into(),
+            geography: "A modest river town at the edge of the Northern Marches. The river bends around a rocky promontory, providing a natural harbor for small boats.".into(),
+            history: "Founded as a trading post three centuries ago. The old fortifications are mostly ruins now, but the town has grown into a regional hub for grain and timber.".into(),
+            culture: "Practical and tight-knit. People value hard work and discretion. Strangers are welcomed cautiously. Gossip travels fast, but overt curiosity is considered rude.".into(),
+            landmarks: vec![
+                "The Market Plaza, with its old stone well and weekly market".into(),
+                "The Temple of the Weeping Saint, a modest stone building near the plaza".into(),
+                "The Guard Office, a squat brick building by the north gate".into(),
+                "The Docks, where river barges unload grain and timber".into(),
+                "The Mafia Hall, a discreet building in the warehouse district".into(),
+            ],
+            economy: "Grain, timber, and river trade. The merchants' guild dominates local commerce. The mafia controls smuggling and protection rackets.".into(),
+            institutions: "The Watch maintains order and answers to the town council. The Temple provides charity and spiritual guidance. The merchants' guild regulates trade and prices.".into(),
+            recent_events: "A recent warehouse fire destroyed a shipment of grain. A courier went missing last month. The mafia is rumored to be expanding its operations.".into(),
+            everyday_knowledge: "Bread is baked daily at the plaza bakery. The river is safe to cross at the ford, but not at the docks after dark. The Watch patrols the plaza and the main streets.".into(),
+        },
     }
 }
 

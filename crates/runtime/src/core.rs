@@ -35,7 +35,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rpg_agents::NpcPolicy;
+use rpg_agents::{NpcPolicy, NpcRequestContext};
 use rpg_domain::action::{Action, Loudness, ValidationOutcome};
 use rpg_domain::geom::Vec2;
 use rpg_domain::ids::{ActorId, OfferId, PLAYER};
@@ -50,6 +50,12 @@ use crate::telemetry::{Telemetry, NONE};
 /// simulation also applies occlusion and location factors, so this stays
 /// conservative: the UI never offers a target the validator would reject.
 pub const TALK_RADIUS: f32 = 3.5;
+
+/// How long an idle conversation remains open before it is considered over.
+pub const CONVERSATION_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Maximum number of recent exchanges kept for short-term memory.
+pub const MAX_CONVERSATION_TURNS: usize = 12;
 
 /// Timeouts and limits for the conversation state machine.
 #[derive(Clone, Debug)]
@@ -116,6 +122,23 @@ struct Conversation {
     /// Line currently being voiced.
     line: Option<u64>,
     regenerations: u8,
+}
+
+/// A persistent social interaction with one NPC. Unlike [`Conversation`],
+/// which tracks one voice/inference turn, this survives across turns until
+/// the player switches targets, ends it, or the NPC leaves.
+#[derive(Clone, Debug)]
+struct ActiveConversation {
+    npc: ActorId,
+    last_active: Duration,
+    turns: VecDeque<ConversationTurn>,
+}
+
+/// One exchange in an active conversation, kept for short-term memory.
+#[derive(Clone, Debug)]
+struct ConversationTurn {
+    speaker: ActorId,
+    text: String,
 }
 
 /// Counters surfaced in the diagnostics overlay and asserted by tests.
@@ -221,6 +244,7 @@ pub struct SimCore {
     asr: Readiness,
     tts: Readiness,
     conv: Option<Conversation>,
+    active_conversation: Option<ActiveConversation>,
     next_conv: ConvId,
     next_line: u64,
     world_epoch: u64,
@@ -251,6 +275,7 @@ impl SimCore {
             asr: Readiness::Loading,
             tts: Readiness::Loading,
             conv: None,
+            active_conversation: None,
             next_conv: 1,
             next_line: 1,
             world_epoch: 0,
@@ -304,6 +329,42 @@ impl SimCore {
         self.now = now;
         let _ = self.session.tick();
         self.check_deadlines();
+        self.check_active_conversation();
+    }
+
+    /// End the active conversation if its NPC can no longer participate, or
+    /// the interaction has been idle for too long.
+    fn check_active_conversation(&mut self) {
+        let Some(ac) = &self.active_conversation else {
+            return;
+        };
+        let npc = ac.npc.clone();
+        if !self.npc_can_participate(&npc) {
+            let name = actor_name(&self.session.sim.world, &npc);
+            self.active_conversation = None;
+            self.system(&format!("{name} is no longer close enough to talk"));
+            return;
+        }
+        if self.now.saturating_sub(ac.last_active) > CONVERSATION_TIMEOUT {
+            self.active_conversation = None;
+            self.system("the conversation has gone quiet");
+        }
+    }
+
+    /// Whether an NPC is alive, present, and within talking distance of the
+    /// player. Used to keep a conversation open across turns.
+    fn npc_can_participate(&self, npc: &ActorId) -> bool {
+        let world = &self.session.sim.world;
+        let Some(player) = world.actor(&ActorId::new(PLAYER)) else {
+            return false;
+        };
+        let Some(a) = world.actor(npc) else {
+            return false;
+        };
+        a.kind == ActorKind::Npc
+            && a.status == ActorStatus::Alive
+            && a.location == player.location
+            && a.pos.distance(player.pos) <= self.cfg.talk_radius
     }
 
     /// Side effects produced since the last call, in order.
@@ -393,6 +454,71 @@ impl SimCore {
             Command::PushToTalk(true) => self.ptt_down(),
             Command::PushToTalk(false) => self.ptt_up(),
             Command::Say(text) => self.typed(text),
+            Command::SelectTarget(id) => {
+                if self.npc_can_participate(&id) {
+                    // Switching to a different NPC while a turn is in flight
+                    // would otherwise let the old NPC's late answer be voiced
+                    // after the player has moved on. Cancel it first so pending
+                    // work is handled consistently.
+                    if self
+                        .conv
+                        .as_ref()
+                        .is_some_and(|c| c.npc.as_ref() != Some(&id))
+                    {
+                        self.cancel_active("switched target");
+                    }
+                    self.begin_active_conversation(id.clone());
+                    let name = actor_name(&self.session.sim.world, &id);
+                    self.status = format!("talking to {name}");
+                } else {
+                    self.system("that person is not close enough to talk to");
+                }
+            }
+            Command::CycleTarget => {
+                let candidates = self.nearby_all();
+                if candidates.is_empty() {
+                    self.system("nobody is close enough to talk to");
+                } else {
+                    let current = self.active_conversation.as_ref().map(|ac| ac.npc.clone());
+                    // Finite, deterministic selection. `candidates` is already
+                    // ordered (nearest first, ties broken by id), so:
+                    // - no current target  -> first candidate
+                    // - current present    -> next candidate, wrapping to first
+                    // - current absent     -> first candidate (it left/died)
+                    let next = match current {
+                        Some(current_npc) => candidates
+                            .iter()
+                            .position(|c| *c == current_npc)
+                            .map(|idx| candidates[(idx + 1) % candidates.len()].clone())
+                            .unwrap_or_else(|| candidates[0].clone()),
+                        None => candidates[0].clone(),
+                    };
+                    // A target switch invalidates an in-flight turn for a
+                    // different NPC; cancel it so its late answer cannot be
+                    // voiced after the player has moved on.
+                    if self
+                        .conv
+                        .as_ref()
+                        .is_some_and(|c| c.npc.as_ref() != Some(&next))
+                    {
+                        self.cancel_active("switched target");
+                    }
+                    self.begin_active_conversation(next.clone());
+                    let name = actor_name(&self.session.sim.world, &next);
+                    self.status = format!("talking to {name}");
+                }
+            }
+            Command::EndConversation => {
+                // Cancel any in-flight turn first: ending the conversation must
+                // not leave a model request that later voices a ghost line.
+                if self.conv.is_some() {
+                    self.cancel_active("conversation ended");
+                }
+                if self.active_conversation.is_some() {
+                    self.active_conversation = None;
+                    self.status = "conversation ended".into();
+                }
+            }
             Command::CancelVoice => {
                 if self.conv.is_some() {
                     self.cancel_active("cancelled");
@@ -508,11 +634,33 @@ impl SimCore {
             text: text.clone(),
             kind: LineKind::Player,
         });
-        let Some(npc) = self.nearby() else {
-            self.system("nobody is close enough to hear you");
-            self.finish(false);
-            return;
+
+        // An active conversation is authoritative; proximity only chooses the
+        // first addressee. This is what stops the nearest NPC from stealing a
+        // continuing conversation.
+        let npc = match self.resolve_addressee() {
+            Some(n) => n,
+            None => {
+                self.system("nobody is close enough to hear you");
+                self.finish(false);
+                return;
+            }
         };
+
+        self.begin_active_conversation(npc.clone());
+
+        // Record the player's turn for short-term memory.
+        if let Some(ac) = self.active_conversation.as_mut() {
+            ac.turns.push_back(ConversationTurn {
+                speaker: ActorId::new(PLAYER),
+                text: text.clone(),
+            });
+            ac.last_active = self.now;
+            while ac.turns.len() > MAX_CONVERSATION_TURNS {
+                ac.turns.pop_front();
+            }
+        }
+
         let out = self.session.player_speak(npc.as_str(), &text);
         if let ValidationOutcome::Rejected(reason) = out {
             let name = actor_name(&self.session.sim.world, &npc);
@@ -525,6 +673,17 @@ impl SimCore {
             c.utterance = Some(text);
         }
         self.request_decision();
+    }
+
+    /// Resolve who the player is addressing. An active conversation is
+    /// authoritative until the NPC leaves or the player explicitly switches.
+    fn resolve_addressee(&self) -> Option<ActorId> {
+        if let Some(ac) = &self.active_conversation {
+            if self.npc_can_participate(&ac.npc) {
+                return Some(ac.npc.clone());
+            }
+        }
+        self.nearby()
     }
 
     /// Ask for the active conversation's NPC decision: synchronously from the
@@ -544,13 +703,45 @@ impl SimCore {
         };
         if let Some(reason) = fallback_reason {
             self.set_stage(VoiceStage::Validating);
-            let decision =
-                NpcPolicy.heuristic(&self.session.sim.world, &npc, &player, &text, reason);
+            let ctx = NpcRequestContext {
+                world: &self.session.sim.world,
+                npc: &npc,
+                speaker: &player,
+                utterance: &text,
+                history: &[],
+            };
+            let decision = NpcPolicy.heuristic(&ctx, reason);
             self.commit(npc, decision, false);
             return;
         }
         let request_id = self.session.next_request_id();
-        let request = NpcPolicy.request(&self.session.sim.world, &npc, &player, &text, request_id);
+        // Build prior-turn history, excluding the player's current utterance
+        // (recorded in `turns` by `player_turn`) because that utterance is
+        // passed separately to the model prompt. Including it here would
+        // render the same line twice.
+        let history: Vec<(ActorId, String)> = self
+            .active_conversation
+            .as_ref()
+            .filter(|ac| ac.npc == npc)
+            .map(|ac| {
+                let prior = ac.turns.len().saturating_sub(1);
+                ac.turns
+                    .iter()
+                    .take(prior)
+                    .map(|t| (t.speaker.clone(), t.text.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let request = NpcPolicy.request(
+            &NpcRequestContext {
+                world: &self.session.sim.world,
+                npc: &npc,
+                speaker: &player,
+                utterance: &text,
+                history: &history,
+            },
+            request_id,
+        );
         if let Some(c) = self.conv.as_mut() {
             c.pending = Some(PendingDecision {
                 request_id,
@@ -599,6 +790,19 @@ impl SimCore {
         }
         match commit.spoken {
             Some(line) => {
+                // Record the NPC's reply for short-term memory.
+                if let Some(ac) = self.active_conversation.as_mut() {
+                    if ac.npc == npc {
+                        ac.turns.push_back(ConversationTurn {
+                            speaker: npc.clone(),
+                            text: line.clone(),
+                        });
+                        ac.last_active = self.now;
+                        while ac.turns.len() > MAX_CONVERSATION_TURNS {
+                            ac.turns.pop_front();
+                        }
+                    }
+                }
                 self.dialogue_push(DialogueLine {
                     speaker: npc.as_str().to_string(),
                     text: line.clone(),
@@ -853,10 +1057,13 @@ impl SimCore {
             _ => "unknown".into(),
         };
         let decision = NpcPolicy.resolve(
-            &self.session.sim.world,
-            &npc,
-            &ActorId::new(PLAYER),
-            &text,
+            &NpcRequestContext {
+                world: &self.session.sim.world,
+                npc: &npc,
+                speaker: &ActorId::new(PLAYER),
+                utterance: &text,
+                history: &[],
+            },
             pending.request,
             result,
             &model_id,
@@ -935,6 +1142,26 @@ impl SimCore {
             regenerations: 0,
         });
         id
+    }
+
+    /// Start or refresh a persistent conversation with an NPC.
+    fn begin_active_conversation(&mut self, npc: ActorId) {
+        let already = self
+            .active_conversation
+            .as_ref()
+            .map(|ac| ac.npc == npc)
+            .unwrap_or(false);
+        if already {
+            if let Some(ac) = self.active_conversation.as_mut() {
+                ac.last_active = self.now;
+            }
+            return;
+        }
+        self.active_conversation = Some(ActiveConversation {
+            npc,
+            last_active: self.now,
+            turns: VecDeque::new(),
+        });
     }
 
     fn set_stage(&mut self, stage: VoiceStage) {
@@ -1145,6 +1372,31 @@ impl SimCore {
         }
     }
 
+    /// All living named NPCs in the same room within the talk radius, sorted
+    /// by distance to the player.
+    pub fn nearby_all(&self) -> Vec<ActorId> {
+        let world = &self.session.sim.world;
+        let Some(player) = world.actor(&ActorId::new(PLAYER)) else {
+            return Vec::new();
+        };
+        let mut candidates: Vec<_> = world
+            .actors
+            .values()
+            .filter(|a| a.id.0 != PLAYER)
+            .filter(|a| a.kind == ActorKind::Npc)
+            .filter(|a| a.status == ActorStatus::Alive)
+            .filter(|a| a.location == player.location)
+            .filter(|a| a.pos.distance(player.pos) <= self.cfg.talk_radius)
+            .map(|a| (a.pos.distance(player.pos), a.id.clone()))
+            .collect();
+        candidates.sort_by(|a, b| {
+            a.0.partial_cmp(&b.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.cmp(&b.1))
+        });
+        candidates.into_iter().map(|(_, id)| id).collect()
+    }
+
     /// Nearest living named NPC in the same room, within the talk radius.
     pub fn nearby(&self) -> Option<ActorId> {
         let world = &self.session.sim.world;
@@ -1316,6 +1568,7 @@ impl SimCore {
                 .conv
                 .as_ref()
                 .and_then(|c| c.npc.as_ref())
+                .or_else(|| self.active_conversation.as_ref().map(|ac| &ac.npc))
                 .map(|n| n.as_str().to_string()),
             stage_seconds: self
                 .conv
@@ -1398,6 +1651,10 @@ impl SimCore {
             player_pos,
             player_location,
             nearby,
+            talking_to: self
+                .active_conversation
+                .as_ref()
+                .map(|ac| ac.npc.as_str().to_string()),
             dialogue: self.dialogue.clone(),
             engine_name,
             model_id,

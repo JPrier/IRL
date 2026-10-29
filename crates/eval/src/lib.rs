@@ -8,7 +8,7 @@
 //! Every scenario is seeded and deterministic; replaying the same script must
 //! produce the same canonical event checksum.
 
-use rpg_agents::{HeuristicEngine, NpcPolicy};
+use rpg_agents::{HeuristicEngine, NpcPolicy, NpcRequestContext};
 use rpg_content::build_town;
 use rpg_domain::action::{
     Action, ActionProposal, InvestigateTarget, Loudness, ProposalSource, QuestPredicate,
@@ -171,17 +171,29 @@ impl Session {
     /// authoritative simulation; the voice client reads exactly this text and
     /// never invents dialogue.
     pub fn npc_respond(&mut self, npc: &str, text: &str) -> Option<String> {
+        self.npc_respond_with_history(npc, text, &[])
+    }
+
+    /// Run the NPC decision for a heard utterance with explicit conversation
+    /// history. The history is rendered into the model prompt so the NPC can
+    /// resolve follow-up references.
+    pub fn npc_respond_with_history(
+        &mut self,
+        npc: &str,
+        text: &str,
+        history: &[(ActorId, String)],
+    ) -> Option<String> {
         let npc_id = ActorId::new(npc);
         let player = ActorId::new(PLAYER);
         let request_id = self.next_request_id();
-        let decision = NpcPolicy.decide(
-            &self.sim.world,
-            &npc_id,
-            &player,
-            text,
-            self.engine.as_mut(),
-            request_id,
-        );
+        let ctx = NpcRequestContext {
+            world: &self.sim.world,
+            npc: &npc_id,
+            speaker: &player,
+            utterance: text,
+            history,
+        };
+        let decision = NpcPolicy.decide(&ctx, request_id, self.engine.as_mut());
         self.commit_npc_decision(npc, decision).spoken
     }
 
@@ -657,7 +669,7 @@ fn grocer_conditional_bargain(seed: u64) -> ScenarioResult {
         let knows_before = s
             .sim
             .world
-            .believes(&ActorId::new(PLAYER), &FactId::new("f_grocer_ledger"));
+            .has_heard(&ActorId::new(PLAYER), &FactId::new("f_grocer_ledger"));
         check(
             &mut checks,
             "not_disclosed_before_medicine",
@@ -695,12 +707,12 @@ fn grocer_conditional_bargain(seed: u64) -> ScenarioResult {
         let knows_after = s
             .sim
             .world
-            .believes(&ActorId::new(PLAYER), &FactId::new("f_grocer_ledger"));
+            .has_heard(&ActorId::new(PLAYER), &FactId::new("f_grocer_ledger"));
         check(
             &mut checks,
             "ledger_disclosed_after_bargain",
             knows_after,
-            "player believes ledger fact",
+            "player heard ledger fact",
         );
     }
     finish("grocer_conditional_bargain", seed, &s, checks)
@@ -990,6 +1002,7 @@ fn knowledge_boundaries(seed: u64) -> ScenarioResult {
         &ActorId::new("grocer"),
         &ActorId::new(PLAYER),
         "Who leads the mafia?",
+        &[],
     );
     check(
         &mut checks,
@@ -1152,6 +1165,25 @@ mod tests {
         }
     }
 
+    /// Autonomy regression: every scenario must keep passing across many
+    /// seeds now that NPCs autonomously pursue goals between ticks. Goals
+    /// (Marta's protective watch, Renn's investigation) may fire during any
+    /// scenario, so this guards against autonomy disturbing scripted
+    /// expectations or breaking deterministic replay.
+    #[test]
+    fn all_scenarios_pass_across_seeds_with_autonomy() {
+        for seed in [1u64, 7, 42, 2026, 98765] {
+            for result in run_all(seed) {
+                assert!(
+                    result.passed(),
+                    "scenario {} failed at seed {}\n{result:?}",
+                    result.name,
+                    seed
+                );
+            }
+        }
+    }
+
     /// No-weights regression test for the real-model interaction shape: a
     /// scripted model that only "speaks" still gets the canonical bargain,
     /// and the satisfied deal is honoured on the next turn.
@@ -1205,8 +1237,8 @@ mod tests {
         assert!(
             s.sim
                 .world
-                .believes(&ActorId::new(PLAYER), &FactId::new("f_grocer_ledger")),
-            "player should learn the ledger fact once the deal is honoured"
+                .has_heard(&ActorId::new(PLAYER), &FactId::new("f_grocer_ledger")),
+            "player should hear the ledger fact once the deal is honoured"
         );
     }
 }

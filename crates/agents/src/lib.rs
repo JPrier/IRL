@@ -20,7 +20,7 @@ use rpg_domain::ports::{
     MemoryRetriever, RetrievedMemory,
 };
 use rpg_domain::social::CommitmentState;
-use rpg_domain::world::{ActorKind, Sensitivity, World};
+use rpg_domain::world::{Actor, ActorKind, Fact, Sensitivity, World};
 use rpg_narrative::{Decision, NarrativeChange};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -226,6 +226,7 @@ pub fn render_npc_context(
     npc: &ActorId,
     speaker: &ActorId,
     utterance: &str,
+    history: &[(ActorId, String)],
 ) -> String {
     let Some(a) = world.actor(npc) else {
         return String::new();
@@ -257,23 +258,64 @@ pub fn render_npc_context(
         .unwrap_or("somewhere");
     out.push_str(&format!("You are at {loc}.\n"));
 
+    if !a.biography.is_empty() {
+        out.push_str(&format!("Your public background: {}\n", a.biography));
+    }
+    // Private knowledge is secret: it may guide the NPC's behaviour, but the
+    // NPC must not state it plainly unless deliberately disclosing it. It is
+    // rendered separately so the model can distinguish what it may say from
+    // what it knows.
+    if !a.private_biography.is_empty() {
+        out.push_str(&format!(
+            "Your private knowledge (secret — never state this plainly; it may guide \
+             your choices, evasions and lies): {}\n",
+            a.private_biography
+        ));
+    }
+    if let Some(faction) = &a.secret_allegiance {
+        out.push_str(&format!(
+            "Your secret allegiance (concealed — do not reveal): {faction}\n"
+        ));
+    }
+
+    // Shared world lore available to every resident.
+    if !world.lore.settlement_name.is_empty() {
+        out.push_str(&format!(
+            "About {}: {}\n",
+            world.lore.settlement_name, world.lore.geography
+        ));
+        out.push_str(&format!("History: {}\n", world.lore.history));
+        out.push_str(&format!("Culture: {}\n", world.lore.culture));
+        out.push_str(&format!("Economy: {}\n", world.lore.economy));
+        out.push_str(&format!("Institutions: {}\n", world.lore.institutions));
+        out.push_str(&format!("Recent events: {}\n", world.lore.recent_events));
+        out.push_str(&format!(
+            "Everyday knowledge: {}\n",
+            world.lore.everyday_knowledge
+        ));
+        if !world.lore.landmarks.is_empty() {
+            out.push_str(&format!("Landmarks: {}\n", world.lore.landmarks.join("; ")));
+        }
+    }
+
     let rel = a.relationship(speaker);
     out.push_str(&format!(
         "Toward {}: trust={:.2} affection={:.2} fear={:.2} anger={:.2} suspicion={:.2} obligation={:.2}.\n",
         speaker, rel.trust, rel.affection, rel.fear, rel.anger, rel.suspicion, rel.obligation
     ));
 
-    // Only the NPC's own beliefs, and never inner-circle facts for outsiders.
+    // Only the NPC's own beliefs, and only those the current conversation
+    // context authorises surfacing. Sensitive facts are composed selectively so
+    // the model cannot blurt a secret during unrelated small talk.
     out.push_str("Things you believe:\n");
     for (fid, b) in &a.beliefs {
         if !b.believes_true {
             continue;
         }
         if let Some(f) = world.fact(fid) {
-            if f.sensitivity == Sensitivity::InnerCircle && !a.has_flag("inner_circle") {
-                continue;
+            if disclosure_allowed(a, f, utterance, history) {
+                out.push_str(&format!("- {}: {}\n", fid, f.statement));
             }
-            out.push_str(&format!("- {}: {}\n", fid, f.statement));
         }
     }
 
@@ -313,11 +355,24 @@ pub fn render_npc_context(
         );
     }
 
+    if !history.is_empty() {
+        out.push_str("\nRecent conversation:\n");
+        for (who, said) in history {
+            out.push_str(&format!("{}: \"{}\"\n", who, said));
+        }
+    }
+
     out.push_str(&format!("\n{} says: \"{}\"\n", speaker, utterance));
     out.push_str(
-        "Rules: never invent facts; never reveal a fact you would not trade; if the \
-         player asks for something and you need something first, make a conditional \
-         offer.\n",
+        "Rules:\n\
+         - You are a person with goals, memories, and relationships. Respond naturally as your character would.\n\
+         - Use the recent conversation to understand references like 'here', 'that', or 'him'.\n\
+         - Never invent facts you do not know. If you do not know, say so or express uncertainty.\n\
+         - You may share facts you believe, but only if you are willing to. You can refuse, deflect, lie, or bargain.\n\
+         - Private knowledge marked secret is yours alone: you may act on it (deflect, mislead, protect it) but must not state it plainly unless your goals call for deliberate disclosure.\n\
+         - Ordinary greetings, small talk, and questions about the town or your work should get a natural spoken reply.\n\
+         - Only make an offer, promise, or threat when it fits the conversation and your goals.\n\
+         - Keep replies brief unless the player asks for substantial information.\n",
     );
     out.push_str(
         r#"Respond with ONE JSON object, no prose. Allowed shapes:
@@ -331,6 +386,58 @@ If you need something before you help, make a conditional offer: condition "has_
 "#,
     );
     out
+}
+
+/// Whether the current conversation context authorises surfacing `fact` to the
+/// model. This is the prompt-composition counterpart to
+/// `Simulation::validate_disclosure`: it keeps secrets out of the prompt during
+/// unrelated small talk, where the model might otherwise blurt them out.
+///
+/// * Public and restricted facts are always safe to surface.
+/// * Private and secret facts require the actor to be a canonical holder and
+///   the conversation to be topically relevant.
+/// * Inner-circle facts additionally require the inner-circle flag.
+fn disclosure_allowed(
+    actor: &Actor,
+    fact: &Fact,
+    utterance: &str,
+    history: &[(ActorId, String)],
+) -> bool {
+    match fact.sensitivity {
+        Sensitivity::Public | Sensitivity::Restricted => true,
+        Sensitivity::Private | Sensitivity::Secret | Sensitivity::InnerCircle => {
+            let holder =
+                fact.eligible_holders.is_empty() || fact.eligible_holders.contains(&actor.id);
+            if !holder {
+                return false;
+            }
+            if matches!(fact.sensitivity, Sensitivity::InnerCircle)
+                && !actor.has_flag("inner_circle")
+            {
+                return false;
+            }
+            topic_relevant(fact, utterance, history)
+        }
+    }
+}
+
+/// Whether the current conversation is plausibly about `fact`.
+///
+/// Checks the current utterance and recent history for distinctive words from
+/// the fact's statement or id. A fact with no topical overlap is not surfaced,
+/// so the model cannot casually mention a secret during unrelated dialogue.
+fn topic_relevant(fact: &Fact, utterance: &str, history: &[(ActorId, String)]) -> bool {
+    let mut haystack = utterance.to_lowercase();
+    for (_, said) in history {
+        haystack.push(' ');
+        haystack.push_str(&said.to_lowercase());
+    }
+    let statement = fact.statement.to_lowercase();
+    let keywords: Vec<&str> = statement
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() >= 4)
+        .collect();
+    keywords.iter().any(|k| haystack.contains(k))
 }
 
 /// Deserialize an optional list where an explicit `null` (the strict
@@ -636,6 +743,18 @@ pub struct NpcDecision {
     pub raw: Option<InferenceResponse>,
 }
 
+/// Bundled inputs for an NPC decision request. Groups the world, participants,
+/// utterance, and conversation history so the policy API stays small and
+/// readable, and so callers cannot accidentally swap the participants.
+#[derive(Clone, Copy, Debug)]
+pub struct NpcRequestContext<'a> {
+    pub world: &'a World,
+    pub npc: &'a ActorId,
+    pub speaker: &'a ActorId,
+    pub utterance: &'a str,
+    pub history: &'a [(ActorId, String)],
+}
+
 pub struct NpcPolicy;
 
 impl NpcPolicy {
@@ -647,20 +766,17 @@ impl NpcPolicy {
     /// different threads so the simulation never waits for the model.
     pub fn decide(
         &self,
-        world: &World,
-        npc: &ActorId,
-        speaker: &ActorId,
-        utterance: &str,
-        engine: &mut dyn InferenceEngine,
+        ctx: &NpcRequestContext<'_>,
         request_id: u64,
+        engine: &mut dyn InferenceEngine,
     ) -> NpcDecision {
         if !engine.is_real_model() {
-            return self.heuristic(world, npc, speaker, utterance, None);
+            return self.heuristic(ctx, None);
         }
-        let req = self.request(world, npc, speaker, utterance, request_id);
+        let req = self.request(ctx, request_id);
         let result = engine.complete(&req);
         let model_id = engine.model_id();
-        self.resolve(world, npc, speaker, utterance, req, result, &model_id)
+        self.resolve(ctx, req, result, &model_id)
     }
 
     /// Build the model request for one NPC decision.
@@ -668,19 +784,12 @@ impl NpcPolicy {
     /// The request carries only the NPC's scoped, rendered context — never a
     /// reference to the mutable world — so it can be handed to an inference
     /// worker while the simulation keeps running.
-    pub fn request(
-        &self,
-        world: &World,
-        npc: &ActorId,
-        speaker: &ActorId,
-        utterance: &str,
-        request_id: u64,
-    ) -> InferenceRequest {
+    pub fn request(&self, ctx: &NpcRequestContext<'_>, request_id: u64) -> InferenceRequest {
         InferenceRequest {
             id: request_id,
             role: InferenceRole::NpcDecision,
             system: "You are a character in a grounded social RPG. Stay in character. Never invent facts you were not told. Reply with one JSON object only.".into(),
-            prompt: render_npc_context(world, npc, speaker, utterance),
+            prompt: render_npc_context(ctx.world, ctx.npc, ctx.speaker, ctx.utterance, ctx.history),
             max_tokens: 160,
             // Tool decisions are deterministic: a small model asked at higher
             // temperature drifts between valid but unrelated actions.
@@ -693,21 +802,14 @@ impl NpcPolicy {
     /// The deterministic policy's decision. `reason` is `Some` when a real
     /// model was configured but could not be used, so the provenance records
     /// a fallback rather than an explicit heuristic engine.
-    pub fn heuristic(
-        &self,
-        world: &World,
-        npc: &ActorId,
-        speaker: &ActorId,
-        utterance: &str,
-        reason: Option<String>,
-    ) -> NpcDecision {
+    pub fn heuristic(&self, ctx: &NpcRequestContext<'_>, reason: Option<String>) -> NpcDecision {
         let label = reason
             .clone()
             .unwrap_or_else(|| "deterministic policy".into());
         NpcDecision {
             proposal: ActionProposal {
-                actor: npc.clone(),
-                action: heuristic_decision(world, npc, speaker, utterance),
+                actor: ctx.npc.clone(),
+                action: heuristic_decision(ctx.world, ctx.npc, ctx.speaker, ctx.utterance),
                 source: ProposalSource::NpcPolicy,
                 rationale: label,
             },
@@ -715,7 +817,7 @@ impl NpcPolicy {
                 Some(r) => DecisionSource::HeuristicFallback { reason: r },
                 None => DecisionSource::HeuristicEngine,
             },
-            prompt: render_npc_context(world, npc, speaker, utterance),
+            prompt: render_npc_context(ctx.world, ctx.npc, ctx.speaker, ctx.utterance, &[]),
             raw: None,
         }
     }
@@ -726,19 +828,15 @@ impl NpcPolicy {
     /// world `req` was rendered from: parsing, the canonical agenda and the
     /// canonical obligations are all checked against the current state, and
     /// the caller must still validate the proposal before committing it.
-    #[allow(clippy::too_many_arguments)]
     pub fn resolve(
         &self,
-        world: &World,
-        npc: &ActorId,
-        speaker: &ActorId,
-        utterance: &str,
+        ctx: &NpcRequestContext<'_>,
         req: InferenceRequest,
         result: Result<InferenceResponse, InferenceError>,
         model_id: &str,
     ) -> NpcDecision {
         let fallback = |reason: String| {
-            let mut d = self.heuristic(world, npc, speaker, utterance, Some(reason));
+            let mut d = self.heuristic(ctx, Some(reason));
             d.prompt = req.prompt.clone();
             d
         };
@@ -757,7 +855,8 @@ impl NpcPolicy {
                 preview(&resp.text)
             ));
         }
-        let Some(mut action) = parse_decision(&resp.text, Some(world), npc, speaker) else {
+        let Some(mut action) = parse_decision(&resp.text, Some(ctx.world), ctx.npc, ctx.speaker)
+        else {
             return fallback(format!(
                 "model output was not a valid action: {}",
                 preview(&resp.text)
@@ -766,7 +865,9 @@ impl NpcPolicy {
         // Canonical agenda: an NPC with an unmet item need should not give up
         // a private fact for free. If the model did not initiate the designed
         // bargain, the policy does.
-        if let Some((fact, item)) = canonical_bargain(world, npc, speaker, utterance) {
+        if let Some((fact, item)) =
+            canonical_bargain(ctx.world, ctx.npc, ctx.speaker, ctx.utterance)
+        {
             match &mut action {
                 Action::MakeOffer {
                     condition,
@@ -774,7 +875,7 @@ impl NpcPolicy {
                     ..
                 } => {
                     *condition = Some(QuestPredicate::HasItem {
-                        actor: npc.clone(),
+                        actor: ctx.npc.clone(),
                         item: item.clone(),
                         qty: 1,
                     });
@@ -784,13 +885,13 @@ impl NpcPolicy {
                 _ => {
                     return NpcDecision {
                         proposal: ActionProposal {
-                            actor: npc.clone(),
+                            actor: ctx.npc.clone(),
                             action: Action::MakeOffer {
-                                target: speaker.clone(),
+                                target: ctx.speaker.clone(),
                                 give: vec![],
                                 want: vec![],
                                 condition: Some(QuestPredicate::HasItem {
-                                    actor: npc.clone(),
+                                    actor: ctx.npc.clone(),
                                     item: item.clone(),
                                     qty: 1,
                                 }),
@@ -812,13 +913,13 @@ impl NpcPolicy {
         // Canonical obligation: a satisfied deal the NPC owes the player must
         // be honoured. A small model often stalls with another offer here; the
         // simulation authority does not.
-        if let Some(fact) = owed_disclosure(world, npc, speaker, utterance) {
+        if let Some(fact) = owed_disclosure(ctx.world, ctx.npc, ctx.speaker, ctx.utterance) {
             if !matches!(action, Action::ShareClaim { .. }) {
                 return NpcDecision {
                     proposal: ActionProposal {
-                        actor: npc.clone(),
+                        actor: ctx.npc.clone(),
                         action: Action::ShareClaim {
-                            target: speaker.clone(),
+                            target: ctx.speaker.clone(),
                             fact: fact.clone(),
                             assertive: true,
                         },
@@ -835,7 +936,7 @@ impl NpcPolicy {
         }
         NpcDecision {
             proposal: ActionProposal {
-                actor: npc.clone(),
+                actor: ctx.npc.clone(),
                 action,
                 source: ProposalSource::NpcModel,
                 rationale: format!("{model_id} completion_tokens={}", resp.completion_tokens),
@@ -849,15 +950,11 @@ impl NpcPolicy {
     /// Backwards-compatible convenience used by older callers and tests.
     pub fn respond(
         &self,
-        world: &World,
-        npc: &ActorId,
-        speaker: &ActorId,
-        utterance: &str,
-        engine: &mut dyn InferenceEngine,
+        ctx: &NpcRequestContext<'_>,
         request_id: u64,
+        engine: &mut dyn InferenceEngine,
     ) -> ActionProposal {
-        self.decide(world, npc, speaker, utterance, engine, request_id)
-            .proposal
+        self.decide(ctx, request_id, engine).proposal
     }
 }
 
@@ -907,6 +1004,8 @@ fn canonical_bargain(
 
 /// If the NPC owes the player a satisfied obligation, return the fact it should
 /// now disclose: the promised fact, else the fact the player is asking about.
+/// The obligation is fulfilled once the fact has been *heard* (delivered) —
+/// whether or not the recipient came to believe it.
 fn owed_disclosure(
     world: &World,
     npc: &ActorId,
@@ -917,12 +1016,12 @@ fn owed_disclosure(
         c.debtor == *npc && c.creditor == *speaker && c.state == CommitmentState::Satisfied
     })?;
     if let Some(fact) = &debt.promised_fact {
-        if !world.believes(speaker, fact) {
+        if !world.has_heard(speaker, fact) {
             return Some(fact.clone());
         }
     }
     let fact = relevant_believed_fact(world, npc, utterance)?;
-    if world.believes(speaker, &fact) {
+    if world.has_heard(speaker, &fact) {
         return None;
     }
     Some(fact)
@@ -1079,7 +1178,7 @@ pub fn retrieve_beliefs(
 mod tests {
     use super::*;
     use rpg_domain::world::{
-        Actor, ActorStatus, Belief, Capabilities, Inventory, Personality, Provenance,
+        Actor, ActorStatus, Belief, Capabilities, Inventory, Personality, Provenance, WorldLore,
     };
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -1095,6 +1194,8 @@ mod tests {
             facing: 0.0,
             personality: Personality::default(),
             values: vec![],
+            biography: String::new(),
+            private_biography: String::new(),
             affiliations: vec![FactionId::new("merchants")],
             capabilities: Capabilities::default(),
             inventory: Inventory::default(),
@@ -1155,6 +1256,7 @@ mod tests {
             next_offer_id: 1,
             next_rumor_id: 1,
             next_goal_id: 1,
+            lore: WorldLore::default(),
         };
         w.locations.insert(
             LocationId::new("shop"),
@@ -1181,6 +1283,8 @@ mod tests {
                 facing: 0.0,
                 personality: Personality::default(),
                 values: vec![],
+                biography: String::new(),
+                private_biography: String::new(),
                 affiliations: vec![],
                 capabilities: Capabilities::default(),
                 inventory: Inventory::default(),
@@ -1340,6 +1444,7 @@ mod tests {
             &ActorId::new("grocer"),
             &ActorId::new(PLAYER),
             "who leads it?",
+            &[],
         );
         assert!(!prompt.contains("SELENE"));
     }
@@ -1366,5 +1471,55 @@ mod tests {
         // Remaining P2 tasks pop FIFO: Memory(id 1) before Director(id 3).
         assert_eq!(s.pop().unwrap().id, 1);
         assert_eq!(s.pop().unwrap().id, 3);
+    }
+
+    #[test]
+    fn test_prompt_includes_dialogue_history() {
+        let w = world_with_grocer();
+        let npc = ActorId::new("grocer");
+        let player = ActorId::new(PLAYER);
+        let history = vec![
+            (player.clone(), "Hello there!".to_string()),
+            (npc.clone(), "Good day to you.".to_string()),
+            (
+                player.clone(),
+                "I was wondering about the ledger.".to_string(),
+            ),
+        ];
+        let prompt = render_npc_context(&w, &npc, &player, "What do you think about it?", &history);
+        assert!(prompt.contains("Recent conversation:"));
+        assert!(prompt.contains("Hello there!"));
+        assert!(prompt.contains("Good day to you."));
+        assert!(prompt.contains("I was wondering about the ledger."));
+    }
+
+    #[test]
+    fn test_prompt_includes_world_knowledge_and_biography() {
+        let mut w = world_with_grocer();
+        w.actor_mut(&ActorId::new("grocer")).unwrap().biography =
+            "Marta has run the shop for twenty years and knows everyone's business.".into();
+        w.lore = WorldLore {
+            settlement_name: "Ashwick".into(),
+            geography: "A river town at the edge of the Northern Marches.".into(),
+            history: "Founded as a trading post three centuries ago.".into(),
+            culture: "Practical and tight-knit.".into(),
+            landmarks: vec!["The Market Plaza".into()],
+            economy: "Grain and timber.".into(),
+            institutions: "The Watch and the Temple.".into(),
+            recent_events: "A recent warehouse fire.".into(),
+            everyday_knowledge: "Bread is baked daily at the plaza bakery.".into(),
+        };
+        let prompt = render_npc_context(
+            &w,
+            &ActorId::new("grocer"),
+            &ActorId::new(PLAYER),
+            "What do you know about this place?",
+            &[],
+        );
+        assert!(prompt.contains("Marta has run the shop for twenty years"));
+        assert!(prompt.contains("Ashwick"));
+        assert!(prompt.contains("A river town at the edge of the Northern Marches"));
+        assert!(prompt.contains("Founded as a trading post three centuries ago"));
+        assert!(prompt.contains("The Market Plaza"));
     }
 }

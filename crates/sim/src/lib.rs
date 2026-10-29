@@ -7,6 +7,7 @@
 //! [`Simulation::apply`], which validates a typed [`ActionProposal`] and emits
 //! typed events. Model output is always an untrusted proposal.
 
+pub mod autonomy;
 pub mod pathfind;
 
 use rpg_domain::action::{
@@ -27,6 +28,8 @@ use rpg_social as social;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::autonomy::GoalAutonomy;
+
 /// Tunable, scenario-fixed simulation parameters.
 #[derive(Clone, Debug)]
 pub struct SimConfig {
@@ -40,6 +43,13 @@ pub struct SimConfig {
     pub enable_background: bool,
     /// Run the deterministic director (checkpoints + clue placement).
     pub enable_director: bool,
+    /// Enable deterministic goal-driven autonomy (pursuits) for NPCs.
+    pub enable_goal_autonomy: bool,
+    /// Pacing margin (in ticks) added on top of the estimated travel time for
+    /// an autonomous pursuit; the deadline scales with the planned path.
+    pub goal_pursuit_margin_ticks: u32,
+    /// Ticks to pause goal autonomy after a completed pursuit.
+    pub goal_cooldown_ticks: u32,
     /// Minimum minutes between ambient incident rolls.
     pub incident_interval_minutes: u32,
 }
@@ -52,6 +62,9 @@ impl Default for SimConfig {
             move_units_per_tick: 2.0,
             enable_background: true,
             enable_director: true,
+            enable_goal_autonomy: true,
+            goal_pursuit_margin_ticks: 10,
+            goal_cooldown_ticks: 60,
             incident_interval_minutes: 60,
         }
     }
@@ -85,6 +98,9 @@ pub struct SimTransient {
     pub paths: BTreeMap<ActorId, Vec<Vec2>>,
     pub pending_private: Vec<PendingPrivate>,
     pub last_incident_minute: u64,
+    /// Transient autonomy state, persisted for exact continuation.
+    #[serde(default)]
+    pub autonomy: GoalAutonomy,
 }
 
 /// A recorded public entry point, used for input/proposal replay.
@@ -117,6 +133,8 @@ pub struct Simulation {
     pub ops: Vec<SimOp>,
     /// Pending private-conversation walks.
     pub pending_private: Vec<PendingPrivate>,
+    /// Transient goal-autonomy state.
+    pub autonomy: GoalAutonomy,
     /// When false, `apply`/`step` do not append to `ops` (used during replay).
     pub recording: bool,
 }
@@ -136,6 +154,7 @@ impl Simulation {
             last_incident_minute: 0,
             ops: Vec::new(),
             pending_private: Vec::new(),
+            autonomy: GoalAutonomy::default(),
             recording: true,
         }
     }
@@ -174,6 +193,7 @@ impl Simulation {
             initial_world,
             ops,
             pending_private: transient.pending_private,
+            autonomy: transient.autonomy,
             recording: true,
         }
     }
@@ -184,6 +204,7 @@ impl Simulation {
             paths: self.paths.clone(),
             pending_private: self.pending_private.clone(),
             last_incident_minute: self.last_incident_minute,
+            autonomy: self.autonomy.clone(),
         }
     }
 
@@ -417,8 +438,19 @@ impl Simulation {
         Ok(())
     }
 
-    /// A fact may only be disclosed if the actor believes it and is permitted
-    /// by its sensitivity (inner-circle secrets require inner-circle status).
+    /// A fact may only be disclosed if the actor believes it *and* is
+    /// canonically authorised to share it.
+    ///
+    /// Knowledge is not permission. A character who merely overheard a secret
+    /// must not be able to blab it in ordinary dialogue. The canonical
+    /// authorisation tiers are:
+    ///
+    /// * `Public` / `Restricted` — freely shareable by any believer.
+    /// * `Private` / `Secret` — only canonical holders (the actors named in
+    ///   `eligible_holders`) may disclose. An empty holder list places no
+    ///   canonical restriction on the fact.
+    /// * `InnerCircle` — holders must additionally carry the `inner_circle`
+    ///   flag, so an outsider who learned the secret cannot spread it.
     fn validate_disclosure(&self, actor: &Actor, fact: &FactId) -> Result<(), RejectReason> {
         let Some(f) = self.world.fact(fact) else {
             return Err(RejectReason::UnknownFact(fact.clone()));
@@ -426,7 +458,13 @@ impl Simulation {
         if !self.world.believes(&actor.id, fact) {
             return Err(RejectReason::LacksKnowledge(fact.clone()));
         }
-        if f.sensitivity == Sensitivity::InnerCircle && !actor.has_flag("inner_circle") {
+        let holder = f.eligible_holders.is_empty() || f.eligible_holders.contains(&actor.id);
+        let authorized = match f.sensitivity {
+            Sensitivity::Public | Sensitivity::Restricted => true,
+            Sensitivity::Private | Sensitivity::Secret => holder,
+            Sensitivity::InnerCircle => actor.has_flag("inner_circle") && holder,
+        };
+        if !authorized {
             return Err(RejectReason::NotPermittedToDisclose(fact.clone()));
         }
         Ok(())
@@ -1535,7 +1573,26 @@ impl Simulation {
             self.director_tick(&mut report);
         }
 
-        let routine = self.routine_proposals(&acted);
+        let mut routine = self.routine_proposals(&acted);
+        // At-post gate: autonomy may replace a routine proposal only when the
+        // actor is at its scheduled post (routine idles) or has no schedule
+        // entry; it never hijacks schedule-driven moves. Pursuing actors are
+        // absent from `routine` (the goal layer owns their turns), so their
+        // re-proposed walks and arrival actions always apply.
+        for p in self.autonomy_proposals(&acted) {
+            let at_post = match routine.iter().find(|r| r.actor == p.actor) {
+                Some(r) => matches!(r.action, Action::Idle),
+                None => true,
+            };
+            if !at_post {
+                continue;
+            }
+            if let Some(pos) = routine.iter().position(|r| r.actor == p.actor) {
+                routine[pos] = p;
+            } else {
+                routine.push(p);
+            }
+        }
         for p in &routine {
             let _ = self.apply_impl(p);
         }
@@ -1574,6 +1631,11 @@ impl Simulation {
                     .iter()
                     .any(|p| p.a == actor.id || p.b == actor.id)
             {
+                continue;
+            }
+            // Pursuing actors: the goal layer owns their movement while a
+            // pursuit is active; do not fight it with schedule moves.
+            if self.autonomy.is_pursuing(&actor.id) {
                 continue;
             }
             let scheduled = actor

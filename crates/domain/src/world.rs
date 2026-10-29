@@ -150,6 +150,13 @@ pub struct Goal {
     /// Optional stable predicate that marks the goal satisfied.
     #[serde(default)]
     pub predicate: Option<crate::action::QuestPredicate>,
+    /// Optional pursuit target: a location the actor will visit for this
+    /// goal. Authored content fills these; the autonomy layer consumes them.
+    #[serde(default)]
+    pub target_location: Option<LocationId>,
+    /// Optional pursuit target: another actor the goal is about.
+    #[serde(default)]
+    pub target_actor: Option<ActorId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -245,6 +252,18 @@ pub struct Actor {
     pub facing: f32,
     pub personality: Personality,
     pub values: Vec<String>,
+    /// A compact, authored biography used to ground the character's voice and
+    /// knowledge. Empty for procedurally generated actors. This is the public
+    /// persona: safe to render into prompts and to share in ordinary speech.
+    #[serde(default)]
+    pub biography: String,
+    /// Information the actor knows but must not share freely: hidden
+    /// allegiances, secret identities, protected confessions. It informs
+    /// behaviour (evasion, deflection, bargaining) but is never a permitted
+    /// public assertion, so it is rendered separately from the public
+    /// biography and kept out of ordinary spoken lines.
+    #[serde(default)]
+    pub private_biography: String,
     pub affiliations: Vec<FactionId>,
     pub capabilities: Capabilities,
     pub inventory: Inventory,
@@ -662,6 +681,21 @@ pub struct ContainerCommit {
 // The canonical world container
 // ---------------------------------------------------------------------------
 
+/// Structured, authored lore about the settlement. Shared public knowledge
+/// that every resident may draw on; personal knowledge stays on [`Actor`].
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct WorldLore {
+    pub settlement_name: String,
+    pub geography: String,
+    pub history: String,
+    pub culture: String,
+    pub landmarks: Vec<String>,
+    pub economy: String,
+    pub institutions: String,
+    pub recent_events: String,
+    pub everyday_knowledge: String,
+}
+
 /// All canonical, authoritative game state. The `sim` crate owns the logic
 /// that mutates this; every other layer only reads it (or proposes changes).
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -698,6 +732,9 @@ pub struct World {
     pub next_offer_id: u64,
     pub next_rumor_id: u64,
     pub next_goal_id: u64,
+    /// Authored, shared lore for the settlement.
+    #[serde(default)]
+    pub lore: WorldLore,
 }
 
 impl World {
@@ -735,6 +772,14 @@ impl World {
             .get(actor)
             .and_then(|a| a.beliefs.get(fact))
             .map(|b| b.believes_true)
+            .unwrap_or(false)
+    }
+
+    /// Has the actor heard about `fact`, whether or not they believe it?
+    pub fn has_heard(&self, actor: &ActorId, fact: &FactId) -> bool {
+        self.actors
+            .get(actor)
+            .map(|a| a.beliefs.contains_key(fact))
             .unwrap_or(false)
     }
 
@@ -846,6 +891,7 @@ mod tests {
             next_offer_id: 1,
             next_rumor_id: 1,
             next_goal_id: 1,
+            lore: WorldLore::default(),
         }
     }
 

@@ -63,7 +63,16 @@ fn real_openrouter_turn_goes_through_canonical_validation() {
         p.pos = pos;
         p.location = loc;
     }
-    let req = rpg_agents::NpcPolicy.request(&world, &grocer, &player, "Good evening.", 1);
+    let req = rpg_agents::NpcPolicy.request(
+        &rpg_agents::NpcRequestContext {
+            world: &world,
+            npc: &grocer,
+            speaker: &player,
+            utterance: "Good evening.",
+            history: &[],
+        },
+        1,
+    );
     let resp = engine.complete(&req).expect("a real completion");
     let contract = rpg_domain::contract::validate_action_json(&resp.text);
     assert!(contract.is_ok(), "contract: {contract:?} for {}", resp.text);

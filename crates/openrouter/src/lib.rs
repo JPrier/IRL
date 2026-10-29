@@ -214,7 +214,10 @@ impl Default for OpenRouterConfig {
         Self {
             api_base: DEFAULT_API_BASE.into(),
             model: DEFAULT_MODEL.into(),
-            max_output_tokens: 400,
+            // Short NPC dialogue and decisions rarely need more than this.
+            // Keeping the cap low reduces provider-side generation time and
+            // discourages long, rambling completions.
+            max_output_tokens: 160,
             temperature: None,
             send_seed: true,
             send_temperature: true,
@@ -222,7 +225,10 @@ impl Default for OpenRouterConfig {
             structured: StructuredMode::JsonSchema,
             stream: true,
             timeout_ms: 40_000,
-            reasoning_effort: None,
+            // Simple dialogue does not benefit from hidden reasoning. Models
+            // that support it are asked to skip it; unsupported models ignore
+            // the field.
+            reasoning_effort: Some("none".into()),
             referer: None,
             title: APP_TITLE.into(),
             budget: Budget::default(),
@@ -1217,7 +1223,7 @@ mod tests {
         for absent in ["seed", "temperature", "reasoning", "max_tokens"] {
             assert!(body.get(absent).is_none(), "{absent} still sent");
         }
-        assert_eq!(body["max_completion_tokens"], 400);
+        assert_eq!(body["max_completion_tokens"], 160);
         // A generic routing 404 is not misreported as missing structured outputs.
         assert!(matches!(
             classify_http_error(
