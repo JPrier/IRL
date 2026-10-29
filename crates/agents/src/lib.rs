@@ -1004,6 +1004,8 @@ fn canonical_bargain(
 
 /// If the NPC owes the player a satisfied obligation, return the fact it should
 /// now disclose: the promised fact, else the fact the player is asking about.
+/// The obligation is fulfilled once the fact has been *heard* (delivered) —
+/// whether or not the recipient came to believe it.
 fn owed_disclosure(
     world: &World,
     npc: &ActorId,
@@ -1014,12 +1016,12 @@ fn owed_disclosure(
         c.debtor == *npc && c.creditor == *speaker && c.state == CommitmentState::Satisfied
     })?;
     if let Some(fact) = &debt.promised_fact {
-        if !world.believes(speaker, fact) {
+        if !world.has_heard(speaker, fact) {
             return Some(fact.clone());
         }
     }
     let fact = relevant_believed_fact(world, npc, utterance)?;
-    if world.believes(speaker, &fact) {
+    if world.has_heard(speaker, &fact) {
         return None;
     }
     Some(fact)

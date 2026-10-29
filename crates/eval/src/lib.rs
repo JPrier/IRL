@@ -669,7 +669,7 @@ fn grocer_conditional_bargain(seed: u64) -> ScenarioResult {
         let knows_before = s
             .sim
             .world
-            .believes(&ActorId::new(PLAYER), &FactId::new("f_grocer_ledger"));
+            .has_heard(&ActorId::new(PLAYER), &FactId::new("f_grocer_ledger"));
         check(
             &mut checks,
             "not_disclosed_before_medicine",
@@ -707,12 +707,12 @@ fn grocer_conditional_bargain(seed: u64) -> ScenarioResult {
         let knows_after = s
             .sim
             .world
-            .believes(&ActorId::new(PLAYER), &FactId::new("f_grocer_ledger"));
+            .has_heard(&ActorId::new(PLAYER), &FactId::new("f_grocer_ledger"));
         check(
             &mut checks,
             "ledger_disclosed_after_bargain",
             knows_after,
-            "player believes ledger fact",
+            "player heard ledger fact",
         );
     }
     finish("grocer_conditional_bargain", seed, &s, checks)
@@ -1237,8 +1237,8 @@ mod tests {
         assert!(
             s.sim
                 .world
-                .believes(&ActorId::new(PLAYER), &FactId::new("f_grocer_ledger")),
-            "player should learn the ledger fact once the deal is honoured"
+                .has_heard(&ActorId::new(PLAYER), &FactId::new("f_grocer_ledger")),
+            "player should hear the ledger fact once the deal is honoured"
         );
     }
 }

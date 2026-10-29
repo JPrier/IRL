@@ -775,6 +775,14 @@ impl World {
             .unwrap_or(false)
     }
 
+    /// Has the actor heard about `fact`, whether or not they believe it?
+    pub fn has_heard(&self, actor: &ActorId, fact: &FactId) -> bool {
+        self.actors
+            .get(actor)
+            .map(|a| a.beliefs.contains_key(fact))
+            .unwrap_or(false)
+    }
+
     /// All living named NPCs (excludes player and background actors).
     pub fn named_npcs(&self) -> impl Iterator<Item = &Actor> {
         self.actors
