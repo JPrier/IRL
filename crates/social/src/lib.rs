@@ -719,4 +719,121 @@ mod tests {
             &ActorId::new("b")
         ));
     }
+
+    /// Regression: ordinary (and even assertive) claims must be judged by the
+    /// relationship-sensitive roll — the speaker's `assertive` flag must never
+    /// guarantee belief. Delivery (hearing) is still always guaranteed.
+    #[test]
+    fn share_claim_ordinary_claims_are_probabilistic_even_when_assertive() {
+        let seeds = 32;
+        let mut believed_count = 0;
+        for seed in 0..seeds {
+            let mut w = world_with(vec![actor("a"), actor("b")]);
+            let mut events = EventLog::new();
+            let mut rng = DeterministicRng::new(seed);
+            let out = share_claim(
+                &mut w,
+                &mut events,
+                &mut rng,
+                1,
+                480,
+                &ActorId::new("a"),
+                &ActorId::new("b"),
+                &FactId::new("f_x"),
+                true,
+            );
+            if out.believed {
+                believed_count += 1;
+            }
+            // Delivery is guaranteed regardless of the belief roll: the
+            // recipient always records that it heard the claim.
+            assert!(
+                w.has_heard(&ActorId::new("b"), &FactId::new("f_x")),
+                "the recipient must always hear the claim (seed {seed})"
+            );
+        }
+        assert!(
+            believed_count < seeds,
+            "an assertive claim with a neutral relationship must not be believed deterministically"
+        );
+    }
+
+    /// Regression: a distrusted, suspected speaker must be doubted — trust and
+    /// suspicion must actually lower the belief probability.
+    #[test]
+    fn share_claim_distrusted_speakers_are_doubted() {
+        let seeds = 32;
+        let mut believed_count = 0;
+        for seed in 0..seeds {
+            let mut w = world_with(vec![actor("a"), actor("b")]);
+            // The recipient `b` deeply distrusts and suspects the speaker `a`.
+            adjust_relationship(
+                &mut w,
+                &ActorId::new("b"),
+                &ActorId::new("a"),
+                &RelationshipDelta::new().trust(-1.0).suspicion(1.0),
+            );
+            let mut events = EventLog::new();
+            let mut rng = DeterministicRng::new(seed);
+            let out = share_claim(
+                &mut w,
+                &mut events,
+                &mut rng,
+                1,
+                480,
+                &ActorId::new("a"),
+                &ActorId::new("b"),
+                &FactId::new("f_x"),
+                true,
+            );
+            if out.believed {
+                believed_count += 1;
+            }
+        }
+        assert!(
+            believed_count * 2 < seeds,
+            "a distrusted speaker should be believed in well under half of the seeds, got {believed_count}/{seeds}"
+        );
+    }
+
+    /// Regression: a fulfilled bargain must guarantee that the promised
+    /// information is *delivered* (heard), not that the recipient believes it.
+    /// Even when the belief roll fails, the belief record must exist.
+    #[test]
+    fn share_claim_delivers_even_when_not_believed() {
+        let mut found_disbelief = false;
+        for seed in 0..32 {
+            let mut w = world_with(vec![actor("a"), actor("b")]);
+            adjust_relationship(
+                &mut w,
+                &ActorId::new("b"),
+                &ActorId::new("a"),
+                &RelationshipDelta::new().trust(-1.0).suspicion(1.0),
+            );
+            let mut events = EventLog::new();
+            let mut rng = DeterministicRng::new(seed);
+            let out = share_claim(
+                &mut w,
+                &mut events,
+                &mut rng,
+                1,
+                480,
+                &ActorId::new("a"),
+                &ActorId::new("b"),
+                &FactId::new("f_x"),
+                true,
+            );
+            if !out.believed {
+                found_disbelief = true;
+                assert!(
+                    w.has_heard(&ActorId::new("b"), &FactId::new("f_x")),
+                    "delivery must be guaranteed even when belief fails (seed {seed})"
+                );
+            }
+        }
+        assert!(
+            found_disbelief,
+            "expected at least one seed where a distrusted speaker is not believed"
+        );
+    }
 }
