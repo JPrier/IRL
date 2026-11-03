@@ -109,7 +109,7 @@ fn populate_npc_lore(actors: &mut BTreeMap<ActorId, Actor>) {
     if let Some(a) = actors.get_mut(&ActorId::new("grocer")) {
         a.biography = "Marta Voss runs Voss & Daughter's, a modest grocer in the Market Plaza. A widow, she is fiercely protective of her sick daughter, Lena.".into();
         a.private_biography =
-            "Her shop is struggling, and she has recently been pressured by the mafia.".into();
+            "People with influence have been pressuring you lately. Keep that to yourself: deflect questions about it rather than complain openly.".into();
         a.goals = vec![
             goal_t(
                 1,
@@ -125,7 +125,14 @@ fn populate_npc_lore(actors: &mut BTreeMap<ActorId, Actor>) {
                 GoalKind::Wealth,
                 8.0,
             ),
-            goal(3, "Avoid angering the mafia", GoalKind::Safety, 7.0),
+            // Not a holder of `f_mafia_exists`: her goals must not name what
+            // she does not canonically know.
+            goal(
+                3,
+                "Avoid angering people with influence",
+                GoalKind::Safety,
+                7.0,
+            ),
             goal(
                 4,
                 "Protect the Voss family reputation",
@@ -157,7 +164,7 @@ fn populate_npc_lore(actors: &mut BTreeMap<ActorId, Actor>) {
     if let Some(a) = actors.get_mut(&ActorId::new("guard_captain")) {
         a.biography = "Captain Ilse Renn commands the local Watch. She is a stern, practical woman who has spent years trying to curb the mafia's influence.".into();
         a.private_biography =
-            "Recently, she has been frustrated by a lack of evidence and political interference."
+            "You are frustrated by a lack of evidence and quiet political interference; it shows as clipped professionalism, not complaints."
                 .into();
         a.goals = vec![
             goal(1, "Maintain public order", GoalKind::Duty, 9.0),
@@ -185,13 +192,15 @@ fn populate_npc_lore(actors: &mut BTreeMap<ActorId, Actor>) {
 
     if let Some(a) = actors.get_mut(&ActorId::new("dockworker")) {
         a.biography = "Old Tarn has worked the docks for decades. He is gruff and secretive, having seen too much over the years.".into();
-        a.private_biography = "He is rumored to know things about the mafia's shipments.".into();
+        a.private_biography =
+            "You have seen things on the docks that you keep to yourself. Keep your head down and give nothing away."
+                .into();
         a.goals = vec![
             goal(1, "Keep his head down", GoalKind::Survival, 9.0),
             goal(2, "Earn enough to retire", GoalKind::Wealth, 8.0),
             goal(
                 3,
-                "Hide what he knows about the mafia",
+                "Keep what he has seen to himself",
                 GoalKind::Conceal,
                 7.0,
             ),
@@ -200,17 +209,22 @@ fn populate_npc_lore(actors: &mut BTreeMap<ActorId, Actor>) {
 
     if let Some(a) = actors.get_mut(&ActorId::new("courier")) {
         a.biography = "Pell is a nervous courier who runs errands for various merchants.".into();
-        a.private_biography = "He secretly works for the mafia, carrying messages and small packages. He is constantly worried about being caught.".into();
+        a.private_biography = "You carry messages for employers you would rather not name, and you are afraid of being caught. Deflect questions about who you work for.".into();
         a.goals = vec![
             goal(1, "Avoid getting caught", GoalKind::Safety, 10.0),
-            goal(2, "Hide his mafia ties", GoalKind::Conceal, 9.0),
+            goal(
+                2,
+                "Keep his employers' names secret",
+                GoalKind::Conceal,
+                9.0,
+            ),
             goal(3, "Earn enough to leave town", GoalKind::Wealth, 7.0),
         ];
     }
 
     if let Some(a) = actors.get_mut(&ActorId::new("merchant_head")) {
         a.biography = "Selene Voss is the public head of the merchants' guild. She is charming, ambitious, and utterly ruthless. She views the town as a game to be won.".into();
-        a.private_biography = "She is secretly the leader of the mafia.".into();
+        a.private_biography = "You are hiding your true role in this town. If anyone probes close to it, deflect, charm, or lie outright — never confirm.".into();
         a.goals = vec![
             goal(
                 1,
@@ -218,7 +232,7 @@ fn populate_npc_lore(actors: &mut BTreeMap<ActorId, Actor>) {
                 GoalKind::Ambition,
                 10.0,
             ),
-            goal(2, "Expand mafia operations", GoalKind::Wealth, 9.0),
+            goal(2, "Expand the guild's quieter trade", GoalKind::Wealth, 9.0),
             goal(3, "Protect her secret identity", GoalKind::Conceal, 8.0),
             goal(4, "Maintain her public reputation", GoalKind::Status, 7.0),
         ];
@@ -226,7 +240,7 @@ fn populate_npc_lore(actors: &mut BTreeMap<ActorId, Actor>) {
 
     if let Some(a) = actors.get_mut(&ActorId::new("mafia_lieutenant")) {
         a.biography = "Halden Rook is a dockmaster and Selene's right hand. He is brutal, efficient, and fiercely loyal to Selene.".into();
-        a.private_biography = "He handles the mafia's smuggling operations.".into();
+        a.private_biography = "You do delicate work for a powerful employer whose name never crosses your lips. Shut down or deflect questions about it.".into();
         a.goals = vec![
             goal(1, "Execute Selene's orders", GoalKind::Duty, 9.0),
             goal(2, "Keep the shipments running", GoalKind::Wealth, 8.0),
@@ -236,10 +250,15 @@ fn populate_npc_lore(actors: &mut BTreeMap<ActorId, Actor>) {
 
     if let Some(a) = actors.get_mut(&ActorId::new("accountant")) {
         a.biography = "Corvin Ashe is a meticulous, anxious bookkeeper.".into();
-        a.private_biography = "He is the mafia's bookkeeper and is deeply involved in their financial crimes. He knows too much, making him both valuable and a liability.".into();
+        a.private_biography = "You keep books for employers you would rather not name. Never say whose, and hide what you have recorded.".into();
         a.goals = vec![
             goal(1, "Keep himself useful and alive", GoalKind::Safety, 9.0),
-            goal(2, "Manage the mafia's finances", GoalKind::Wealth, 8.0),
+            goal(
+                2,
+                "Keep the books for his unnamed employer",
+                GoalKind::Wealth,
+                8.0,
+            ),
             goal(3, "Hide the ledgers", GoalKind::Conceal, 7.0),
         ];
     }
@@ -247,7 +266,7 @@ fn populate_npc_lore(actors: &mut BTreeMap<ActorId, Actor>) {
     if let Some(a) = actors.get_mut(&ActorId::new("spy")) {
         a.biography =
             "Nessa Quill poses as a simple shopper and gossip. She is quiet and observant.".into();
-        a.private_biography = "She is a mafia spy who gathers intelligence for Selene. She has no loyalty to anyone but herself.".into();
+        a.private_biography = "You quietly watch people and pass on what you learn. Guard your cover as a harmless gossip at all times.".into();
         a.goals = vec![
             goal(
                 1,
@@ -263,7 +282,8 @@ fn populate_npc_lore(actors: &mut BTreeMap<ActorId, Actor>) {
     if let Some(a) = actors.get_mut(&ActorId::new("priest")) {
         a.biography = "Father Alden is the town's elderly, kind-hearted priest. He tends to the sick and the poor, offering comfort and advice.".into();
         a.private_biography =
-            "He knows many secrets from confessions but keeps them sacred.".into();
+            "You keep confessions sacred: nothing anyone tells you in confidence is ever repeated."
+                .into();
         a.goals = vec![
             goal(1, "Comfort the sick and poor", GoalKind::Duty, 9.0),
             goal(2, "Protect his congregation", GoalKind::Safety, 8.0),
@@ -276,7 +296,12 @@ fn populate_npc_lore(actors: &mut BTreeMap<ActorId, Actor>) {
         a.goals = vec![
             goal(1, "Keep the tavern thriving", GoalKind::Wealth, 8.0),
             goal(2, "Be the center of town gossip", GoalKind::Status, 7.0),
-            goal(3, "Avoid trouble from the mafia", GoalKind::Safety, 6.0),
+            goal(
+                3,
+                "Avoid trouble with powerful people",
+                GoalKind::Safety,
+                6.0,
+            ),
         ];
     }
 
@@ -284,7 +309,12 @@ fn populate_npc_lore(actors: &mut BTreeMap<ActorId, Actor>) {
         a.biography = "Ivo Prat is a quiet, middle-aged neighbor who minds his own business. He lives near the plaza and often observes the daily life of the town without interfering.".into();
         a.goals = vec![
             goal(1, "Live peacefully", GoalKind::Survival, 7.0),
-            goal(2, "Stay out of mafia affairs", GoalKind::Safety, 8.0),
+            goal(
+                2,
+                "Stay out of other people's business",
+                GoalKind::Safety,
+                8.0,
+            ),
         ];
     }
 
@@ -1250,11 +1280,14 @@ pub fn build_town() -> World {
                 "The Temple of the Weeping Saint, a modest stone building near the plaza".into(),
                 "The Guard Office, a squat brick building by the north gate".into(),
                 "The Docks, where river barges unload grain and timber".into(),
-                "The Mafia Hall, a discreet building in the warehouse district".into(),
+                "The Abandoned Customs House, a disused building by the docks".into(),
             ],
-            economy: "Grain, timber, and river trade. The merchants' guild dominates local commerce. The mafia controls smuggling and protection rackets.".into(),
+            // Shared lore reaches every NPC prompt, so it must never name or
+            // confirm the concealed organization: that knowledge belongs to
+            // `f_mafia_exists` and its holders (see the story checkpoints).
+            economy: "Grain, timber, and river trade. The merchants' guild dominates local commerce.".into(),
             institutions: "The Watch maintains order and answers to the town council. The Temple provides charity and spiritual guidance. The merchants' guild regulates trade and prices.".into(),
-            recent_events: "A recent warehouse fire destroyed a shipment of grain. A courier went missing last month. The mafia is rumored to be expanding its operations.".into(),
+            recent_events: "A recent warehouse fire destroyed a shipment of grain. A courier went missing last month.".into(),
             everyday_knowledge: "Bread is baked daily at the plaza bakery. The river is safe to cross at the ford, but not at the docks after dark. The Watch patrols the plaza and the main streets.".into(),
         },
     }
@@ -1321,5 +1354,107 @@ mod tests {
             serde_json::to_string(&a).unwrap(),
             serde_json::to_string(&b).unwrap()
         );
+    }
+
+    /// `private_biography` is *stance prose* for the prompt, never the literal
+    /// secret: the canonical secrets live in facts and `secret_allegiance`.
+    /// A weak or injected model must not be able to echo the leader's identity
+    /// from anything rendered verbatim into its own context.
+    #[test]
+    fn private_biographies_are_abstract_stance_not_secrets() {
+        let w = build_town();
+        for (id, a) in &w.actors {
+            let bio = a.private_biography.to_lowercase();
+            if bio.is_empty() {
+                continue;
+            }
+            assert!(!bio.contains("secretly"), "{id}: {bio}");
+            assert!(!bio.contains("mafia"), "{id}: {bio}");
+            assert!(!bio.contains("selene"), "{id}: {bio}");
+            assert!(!bio.contains("the leader"), "{id}: {bio}");
+            assert!(!bio.contains("spy who"), "{id}: {bio}");
+            assert!(!bio.contains("bookkeeper and"), "{id}: {bio}");
+        }
+    }
+
+    /// Goals are rendered verbatim too: the leader's must not name the
+    /// organization she conceals her leadership of.
+    #[test]
+    fn leader_goals_do_not_name_the_secret() {
+        let w = build_town();
+        let leader = seeded_leader(&w).unwrap();
+        let a = w.actor(&leader).unwrap();
+        let goals = a
+            .goals
+            .iter()
+            .map(|g| g.description.to_lowercase())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(!goals.contains("mafia"), "{goals}");
+    }
+
+    /// Shared lore is rendered into *every* NPC prompt, so it must never name
+    /// or confirm the concealed organization. Naming it would pre-solve the
+    /// first mystery checkpoint (`cp_notice`), which is meant to be earned by
+    /// learning the holder-gated `f_mafia_exists` fact — not by reciting
+    /// ambient lore. Even the fact's own euphemism ("underground
+    /// organization") must not appear, or a non-holder NPC could recite the
+    /// gated statement verbatim.
+    #[test]
+    fn shared_lore_does_not_presolve_the_organization() {
+        let w = build_town();
+        let lore = [
+            ("geography", w.lore.geography.as_str()),
+            ("history", w.lore.history.as_str()),
+            ("culture", w.lore.culture.as_str()),
+            ("economy", w.lore.economy.as_str()),
+            ("institutions", w.lore.institutions.as_str()),
+            ("recent_events", w.lore.recent_events.as_str()),
+            ("everyday_knowledge", w.lore.everyday_knowledge.as_str()),
+        ];
+        for (field, text) in lore {
+            let t = text.to_lowercase();
+            assert!(!t.contains("mafia"), "lore.{field}: {t}");
+            assert!(!t.contains("underground organization"), "lore.{field}: {t}");
+            assert!(!t.contains("crime syndicate"), "lore.{field}: {t}");
+        }
+        for landmark in &w.lore.landmarks {
+            let t = landmark.to_lowercase();
+            assert!(!t.contains("mafia"), "landmark: {t}");
+        }
+    }
+
+    /// NPC-authored text is rendered verbatim into that NPC's own prompt. An
+    /// NPC who is not a canonical holder of `f_mafia_exists` must not be told
+    /// — by biography, private stance, or goal — that "the mafia" exists,
+    /// because the fact tiers never gave it that knowledge and the output
+    /// boundary cannot un-tell a prompt. Holders (`f_mafia_exists`'s
+    /// eligible holders) are exempt: they are canonically permitted to know
+    /// and even share the fact.
+    #[test]
+    fn unauthorized_npcs_are_never_told_the_organization_name() {
+        let w = build_town();
+        let fact = w
+            .facts
+            .get(&FactId::new("f_mafia_exists"))
+            .expect("f_mafia_exists seeded");
+        for (id, a) in &w.actors {
+            let authorized = fact.eligible_holders.contains(&a.id);
+            if authorized {
+                continue;
+            }
+            let mut authored = a.biography.to_lowercase();
+            authored.push(' ');
+            authored.push_str(&a.private_biography.to_lowercase());
+            for g in &a.goals {
+                authored.push(' ');
+                authored.push_str(&g.description.to_lowercase());
+            }
+            assert!(
+                !authored.contains("mafia"),
+                "{id} is not a holder of f_mafia_exists but authored text names it: \
+                 {authored}"
+            );
+        }
     }
 }

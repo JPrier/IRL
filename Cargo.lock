@@ -5318,6 +5318,7 @@ dependencies = [
 name = "rpg_agents"
 version = "0.1.0"
 dependencies = [
+ "rpg_content",
  "rpg_domain",
  "rpg_narrative",
  "rpg_social",
@@ -5416,6 +5417,7 @@ dependencies = [
 name = "rpg_persistence"
 version = "0.1.0"
 dependencies = [
+ "rpg_agents",
  "rpg_content",
  "rpg_domain",
  "rpg_sim",

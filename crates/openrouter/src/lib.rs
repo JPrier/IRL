@@ -60,6 +60,14 @@ pub const APP_TITLE: &str = "IRL";
 /// Environment variable the native client reads the key from.
 pub const API_KEY_ENV: &str = "OPENROUTER_API_KEY";
 
+/// The built-in `reasoning.effort`: a request to skip reasoning, sent to
+/// models the catalog confirms support it. It is an optimization, never a
+/// requirement: [`adapt_to_model`] drops it when reasoning support cannot be
+/// confirmed (so it never narrows `require_parameters` routing), and
+/// mandatory-reasoning models — whose catalog entry documents that `effort:
+/// "none"` is rejected — never receive it.
+pub const DEFAULT_REASONING_EFFORT: &str = "none";
+
 // ---------------------------------------------------------------------------
 // Credentials
 // ---------------------------------------------------------------------------
@@ -198,6 +206,15 @@ pub struct OpenRouterConfig {
     /// Whole-request deadline.
     pub timeout_ms: u64,
     /// Optional `reasoning.effort` for reasoning models (e.g. `"low"`).
+    ///
+    /// The config stores only the effort value, so the built-in default
+    /// ([`DEFAULT_REASONING_EFFORT`] = `"none"`) and an explicitly
+    /// configured `"none"` are indistinguishable and behave identically:
+    /// [`adapt_to_model`] drops the value when the catalog cannot confirm
+    /// reasoning support, and for mandatory-reasoning models (which reject
+    /// `effort: "none"` outright), so it never narrows `require_parameters`
+    /// routing. Any other explicitly configured effort is kept even then —
+    /// choosing it is a deliberate routing trade-off.
     pub reasoning_effort: Option<String>,
     /// Optional `HTTP-Referer` attribution header (native only; browsers set
     /// their own `Referer`).
@@ -225,10 +242,11 @@ impl Default for OpenRouterConfig {
             structured: StructuredMode::JsonSchema,
             stream: true,
             timeout_ms: 40_000,
-            // Simple dialogue does not benefit from hidden reasoning. Models
-            // that support it are asked to skip it; unsupported models ignore
-            // the field.
-            reasoning_effort: Some("none".into()),
+            // Simple dialogue does not benefit from hidden reasoning. A
+            // model the catalog confirms supports it is asked to skip it;
+            // `adapt_to_model` drops the default everywhere else, so
+            // unknown or unsupported models see no `reasoning` field at all.
+            reasoning_effort: Some(DEFAULT_REASONING_EFFORT.into()),
             referer: None,
             title: APP_TITLE.into(),
             budget: Budget::default(),
@@ -808,6 +826,24 @@ impl UsageMeter {
 // Model catalog and key info
 // ---------------------------------------------------------------------------
 
+/// The catalog's per-model `reasoning` object (`GET /models`). Describes
+/// which effort levels a model accepts and whether reasoning is mandatory.
+/// The catalog omits the field for non-reasoning and dynamic-router models.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ModelReasoning {
+    /// When true, reasoning cannot be disabled: the catalog documents that
+    /// `effort: "none"` is rejected, so [`adapt_to_model`] never sends it.
+    #[serde(default)]
+    pub mandatory: bool,
+    /// Effort values the model accepts, highest first. `None` means no
+    /// allowlist (every gateway effort is accepted), or the field was absent.
+    pub supported_efforts: Option<Vec<String>>,
+    /// Effort to pre-select when enabling reasoning without specifying one.
+    pub default_effort: Option<String>,
+    /// Whether reasoning is on when the request does not say.
+    pub default_enabled: Option<bool>,
+}
+
 /// One entry of `GET /models`.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModelInfo {
@@ -819,6 +855,8 @@ pub struct ModelInfo {
     /// USD per completion token.
     pub completion_price: Option<f64>,
     pub supported_parameters: Vec<String>,
+    /// The model's `reasoning` metadata, when the catalog provides it.
+    pub reasoning: Option<ModelReasoning>,
 }
 
 impl ModelInfo {
@@ -882,6 +920,22 @@ pub fn parse_models(body: &str) -> Result<Vec<ModelInfo>, OpenRouterError> {
                             .collect()
                     })
                     .unwrap_or_default(),
+                reasoning: m.get("reasoning").map(|r| ModelReasoning {
+                    mandatory: r.get("mandatory").and_then(Value::as_bool).unwrap_or(false),
+                    supported_efforts: r.get("supported_efforts").and_then(Value::as_array).map(
+                        |a| {
+                            a.iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_string)
+                                .collect()
+                        },
+                    ),
+                    default_effort: r
+                        .get("default_effort")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    default_enabled: r.get("default_enabled").and_then(Value::as_bool),
+                }),
                 id,
             })
         })
@@ -905,6 +959,17 @@ pub fn check_model(model: &ModelInfo, cfg: &OpenRouterConfig) -> Result<(), Open
 /// route to. Returns the names of the parameters that were dropped or
 /// renamed. Structured outputs are never dropped silently: an unsupported
 /// model is an error (see [`check_model`]).
+///
+/// For a catalog entry without `supported_parameters` (empty metadata),
+/// reasoning support cannot be confirmed, so the built-in default
+/// [`DEFAULT_REASONING_EFFORT`] is dropped there — it is an optimization,
+/// never a requirement, and sending it to a model of unknown reasoning
+/// support could otherwise narrow (or, with `require_parameters`, empty) the
+/// endpoint set. The drop checks are value-based and the default is `"none"`,
+/// so an explicitly configured `"none"` is indistinguishable from the default
+/// and is dropped the same way (also on mandatory-reasoning models, which
+/// reject `effort: "none"` outright). Any other explicitly configured effort
+/// is honoured: choosing it is the user's routing trade-off.
 pub fn adapt_to_model(
     cfg: &mut OpenRouterConfig,
     model: &ModelInfo,
@@ -912,7 +977,11 @@ pub fn adapt_to_model(
     check_model(model, cfg)?;
     let mut changed = Vec::new();
     if model.supported_parameters.is_empty() {
-        return Ok(changed); // catalog says nothing; send the defaults
+        if cfg.reasoning_effort.as_deref() == Some(DEFAULT_REASONING_EFFORT) {
+            cfg.reasoning_effort = None;
+            changed.push("reasoning".into());
+        }
+        return Ok(changed);
     }
     if cfg.send_seed && !model.supports("seed") {
         cfg.send_seed = false;
@@ -922,9 +991,18 @@ pub fn adapt_to_model(
         cfg.send_temperature = false;
         changed.push("temperature".into());
     }
-    if cfg.reasoning_effort.is_some() && !model.supports("reasoning") {
-        cfg.reasoning_effort = None;
-        changed.push("reasoning".into());
+    if let Some(effort) = &cfg.reasoning_effort {
+        // A model that does not list `reasoning`, and a mandatory-reasoning
+        // model — which rejects `effort: "none"` outright — both get no
+        // `reasoning` field at all: omitting it is always accepted, and for
+        // mandatory models the model simply reasons by default.
+        let unsupported = !model.supports("reasoning")
+            || (effort == DEFAULT_REASONING_EFFORT
+                && model.reasoning.as_ref().is_some_and(|r| r.mandatory));
+        if unsupported {
+            cfg.reasoning_effort = None;
+            changed.push("reasoning".into());
+        }
     }
     if !model.supports(&cfg.max_tokens_param) {
         if let Some(alt) = ["max_tokens", "max_completion_tokens"]
@@ -1233,6 +1311,236 @@ mod tests {
             ),
             OpenRouterError::BadRequest(_)
         ));
+    }
+
+    /// Known metadata that affirms every parameter: the defaults survive
+    /// adaptation untouched, including the reasoning effort.
+    #[test]
+    fn known_supported_metadata_keeps_the_reasoning_default() {
+        let model = ModelInfo {
+            id: "r/full".into(),
+            supported_parameters: vec![
+                "response_format".into(),
+                "structured_outputs".into(),
+                "reasoning".into(),
+                "seed".into(),
+                "temperature".into(),
+                "max_tokens".into(),
+            ],
+            reasoning: Some(ModelReasoning {
+                mandatory: false,
+                supported_efforts: Some(vec![
+                    "max".into(),
+                    "high".into(),
+                    "medium".into(),
+                    "low".into(),
+                    "none".into(),
+                ]),
+                ..ModelReasoning::default()
+            }),
+            ..ModelInfo::default()
+        };
+        let mut cfg = OpenRouterConfig::default();
+        let changed = adapt_to_model(&mut cfg, &model).unwrap();
+        assert!(changed.is_empty(), "{changed:?}");
+        let body = chat_body(&cfg, &req(), false);
+        assert_eq!(body["reasoning"]["effort"], DEFAULT_REASONING_EFFORT);
+        assert_eq!(body["response_format"]["type"], "json_schema");
+        assert_eq!(body["provider"]["require_parameters"], true);
+        assert_eq!(body["seed"], 7);
+        assert_eq!(body["temperature"], 0.0);
+        assert_eq!(body["max_tokens"], 160);
+    }
+
+    /// A mandatory-reasoning model accepts any effort but rejects `none`
+    /// (the catalog documents this). The default effort is therefore dropped
+    /// and the model simply reasons by default; an explicit effort other
+    /// than `none` is kept.
+    #[test]
+    fn mandatory_reasoning_models_never_receive_effort_none() {
+        let model = || ModelInfo {
+            id: "a/mandatory".into(),
+            supported_parameters: vec![
+                "response_format".into(),
+                "structured_outputs".into(),
+                "reasoning".into(),
+                "seed".into(),
+                "temperature".into(),
+                "max_tokens".into(),
+            ],
+            reasoning: Some(ModelReasoning {
+                mandatory: true,
+                ..ModelReasoning::default()
+            }),
+            ..ModelInfo::default()
+        };
+        let mut cfg = OpenRouterConfig::default();
+        let changed = adapt_to_model(&mut cfg, &model()).unwrap();
+        assert_eq!(changed, vec!["reasoning".to_string()], "{changed:?}");
+        assert!(cfg.reasoning_effort.is_none());
+        let body = chat_body(&cfg, &req(), false);
+        assert!(body.get("reasoning").is_none(), "{body}");
+        // The structured-output requirement is untouched.
+        assert_eq!(body["response_format"]["type"], "json_schema");
+        assert_eq!(body["provider"]["require_parameters"], true);
+
+        let mut explicit = OpenRouterConfig {
+            reasoning_effort: Some("low".into()),
+            ..OpenRouterConfig::default()
+        };
+        let changed = adapt_to_model(&mut explicit, &model()).unwrap();
+        assert!(changed.is_empty(), "{changed:?}");
+        assert_eq!(
+            chat_body(&explicit, &req(), false)["reasoning"]["effort"],
+            "low"
+        );
+    }
+
+    /// A catalog entry with no `supported_parameters` cannot confirm any
+    /// optional parameter. The built-in default reasoning effort is dropped
+    /// instead of restricting routing; an explicit effort other than `none`
+    /// survives; the structured-output requirement is unchanged.
+    #[test]
+    fn absent_metadata_drops_the_default_reasoning_but_keeps_explicit() {
+        let model = ModelInfo {
+            id: "x/unknown".into(),
+            ..ModelInfo::default()
+        };
+        // Strict schema mode still refuses a metadata-blind model outright:
+        // structured-output support cannot be verified.
+        let mut strict = OpenRouterConfig::default();
+        assert!(matches!(
+            adapt_to_model(&mut strict, &model),
+            Err(OpenRouterError::StructuredUnsupported(_))
+        ));
+
+        let mut cfg = OpenRouterConfig {
+            structured: StructuredMode::JsonObject,
+            ..OpenRouterConfig::default()
+        };
+        let changed = adapt_to_model(&mut cfg, &model).unwrap();
+        assert_eq!(changed, vec!["reasoning".to_string()], "{changed:?}");
+        let body = chat_body(&cfg, &req(), false);
+        assert!(body.get("reasoning").is_none(), "{body}");
+        // Everything else keeps the shape it had before this policy.
+        assert_eq!(body["response_format"]["type"], "json_object");
+        assert!(body.get("provider").is_none());
+        assert_eq!(body["seed"], 7);
+        assert_eq!(body["temperature"], 0.0);
+        assert_eq!(body["max_tokens"], 160);
+
+        let mut explicit = OpenRouterConfig {
+            structured: StructuredMode::JsonObject,
+            reasoning_effort: Some("low".into()),
+            ..OpenRouterConfig::default()
+        };
+        let changed = adapt_to_model(&mut explicit, &model).unwrap();
+        assert!(changed.is_empty(), "{changed:?}");
+        assert_eq!(
+            chat_body(&explicit, &req(), false)["reasoning"]["effort"],
+            "low"
+        );
+    }
+
+    /// Effort is stored as a plain value, so an explicitly assigned `"none"`
+    /// is indistinguishable from the built-in default and is dropped exactly
+    /// where the default is dropped: on mandatory-reasoning models and on
+    /// metadata-blind entries. On a model that lists `reasoning`, the
+    /// explicit value is sent as usual.
+    #[test]
+    fn explicit_effort_none_is_indistinguishable_from_the_default() {
+        let mandatory = ModelInfo {
+            id: "a/mandatory".into(),
+            supported_parameters: vec![
+                "response_format".into(),
+                "structured_outputs".into(),
+                "reasoning".into(),
+                "seed".into(),
+                "temperature".into(),
+                "max_tokens".into(),
+            ],
+            reasoning: Some(ModelReasoning {
+                mandatory: true,
+                ..ModelReasoning::default()
+            }),
+            ..ModelInfo::default()
+        };
+        let mut cfg = OpenRouterConfig {
+            reasoning_effort: Some(DEFAULT_REASONING_EFFORT.into()),
+            ..OpenRouterConfig::default()
+        };
+        let changed = adapt_to_model(&mut cfg, &mandatory).unwrap();
+        assert_eq!(changed, vec!["reasoning".to_string()], "{changed:?}");
+        assert!(cfg.reasoning_effort.is_none());
+        assert!(chat_body(&cfg, &req(), false).get("reasoning").is_none());
+
+        let blind = ModelInfo {
+            id: "x/unknown".into(),
+            ..ModelInfo::default()
+        };
+        let mut cfg = OpenRouterConfig {
+            reasoning_effort: Some(DEFAULT_REASONING_EFFORT.into()),
+            structured: StructuredMode::JsonObject,
+            ..OpenRouterConfig::default()
+        };
+        let changed = adapt_to_model(&mut cfg, &blind).unwrap();
+        assert_eq!(changed, vec!["reasoning".to_string()], "{changed:?}");
+        assert!(cfg.reasoning_effort.is_none());
+
+        let supported = ModelInfo {
+            id: "r/full".into(),
+            supported_parameters: vec![
+                "response_format".into(),
+                "structured_outputs".into(),
+                "reasoning".into(),
+                "seed".into(),
+                "temperature".into(),
+                "max_tokens".into(),
+            ],
+            ..ModelInfo::default()
+        };
+        let mut cfg = OpenRouterConfig {
+            reasoning_effort: Some(DEFAULT_REASONING_EFFORT.into()),
+            ..OpenRouterConfig::default()
+        };
+        let changed = adapt_to_model(&mut cfg, &supported).unwrap();
+        assert!(changed.is_empty(), "{changed:?}");
+        assert_eq!(
+            chat_body(&cfg, &req(), false)["reasoning"]["effort"],
+            DEFAULT_REASONING_EFFORT
+        );
+    }
+
+    /// The per-model `reasoning` object is parsed (and tolerated when
+    /// absent, partially filled, or null-listed), and an entry without
+    /// `supported_parameters` yields the absent-metadata case.
+    #[test]
+    fn model_reasoning_metadata_is_parsed_from_the_catalog() {
+        let body = r#"{"data":[
+            {"id":"a/mand","reasoning":{"mandatory":true,
+                "supported_efforts":["high","medium"],"default_effort":"high",
+                "default_enabled":true},
+             "supported_parameters":["reasoning","max_tokens"]},
+            {"id":"b/listless","reasoning":{"mandatory":false,"supported_efforts":null},
+             "supported_parameters":["reasoning","max_tokens"]},
+            {"id":"c/no-reasoning","supported_parameters":["max_tokens"]},
+            {"id":"d/no-params","supported_parameters":[]}]}"#;
+        let models = parse_models(body).unwrap();
+        assert_eq!(models.len(), 4);
+        let mand = models[0].reasoning.as_ref().unwrap();
+        assert!(mand.mandatory);
+        assert_eq!(
+            mand.supported_efforts,
+            Some(vec!["high".into(), "medium".into()])
+        );
+        assert_eq!(mand.default_effort.as_deref(), Some("high"));
+        assert_eq!(mand.default_enabled, Some(true));
+        let listless = models[1].reasoning.as_ref().unwrap();
+        assert!(!listless.mandatory);
+        assert_eq!(listless.supported_efforts, None);
+        assert!(models[2].reasoning.is_none());
+        assert!(models[3].supported_parameters.is_empty());
+        assert!(models[3].reasoning.is_none());
     }
 
     #[test]

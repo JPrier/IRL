@@ -257,11 +257,12 @@ pub struct Actor {
     /// persona: safe to render into prompts and to share in ordinary speech.
     #[serde(default)]
     pub biography: String,
-    /// Information the actor knows but must not share freely: hidden
-    /// allegiances, secret identities, protected confessions. It informs
-    /// behaviour (evasion, deflection, bargaining) but is never a permitted
-    /// public assertion, so it is rendered separately from the public
-    /// biography and kept out of ordinary spoken lines.
+    /// Authored behaviour guidance the actor keeps private: what it deflects,
+    /// who it protects, what it conceals. This is *stance prose*, deliberately
+    /// not the literal secret — canonical secrets live in facts (holders +
+    /// sensitivity) and in `secret_allegiance`. Prompt rendering treats this as
+    /// guidance the actor may act on but never quote, so a model cannot leak
+    /// what it was never told.
     #[serde(default)]
     pub private_biography: String,
     pub affiliations: Vec<FactionId>,
@@ -287,6 +288,20 @@ pub struct Actor {
 impl Actor {
     pub fn is_alive(&self) -> bool {
         self.status == ActorStatus::Alive
+    }
+
+    /// The public biography as rendered into model prompts.
+    ///
+    /// This is *not* a sanitizer: it simply returns the authored public
+    /// persona, which is authored content that is safe to share in ordinary
+    /// speech by construction. The structural boundaries live elsewhere — the
+    /// prompt renderer never quotes [`Actor::private_biography`] (only its
+    /// presence is signalled as deflection guidance), and the persistence
+    /// layer sanitizes legacy saves whose `private_biography` still carried
+    /// literal secrets. Kept as a named seam so prompt renderers have one
+    /// obvious, single field to draw the character's public background from.
+    pub fn safe_biography(&self) -> String {
+        self.biography.clone()
     }
 
     pub fn has_flag(&self, f: &str) -> bool {

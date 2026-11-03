@@ -6,6 +6,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use rpg_domain::ids::{ActorId, PLAYER};
 use rpg_domain::ports::{InferenceError, InferenceResponse, RemoteProvenance};
 use rpg_eval::Session;
 use rpg_runtime::*;
@@ -319,4 +320,105 @@ fn delayed_duplicate_and_cancelled_answers_commit_at_most_once() {
     c.handle(done(&job, answer()), ms(31_500));
     assert_eq!(c.session.sim.events.len(), events);
     assert_eq!(c.counters().stale_responses, 2);
+}
+
+/// The import path (the browser's "paste a save" flow) must apply the legacy
+/// (v1) privacy migration: raw private biographies are cleared and
+/// organization-revealing authored text is scrubbed before anything reaches
+/// the restored world or a prompt.
+#[test]
+fn importing_a_legacy_save_applies_the_privacy_migration() {
+    let mut c = core();
+    let json = exported(&mut c);
+
+    // Turn the exported (v2) save into a representative legacy one: bump it
+    // back to v1 and inject the pre-repurposing authored content — a raw
+    // secret biography and an organization-naming goal/lore sentence.
+    let mut v: serde_json::Value = serde_json::from_str(&json).expect("exported save parses");
+    v["version"] = serde_json::json!(rpg_persistence::LEGACY_SAVE_VERSION);
+    let tavern = v
+        .pointer_mut("/world/actors/tavern_keeper")
+        .expect("tavern keeper in save");
+    tavern["private_biography"] = serde_json::json!("She is secretly the leader of the mafia.");
+    tavern["goals"] = serde_json::json!([
+        {
+            "id": 90,
+            "description": "Avoid trouble from the mafia",
+            "kind": "Safety",
+            "priority": 6.0,
+            "status": "Active",
+        },
+        {
+            "id": 91,
+            "description": "Tend the orchard",
+            "kind": "Safety",
+            "priority": 6.0,
+            "status": "Active",
+        }
+    ]);
+    v["world"]["lore"]["recent_events"] = serde_json::json!(
+        "A recent warehouse fire destroyed a shipment of grain. A courier went \
+         missing last month. The mafia is rumored to be expanding its \
+         operations."
+    );
+    let legacy = v.to_string();
+
+    c.handle(
+        Inbox::Ui(Command::ImportSave {
+            label: "legacy import".into(),
+            json: legacy,
+        }),
+        ms(0),
+    );
+    assert!(c
+        .dialogue()
+        .iter()
+        .any(|l| l.text.contains("loaded from legacy import")));
+
+    let world = &c.session.sim.world;
+    let tavern = world.actor(&ActorId::new("tavern_keeper")).unwrap();
+    assert_eq!(
+        tavern.private_biography, "",
+        "raw secret biography must be structurally cleared on import"
+    );
+    let goals: Vec<&str> = tavern
+        .goals
+        .iter()
+        .map(|g| g.description.as_str())
+        .collect();
+    assert!(
+        !goals.iter().any(|d| d.contains("mafia")),
+        "the organization-naming goal must be dropped on import: {goals:?}"
+    );
+    assert!(
+        goals.contains(&"Tend the orchard"),
+        "unrelated goals must survive: {goals:?}"
+    );
+    assert!(
+        !world.lore.recent_events.contains("mafia"),
+        "the lore sentence naming the organization must be scrubbed: {}",
+        world.lore.recent_events
+    );
+    assert!(
+        world
+            .lore
+            .recent_events
+            .contains("A courier went missing last month."),
+        "unrelated lore sentences must survive: {}",
+        world.lore.recent_events
+    );
+
+    // And no prompt of an unauthorized actor names it.
+    let prompt = rpg_agents::render_npc_context(
+        world,
+        &ActorId::new("tavern_keeper"),
+        &ActorId::new(PLAYER),
+        "Hello",
+        &[],
+    );
+    assert!(
+        !prompt.to_lowercase().contains("mafia"),
+        "the imported tavern keeper's prompt must not name the concealed \
+         organization"
+    );
 }

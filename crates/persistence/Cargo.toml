@@ -20,4 +20,5 @@ rusqlite.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+rpg_agents.workspace = true
 rpg_content.workspace = true

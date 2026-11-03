@@ -6,6 +6,19 @@
 //! briefly, then cool down and return to its routine. Selection is purely
 //! deterministic and local — no model calls, no per-tick inference.
 //!
+//! Pursuits are *gate-then-record*: this module returns fresh pursuits as
+//! candidates ([`AutonomyProposal`]) and the caller records them
+//! ([`Simulation::commit_pursuit`]) only after its at-post gate accepts the
+//! proposal. A pursuit recorded for a rejected proposal would suppress the
+//! actor's schedule from the next tick on and its deadline — estimated from
+//! a position the actor never leaves from — could expire mid-walk.
+//!
+//! Arrival actions are meaningful but bounded. An `Investigate` goal acts
+//! once per site (then the yo-yo guard settles the actor). A `Protect` goal
+//! performs a single comfort check-in on its ward per visit, recorded in
+//! [`GoalAutonomy::tended`]: the goal is re-pursued only when the ward has
+//! moved since, so a protector does not loop away from its post forever.
+//!
 //! Conversation preservation is a hard rule: an actor within talk range of
 //! the player, in a private conversation, or already walking is never
 //! redirected by autonomy.
@@ -27,6 +40,19 @@ pub struct Pursuit {
     pub until_tick: u64,
 }
 
+/// A goal-autonomy proposal together with the pursuit it would newly commit.
+///
+/// `pursuit` is `Some` only for *fresh* pursuits: the commitment the caller
+/// must record via [`Simulation::commit_pursuit`] once its gate accepts the
+/// proposal. Continuations of already-committed pursuits (re-proposed walks
+/// and arrival actions) carry `None`; the goal layer owns those turns and the
+/// caller applies them unconditionally.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AutonomyProposal {
+    pub proposal: ActionProposal,
+    pub pursuit: Option<Pursuit>,
+}
+
 /// Transient autonomy state. Persisted for exact continuation but carries no
 /// canonical world truth: it only schedules and paces autonomous pursuits.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -35,6 +61,13 @@ pub struct GoalAutonomy {
     pub pursuing: BTreeMap<ActorId, Pursuit>,
     /// ActorId -> tick until which goal autonomy is paused.
     pub cooldowns: BTreeMap<ActorId, u64>,
+    /// ActorId -> (goal id -> location where that goal's ward was last
+    /// tended). Bounded protection: a Protect goal whose ward still stands
+    /// where they were last checked in is done for this pass — walking out
+    /// again would empty the protector's post in a loop. A ward who has
+    /// moved re-opens the goal.
+    #[serde(default)]
+    pub tended: BTreeMap<ActorId, BTreeMap<u64, LocationId>>,
 }
 
 impl GoalAutonomy {
@@ -53,10 +86,19 @@ impl Simulation {
     /// Deterministic goal proposals for actors that would otherwise idle.
     ///
     /// Called from `step_impl` after routine proposals; it *replaces* the
-    /// routine `Idle` for an actor when it has something better to do. This
-    /// method mutates the pursuit/cooldown state (expiring stale pursuits,
-    /// committing to new ones) as a side effect.
-    pub fn autonomy_proposals(&mut self, already_acted: &BTreeSet<ActorId>) -> Vec<ActionProposal> {
+    /// routine `Idle` for an actor when it has something better to do.
+    ///
+    /// Mutations performed here are limited to expiring stale pursuits and
+    /// cooldowns. A *fresh* pursuit is returned as a candidate
+    /// ([`AutonomyProposal::pursuit`]) and is NOT recorded: the caller
+    /// commits it with [`Simulation::commit_pursuit`] only after its own
+    /// gate (the at-post check) accepts the proposal. Recording earlier
+    /// would let a rejected pursuit suppress the actor's schedule from the
+    /// next tick and expire mid-walk.
+    pub fn autonomy_proposals(
+        &mut self,
+        already_acted: &BTreeSet<ActorId>,
+    ) -> Vec<AutonomyProposal> {
         if !self.config.enable_goal_autonomy {
             return Vec::new();
         }
@@ -104,14 +146,64 @@ impl Simulation {
                             && aims_here
                             && !actor.inspected.contains(pursuit.location.as_str())
                         {
-                            out.push(ActionProposal {
-                                actor: actor.id.clone(),
-                                action: Action::Investigate {
-                                    target: InvestigateTarget::Location(pursuit.location.clone()),
+                            out.push(AutonomyProposal {
+                                proposal: ActionProposal {
+                                    actor: actor.id.clone(),
+                                    action: Action::Investigate {
+                                        target: InvestigateTarget::Location(
+                                            pursuit.location.clone(),
+                                        ),
+                                    },
+                                    source: ProposalSource::NpcPolicy,
+                                    rationale: format!("goal: {}", goal.description),
                                 },
-                                source: ProposalSource::NpcPolicy,
-                                rationale: format!("goal: {}", goal.description),
+                                pursuit: None,
                             });
+                        } else if goal.kind == GoalKind::Protect {
+                            // A protective check-in: one comfort per visit.
+                            // Pre-checked with the same rules the sim
+                            // validates (the ward must be alive and in
+                            // range), so the emitted proposal always applies;
+                            // recording the tend site here keeps the action
+                            // once-per-visit and lets the selector settle the
+                            // goal until the ward moves. A ward who died
+                            // mid-pursuit is not "checked in": the sim would
+                            // reject a Comfort addressed to the dead, and a
+                            // phantom tend record would silently settle a
+                            // goal whose ward can never move again.
+                            if let Some(ward) = goal
+                                .target_actor
+                                .as_ref()
+                                .and_then(|w| self.world.actor(w))
+                                .filter(|w| w.is_alive())
+                            {
+                                let in_range = actor.location == ward.location
+                                    && actor.pos.distance(ward.pos) <= self.config.talk_radius;
+                                let already_tended = self
+                                    .autonomy
+                                    .tended
+                                    .get(&actor.id)
+                                    .and_then(|m| m.get(&goal.id))
+                                    == Some(&ward.location);
+                                if in_range && !already_tended {
+                                    self.autonomy
+                                        .tended
+                                        .entry(actor.id.clone())
+                                        .or_default()
+                                        .insert(goal.id, ward.location.clone());
+                                    out.push(AutonomyProposal {
+                                        proposal: ActionProposal {
+                                            actor: actor.id.clone(),
+                                            action: Action::Comfort {
+                                                target: ward.id.clone(),
+                                            },
+                                            source: ProposalSource::NpcPolicy,
+                                            rationale: format!("goal: {}", goal.description),
+                                        },
+                                        pursuit: None,
+                                    });
+                                }
+                            }
                         }
                     }
                     continue;
@@ -123,13 +215,16 @@ impl Simulation {
                     .find(|g| g.id == pursuit.goal_id)
                     .map(|g| g.description.clone())
                     .unwrap_or_else(|| "pursuit".into());
-                out.push(ActionProposal {
-                    actor: actor.id.clone(),
-                    action: Action::MoveTo {
-                        location: pursuit.location.clone(),
+                out.push(AutonomyProposal {
+                    proposal: ActionProposal {
+                        actor: actor.id.clone(),
+                        action: Action::MoveTo {
+                            location: pursuit.location.clone(),
+                        },
+                        source: ProposalSource::NpcPolicy,
+                        rationale: format!("goal: {rationale}"),
                     },
-                    source: ProposalSource::NpcPolicy,
-                    rationale: format!("goal: {rationale}"),
+                    pursuit: None,
                 });
                 continue;
             }
@@ -145,27 +240,34 @@ impl Simulation {
                     .insert(actor.id.clone(), tick + cooldown_ticks);
                 continue;
             }
-            out.push(ActionProposal {
-                actor: actor.id.clone(),
-                action: Action::MoveTo {
-                    location: target.clone(),
+            // Candidate only: the caller records it after its gate accepts.
+            out.push(AutonomyProposal {
+                proposal: ActionProposal {
+                    actor: actor.id.clone(),
+                    action: Action::MoveTo {
+                        location: target.clone(),
+                    },
+                    source: ProposalSource::NpcPolicy,
+                    rationale: format!("goal: {}", goal.description),
                 },
-                source: ProposalSource::NpcPolicy,
-                rationale: format!("goal: {}", goal.description),
-            });
-            self.autonomy.pursuing.insert(
-                actor.id.clone(),
-                Pursuit {
+                pursuit: Some(Pursuit {
                     goal_id: goal.id,
                     location: target,
                     // Travel-scaled deadline: enough ticks to walk the planned
                     // path at the actor's speed, plus a pacing margin. Long
                     // hauls are not cut short; nothing lingers forever.
                     until_tick: tick + travel_ticks + margin_ticks,
-                },
-            );
+                }),
+            });
         }
         out
+    }
+
+    /// Record a fresh pursuit after the caller's gate accepted its proposal.
+    /// This is the only write path for new pursuits, so that a proposal the
+    /// gate rejected can never suppress the actor's schedule.
+    pub fn commit_pursuit(&mut self, actor: ActorId, pursuit: Pursuit) {
+        self.autonomy.pursuing.insert(actor, pursuit);
     }
 
     /// Standard eligibility guards for autonomous action. Mirrors the
@@ -232,6 +334,27 @@ impl Simulation {
                 && actor.inspected.contains(target.as_str())
             {
                 continue;
+            }
+            // Bounded protection: a ward still standing where they were last
+            // tended is checked on; re-walking would only empty the
+            // protector's post. A ward who has moved re-opens the goal.
+            if g.kind == GoalKind::Protect {
+                if let Some(ward) = &g.target_actor {
+                    if self
+                        .world
+                        .actor(ward)
+                        .map(|w| {
+                            self.autonomy
+                                .tended
+                                .get(&actor.id)
+                                .and_then(|m| m.get(&g.id))
+                                == Some(&w.location)
+                        })
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                }
             }
             let dest = self
                 .world

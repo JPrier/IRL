@@ -1167,6 +1167,20 @@ impl Simulation {
         ValidationOutcome::Accepted
     }
 
+    /// Deliberate investigation semantics (review finding: an autonomous NPC
+    /// search must never silently make quest items unavailable).
+    ///
+    /// * A *player* search of a location is a recovery: physical items left
+    ///   at the site are taken into the inventory (observable `ItemFound`).
+    /// * An *NPC* search is a look-around, not a seizure: the site is marked
+    ///   inspected and committed clue containers surface as beliefs (each an
+    ///   observable `FactBelieved` event, the player-visible signal of the
+    ///   search), but `location_items` stay where they are. Confiscating
+    ///   key ingredients is an authored obstacle ("the apothecary may refuse
+    ///   because the guard confiscated key ingredients",
+    ///   `docs/design/emergent_quest_driven_rpg_design.md`), delivered
+    ///   through authored changes — never an emergent side effect of
+    ///   autonomous walking.
     fn do_investigate(
         &mut self,
         proposal: &ActionProposal,
@@ -1179,8 +1193,17 @@ impl Simulation {
                 if let Some(a) = self.world.actor_mut(&proposal.actor) {
                     a.inspected.insert(loc.as_str().to_string());
                 }
-                // Recover any physical items left here.
-                let found = self.world.location_items.remove(&loc).unwrap_or_default();
+                // Recover any physical items left here — the player's channel
+                // only; see the deliberate-semantics doc above.
+                let is_player = self
+                    .world
+                    .actor(&proposal.actor)
+                    .is_some_and(|a| a.kind == ActorKind::Player);
+                let found = if is_player {
+                    self.world.location_items.remove(&loc).unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
                 for stack in found {
                     if let Some(a) = self.world.actor_mut(&proposal.actor) {
                         a.inventory.add(stack.item.clone(), stack.qty);
@@ -1578,19 +1601,24 @@ impl Simulation {
         // actor is at its scheduled post (routine idles) or has no schedule
         // entry; it never hijacks schedule-driven moves. Pursuing actors are
         // absent from `routine` (the goal layer owns their turns), so their
-        // re-proposed walks and arrival actions always apply.
+        // re-proposed walks and arrival actions always apply. Fresh pursuits
+        // are recorded only *after* the gate accepts them — a rejected
+        // pursuit must never suppress the schedule it lost to.
         for p in self.autonomy_proposals(&acted) {
-            let at_post = match routine.iter().find(|r| r.actor == p.actor) {
+            let at_post = match routine.iter().find(|r| r.actor == p.proposal.actor) {
                 Some(r) => matches!(r.action, Action::Idle),
                 None => true,
             };
             if !at_post {
                 continue;
             }
-            if let Some(pos) = routine.iter().position(|r| r.actor == p.actor) {
-                routine[pos] = p;
+            if let Some(pursuit) = p.pursuit {
+                self.commit_pursuit(p.proposal.actor.clone(), pursuit);
+            }
+            if let Some(pos) = routine.iter().position(|r| r.actor == p.proposal.actor) {
+                routine[pos] = p.proposal;
             } else {
-                routine.push(p);
+                routine.push(p.proposal);
             }
         }
         for p in &routine {
