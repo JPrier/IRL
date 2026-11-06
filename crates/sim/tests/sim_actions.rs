@@ -11,9 +11,9 @@ use rpg_domain::geom::{GridPos, Rect, Vec2};
 use rpg_domain::ids::*;
 use rpg_domain::social::{CommitmentState, OfferState};
 use rpg_domain::world::{
-    Actor, ActorKind, ActorStatus, Capabilities, ContainerKind, Fact, FactCategory, Inventory,
-    Item, Location, LocationKind, MysteryMode, NavGrid, Personality, Sensitivity, StoryAnchor,
-    StoryState, Tile, World,
+    Actor, ActorKind, ActorStatus, Belief, Capabilities, ContainerKind, Fact, FactCategory,
+    Inventory, Item, Location, LocationKind, MysteryMode, NavGrid, Personality, Provenance,
+    Sensitivity, StoryAnchor, StoryState, Tile, World, WorldLore,
 };
 use rpg_narrative::NarrativeChange;
 use rpg_sim::{SimConfig, Simulation};
@@ -43,6 +43,8 @@ fn actor(id: &str, kind: ActorKind, location: &str, pos: Vec2) -> Actor {
         facing: 0.0,
         personality: Personality::default(),
         values: vec![],
+        biography: String::new(),
+        private_biography: String::new(),
         affiliations: vec![],
         capabilities: Capabilities::default(),
         inventory: Inventory::default(),
@@ -90,6 +92,7 @@ pub fn test_world() -> World {
         next_offer_id: 1,
         next_rumor_id: 1,
         next_goal_id: 1,
+        lore: WorldLore::default(),
     };
     w.locations.insert(
         LocationId::new("shop"),
@@ -407,6 +410,137 @@ fn cannot_investigate_a_distant_location() {
     ));
 }
 
+// ---------------------------------------------------------------------------
+// Deliberate search semantics (PR #7 review finding #5)
+// ---------------------------------------------------------------------------
+//
+// A search that moves quest-critical items into whoever walks by would make
+// the medicine-for-ledger quest fail silently. The canonical rule: physical
+// recovery from a searched site is the player's channel; an NPC search is a
+// look-around that yields knowledge only (committed clue containers surface
+// as beliefs, each recorded as an observable `FactBelieved` event).
+// Confiscating ingredients is an authored obstacle (design doc: "the guard
+// confiscated key ingredients"), never an emergent side effect of walking.
+
+/// Place a committed clue container for the `shipment` fact at `warehouse`
+/// and drop one medicine dose there, mirroring the canonical town.
+fn seed_warehouse_clue_and_medicine(s: &mut Simulation) {
+    let mut events = rpg_domain::events::EventLog::new();
+    let decision = rpg_narrative::commit_change(
+        &mut s.world,
+        &mut events,
+        1,
+        480,
+        NarrativeChange::PlaceClue {
+            fact: FactId::new("shipment"),
+            kind: ContainerKind::Document,
+            location: Some(LocationId::new("warehouse")),
+            holder: None,
+        },
+    );
+    assert!(decision.is_accepted());
+    s.world.location_items.insert(
+        LocationId::new("warehouse"),
+        vec![rpg_domain::world::ItemStack {
+            item: ItemId::new("medicine"),
+            qty: 1,
+        }],
+    );
+}
+
+#[test]
+fn npc_investigation_is_a_search_not_a_seizure() {
+    let mut s = sim();
+    seed_warehouse_clue_and_medicine(&mut s);
+    // The guard stands in the warehouse and autonomously searches it.
+    if let Some(g) = s.world.actor_mut(&ActorId::new("guard")) {
+        g.location = LocationId::new("warehouse");
+        g.pos = Vec2::new(14.0, 3.0);
+    }
+    let out = s.apply(&ActionProposal {
+        actor: ActorId::new("guard"),
+        action: Action::Investigate {
+            target: InvestigateTarget::Location(LocationId::new("warehouse")),
+        },
+        source: ProposalSource::NpcPolicy,
+        rationale: "goal: Find evidence against the mafia".into(),
+    });
+    assert_eq!(out, ValidationOutcome::Accepted);
+
+    // The medicine is untouched and the guard took nothing.
+    let medicine_left = s
+        .world
+        .location_items
+        .get(&LocationId::new("warehouse"))
+        .map(|stacks| {
+            stacks
+                .iter()
+                .any(|st| st.item == ItemId::new("medicine") && st.qty == 1)
+        })
+        .unwrap_or(false);
+    assert!(
+        medicine_left,
+        "an NPC search must not make quest medicine unavailable"
+    );
+    let guard = s.world.actor(&ActorId::new("guard")).unwrap();
+    assert_eq!(
+        guard.inventory.quantity(&ItemId::new("medicine")),
+        0,
+        "an NPC search must not confiscate items"
+    );
+    // The search is not silent: the surfaced clue is observable as a
+    // FactBelieved event, and no ItemFound is emitted for an NPC.
+    assert!(
+        s.world
+            .believes(&ActorId::new("guard"), &FactId::new("shipment")),
+        "an NPC search still learns committed clue containers"
+    );
+    assert!(
+        s.events.all().iter().any(
+            |e| matches!(&e.kind, EventKind::FactBelieved { actor, fact, .. }
+                if actor.as_str() == "guard" && fact.as_str() == "shipment")
+        ),
+        "the knowledge the search surfaced must be an observable event"
+    );
+    assert!(
+        !s.events
+            .all()
+            .iter()
+            .any(|e| matches!(&e.kind, EventKind::ItemFound { .. })),
+        "an NPC search must not report recovering items"
+    );
+}
+
+#[test]
+fn player_investigation_recovers_location_items() {
+    let mut s = sim();
+    seed_warehouse_clue_and_medicine(&mut s);
+    if let Some(p) = s.world.actor_mut(&ActorId::new(PLAYER)) {
+        p.location = LocationId::new("warehouse");
+        p.pos = Vec2::new(14.0, 3.0);
+    }
+    assert_eq!(
+        s.apply(&proposal(
+            PLAYER,
+            Action::Investigate {
+                target: InvestigateTarget::Location(LocationId::new("warehouse")),
+            }
+        )),
+        ValidationOutcome::Accepted
+    );
+    assert!(
+        !s.world
+            .location_items
+            .contains_key(&LocationId::new("warehouse")),
+        "the player's search recovers the medicine"
+    );
+    let player = s.world.actor(&ActorId::new(PLAYER)).unwrap();
+    assert_eq!(player.inventory.quantity(&ItemId::new("medicine")), 1);
+    assert!(s.events.all().iter().any(|e| matches!(&e.kind,
+        EventKind::ItemFound { actor, item, .. }
+            if actor.as_str() == PLAYER && item.as_str() == "medicine")));
+}
+
 #[test]
 fn restore_full_preserves_rng_and_movement_for_exact_continuation() {
     let mut s = sim();
@@ -529,4 +663,144 @@ fn world_and_events_roundtrip_through_json() {
         serde_json::to_string(&s.world).unwrap()
     );
     assert_eq!(e2.checksum(), s.events.checksum());
+}
+
+// ---------------------------------------------------------------------------
+// Canonical disclosure rules
+// ---------------------------------------------------------------------------
+//
+// Knowing a fact is not the same as being permitted to share it. These tests
+// pin the disclosure tiers enforced by `Simulation::validate_disclosure`.
+
+/// Give `actor` a believed belief in `fact`, regardless of whether the world
+/// names them as a canonical holder.
+fn teach(s: &mut Simulation, actor: &str, fact: &str) {
+    s.world
+        .actor_mut(&ActorId::new(actor))
+        .expect("actor exists")
+        .beliefs
+        .insert(
+            FactId::new(fact),
+            Belief {
+                fact: FactId::new(fact),
+                believes_true: true,
+                confidence: 0.9,
+                source: Provenance::Assumed,
+                acquired_tick: 0,
+            },
+        );
+}
+
+/// Move `actor` next to the player so range checks pass.
+fn bring_to_player(s: &mut Simulation, actor: &str) {
+    let player_pos = s.world.actor(&ActorId::new(PLAYER)).unwrap().pos;
+    let player_loc = s
+        .world
+        .actor(&ActorId::new(PLAYER))
+        .unwrap()
+        .location
+        .clone();
+    let a = s.world.actor_mut(&ActorId::new(actor)).unwrap();
+    a.location = player_loc;
+    a.pos = player_pos;
+}
+
+#[test]
+fn outsider_cannot_disclose_secret_fact() {
+    let mut s = sim();
+    // `shipment` is Secret and its canonical holder is only the grocer.
+    teach(&mut s, "guard", "shipment");
+    bring_to_player(&mut s, "guard");
+    let out = s.apply(&proposal(
+        "guard",
+        Action::ShareClaim {
+            target: ActorId::new(PLAYER),
+            fact: FactId::new("shipment"),
+            assertive: true,
+        },
+    ));
+    assert!(
+        matches!(
+            out,
+            ValidationOutcome::Rejected(RejectReason::NotPermittedToDisclose(_))
+        ),
+        "an outsider who merely believes a secret must not be able to disclose it: {out:?}"
+    );
+}
+
+#[test]
+fn canonical_holder_can_disclose_secret_fact() {
+    let mut s = sim();
+    // The grocer is the canonical holder of the secret shipment fact.
+    teach(&mut s, "grocer", "shipment");
+    bring_to_player(&mut s, "grocer");
+    let out = s.apply(&proposal(
+        "grocer",
+        Action::ShareClaim {
+            target: ActorId::new(PLAYER),
+            fact: FactId::new("shipment"),
+            assertive: true,
+        },
+    ));
+    assert_eq!(
+        out,
+        ValidationOutcome::Accepted,
+        "the canonical holder may disclose the secret"
+    );
+}
+
+#[test]
+fn inner_circle_fact_requires_flag_and_holder() {
+    let mut s = sim();
+    // Add an inner-circle fact whose only canonical holder is the guard.
+    s.world.facts.insert(
+        FactId::new("f_leader"),
+        Fact {
+            id: FactId::new("f_leader"),
+            statement: "The guild head leads the mafia.".into(),
+            truth: true,
+            sensitivity: Sensitivity::InnerCircle,
+            category: FactCategory::Identity,
+            prerequisites: vec![],
+            eligible_holders: vec![ActorId::new("guard")],
+            eligible_containers: vec![],
+            committed: false,
+            placed_at: None,
+        },
+    );
+    teach(&mut s, "guard", "f_leader");
+    bring_to_player(&mut s, "guard");
+
+    // Holder without the inner-circle flag is refused.
+    let denied = s.apply(&proposal(
+        "guard",
+        Action::ShareClaim {
+            target: ActorId::new(PLAYER),
+            fact: FactId::new("f_leader"),
+            assertive: true,
+        },
+    ));
+    assert!(
+        matches!(
+            denied,
+            ValidationOutcome::Rejected(RejectReason::NotPermittedToDisclose(_))
+        ),
+        "an inner-circle fact needs the flag as well as holder status: {denied:?}"
+    );
+
+    // Granting the flag makes the same disclosure authorized.
+    s.world
+        .actor_mut(&ActorId::new("guard"))
+        .unwrap()
+        .flags
+        .insert("inner_circle".into());
+    let allowed = s.apply(&proposal(
+        "guard",
+        Action::ShareClaim {
+            target: ActorId::new(PLAYER),
+            fact: FactId::new("f_leader"),
+            assertive: true,
+        },
+    ));
+    assert_eq!(allowed, ValidationOutcome::Accepted);
 }

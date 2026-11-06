@@ -506,6 +506,14 @@ fn handle_input(
         link.send(Command::Investigate(InvestigateTarget::Location(loc)));
     }
 
+    // --- Conversation target management --------------------------------
+    if keys.just_pressed(KeyCode::KeyQ) {
+        link.send(Command::CycleTarget);
+    }
+    if keys.just_pressed(KeyCode::KeyX) {
+        link.send(Command::EndConversation);
+    }
+
     let mut dir = Vec2::ZERO;
     if keys.just_pressed(KeyCode::KeyW) || keys.just_pressed(KeyCode::ArrowUp) {
         dir.y += 1.0;
@@ -701,12 +709,19 @@ fn update_ui(latest: Res<Latest>, ui: Res<UiState>, mut texts: HudTextQuery) {
                 Some(id) => names.get(id).copied().unwrap_or(id).to_string(),
                 None => "nobody in earshot".to_string(),
             };
+            let talking = snap
+                .talking_to
+                .as_deref()
+                .map(|id| names.get(id).copied().unwrap_or(id).to_string());
             set_text(&mut text, format!(
-                "{}  |  tick {}  |  at {}  |  near {}\n{} ({})  |  decisions: {} model / {} canonical / {} fallback",
+                "{}  |  tick {}  |  at {}  |  near {}{}\n{} ({})  |  decisions: {} model / {} canonical / {} fallback",
                 snap.status,
                 snap.tick,
                 here,
                 nearby,
+                talking
+                    .map(|t| format!("  |  talking to {t}"))
+                    .unwrap_or_default(),
                 snap.engine_name,
                 snap.model_id,
                 snap.model_decisions,

@@ -35,7 +35,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rpg_agents::NpcPolicy;
+use rpg_agents::{NpcPolicy, NpcRequestContext};
 use rpg_domain::action::{Action, Loudness, ValidationOutcome};
 use rpg_domain::geom::Vec2;
 use rpg_domain::ids::{ActorId, OfferId, PLAYER};
@@ -50,6 +50,12 @@ use crate::telemetry::{Telemetry, NONE};
 /// simulation also applies occlusion and location factors, so this stays
 /// conservative: the UI never offers a target the validator would reject.
 pub const TALK_RADIUS: f32 = 3.5;
+
+/// How long an idle conversation remains open before it is considered over.
+pub const CONVERSATION_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Maximum number of recent exchanges kept for short-term memory.
+pub const MAX_CONVERSATION_TURNS: usize = 12;
 
 /// Timeouts and limits for the conversation state machine.
 #[derive(Clone, Debug)]
@@ -116,6 +122,23 @@ struct Conversation {
     /// Line currently being voiced.
     line: Option<u64>,
     regenerations: u8,
+}
+
+/// A persistent social interaction with one NPC. Unlike [`Conversation`],
+/// which tracks one voice/inference turn, this survives across turns until
+/// the player switches targets, ends it, or the NPC leaves.
+#[derive(Clone, Debug)]
+struct ActiveConversation {
+    npc: ActorId,
+    last_active: Duration,
+    turns: VecDeque<ConversationTurn>,
+}
+
+/// One exchange in an active conversation, kept for short-term memory.
+#[derive(Clone, Debug)]
+struct ConversationTurn {
+    speaker: ActorId,
+    text: String,
 }
 
 /// Counters surfaced in the diagnostics overlay and asserted by tests.
@@ -221,6 +244,7 @@ pub struct SimCore {
     asr: Readiness,
     tts: Readiness,
     conv: Option<Conversation>,
+    active_conversation: Option<ActiveConversation>,
     next_conv: ConvId,
     next_line: u64,
     world_epoch: u64,
@@ -251,6 +275,7 @@ impl SimCore {
             asr: Readiness::Loading,
             tts: Readiness::Loading,
             conv: None,
+            active_conversation: None,
             next_conv: 1,
             next_line: 1,
             world_epoch: 0,
@@ -304,6 +329,42 @@ impl SimCore {
         self.now = now;
         let _ = self.session.tick();
         self.check_deadlines();
+        self.check_active_conversation();
+    }
+
+    /// End the active conversation if its NPC can no longer participate, or
+    /// the interaction has been idle for too long.
+    fn check_active_conversation(&mut self) {
+        let Some(ac) = &self.active_conversation else {
+            return;
+        };
+        let npc = ac.npc.clone();
+        if !self.npc_can_participate(&npc) {
+            let name = actor_name(&self.session.sim.world, &npc);
+            self.active_conversation = None;
+            self.system(&format!("{name} is no longer close enough to talk"));
+            return;
+        }
+        if self.now.saturating_sub(ac.last_active) > CONVERSATION_TIMEOUT {
+            self.active_conversation = None;
+            self.system("the conversation has gone quiet");
+        }
+    }
+
+    /// Whether an NPC is alive, present, and within talking distance of the
+    /// player. Used to keep a conversation open across turns.
+    fn npc_can_participate(&self, npc: &ActorId) -> bool {
+        let world = &self.session.sim.world;
+        let Some(player) = world.actor(&ActorId::new(PLAYER)) else {
+            return false;
+        };
+        let Some(a) = world.actor(npc) else {
+            return false;
+        };
+        a.kind == ActorKind::Npc
+            && a.status == ActorStatus::Alive
+            && a.location == player.location
+            && a.pos.distance(player.pos) <= self.cfg.talk_radius
     }
 
     /// Side effects produced since the last call, in order.
@@ -393,6 +454,71 @@ impl SimCore {
             Command::PushToTalk(true) => self.ptt_down(),
             Command::PushToTalk(false) => self.ptt_up(),
             Command::Say(text) => self.typed(text),
+            Command::SelectTarget(id) => {
+                if self.npc_can_participate(&id) {
+                    // Switching to a different NPC while a turn is in flight
+                    // would otherwise let the old NPC's late answer be voiced
+                    // after the player has moved on. Cancel it first so pending
+                    // work is handled consistently.
+                    if self
+                        .conv
+                        .as_ref()
+                        .is_some_and(|c| c.npc.as_ref() != Some(&id))
+                    {
+                        self.cancel_active("switched target");
+                    }
+                    self.begin_active_conversation(id.clone());
+                    let name = actor_name(&self.session.sim.world, &id);
+                    self.status = format!("talking to {name}");
+                } else {
+                    self.system("that person is not close enough to talk to");
+                }
+            }
+            Command::CycleTarget => {
+                let candidates = self.nearby_all();
+                if candidates.is_empty() {
+                    self.system("nobody is close enough to talk to");
+                } else {
+                    let current = self.active_conversation.as_ref().map(|ac| ac.npc.clone());
+                    // Finite, deterministic selection. `candidates` is already
+                    // ordered (nearest first, ties broken by id), so:
+                    // - no current target  -> first candidate
+                    // - current present    -> next candidate, wrapping to first
+                    // - current absent     -> first candidate (it left/died)
+                    let next = match current {
+                        Some(current_npc) => candidates
+                            .iter()
+                            .position(|c| *c == current_npc)
+                            .map(|idx| candidates[(idx + 1) % candidates.len()].clone())
+                            .unwrap_or_else(|| candidates[0].clone()),
+                        None => candidates[0].clone(),
+                    };
+                    // A target switch invalidates an in-flight turn for a
+                    // different NPC; cancel it so its late answer cannot be
+                    // voiced after the player has moved on.
+                    if self
+                        .conv
+                        .as_ref()
+                        .is_some_and(|c| c.npc.as_ref() != Some(&next))
+                    {
+                        self.cancel_active("switched target");
+                    }
+                    self.begin_active_conversation(next.clone());
+                    let name = actor_name(&self.session.sim.world, &next);
+                    self.status = format!("talking to {name}");
+                }
+            }
+            Command::EndConversation => {
+                // Cancel any in-flight turn first: ending the conversation must
+                // not leave a model request that later voices a ghost line.
+                if self.conv.is_some() {
+                    self.cancel_active("conversation ended");
+                }
+                if self.active_conversation.is_some() {
+                    self.active_conversation = None;
+                    self.status = "conversation ended".into();
+                }
+            }
             Command::CancelVoice => {
                 if self.conv.is_some() {
                     self.cancel_active("cancelled");
@@ -508,11 +634,33 @@ impl SimCore {
             text: text.clone(),
             kind: LineKind::Player,
         });
-        let Some(npc) = self.nearby() else {
-            self.system("nobody is close enough to hear you");
-            self.finish(false);
-            return;
+
+        // An active conversation is authoritative; proximity only chooses the
+        // first addressee. This is what stops the nearest NPC from stealing a
+        // continuing conversation.
+        let npc = match self.resolve_addressee() {
+            Some(n) => n,
+            None => {
+                self.system("nobody is close enough to hear you");
+                self.finish(false);
+                return;
+            }
         };
+
+        self.begin_active_conversation(npc.clone());
+
+        // Record the player's turn for short-term memory.
+        if let Some(ac) = self.active_conversation.as_mut() {
+            ac.turns.push_back(ConversationTurn {
+                speaker: ActorId::new(PLAYER),
+                text: text.clone(),
+            });
+            ac.last_active = self.now;
+            while ac.turns.len() > MAX_CONVERSATION_TURNS {
+                ac.turns.pop_front();
+            }
+        }
+
         let out = self.session.player_speak(npc.as_str(), &text);
         if let ValidationOutcome::Rejected(reason) = out {
             let name = actor_name(&self.session.sim.world, &npc);
@@ -525,6 +673,63 @@ impl SimCore {
             c.utterance = Some(text);
         }
         self.request_decision();
+    }
+
+    /// Resolve who the player is addressing. An active conversation is
+    /// authoritative until the NPC leaves or the player explicitly switches.
+    fn resolve_addressee(&self) -> Option<ActorId> {
+        if let Some(ac) = &self.active_conversation {
+            if self.npc_can_participate(&ac.npc) {
+                return Some(ac.npc.clone());
+            }
+        }
+        self.nearby()
+    }
+
+    /// Prior turns of the ongoing conversation with `npc`, for decision
+    /// contexts. The model prompt (and the heuristic path's provenance
+    /// prompt) render this history, and both the synchronous fallback and
+    /// the async resolve path build their `NpcRequestContext` from the same
+    /// view. Note the canonical agenda/obligation checks and the heuristic
+    /// fallback's keyword matching do not read it: they resolve against the
+    /// current utterance and world state (e.g. commitments).
+    ///
+    /// Scope: only the *currently active* conversation with the same NPC is
+    /// returned. Switching targets, cycling, ending the conversation, an idle
+    /// timeout, the NPC walking away, or loading a save all drop the active
+    /// conversation, so a new or unrelated conversation starts with an empty
+    /// history and cannot inherit another NPC's — or another session's —
+    /// turns.
+    ///
+    /// Duplication: the player's latest utterance is passed separately as
+    /// `current` and is also the final recorded turn, so the trailing record
+    /// is removed here — but only when it actually is that utterance (same
+    /// speaker and text), never by position alone, so the same line is never
+    /// rendered twice and no real prior turn is dropped.
+    ///
+    /// Call sites (`request_decision`, `resolve_pending`) run exactly while
+    /// the current utterance is the final recorded turn: the NPC's reply is
+    /// recorded only after `commit`.
+    fn prior_turns(&self, npc: &ActorId, current: &str) -> Vec<(ActorId, String)> {
+        let Some(ac) = self
+            .active_conversation
+            .as_ref()
+            .filter(|ac| ac.npc == *npc)
+        else {
+            return Vec::new();
+        };
+        let mut turns: Vec<(ActorId, String)> = ac
+            .turns
+            .iter()
+            .map(|t| (t.speaker.clone(), t.text.clone()))
+            .collect();
+        if turns
+            .last()
+            .is_some_and(|(speaker, text)| speaker.0 == PLAYER && text == current)
+        {
+            turns.pop();
+        }
+        turns
     }
 
     /// Ask for the active conversation's NPC decision: synchronously from the
@@ -544,13 +749,33 @@ impl SimCore {
         };
         if let Some(reason) = fallback_reason {
             self.set_stage(VoiceStage::Validating);
-            let decision =
-                NpcPolicy.heuristic(&self.session.sim.world, &npc, &player, &text, reason);
+            let history = self.prior_turns(&npc, &text);
+            let ctx = NpcRequestContext {
+                world: &self.session.sim.world,
+                npc: &npc,
+                speaker: &player,
+                utterance: &text,
+                history: &history,
+            };
+            let decision = NpcPolicy.heuristic(&ctx, reason);
             self.commit(npc, decision, false);
             return;
         }
         let request_id = self.session.next_request_id();
-        let request = NpcPolicy.request(&self.session.sim.world, &npc, &player, &text, request_id);
+        // The player's current utterance (recorded in `turns` by
+        // `player_turn`) is passed separately, so the history excludes it and
+        // the same line is never rendered twice.
+        let history = self.prior_turns(&npc, &text);
+        let request = NpcPolicy.request(
+            &NpcRequestContext {
+                world: &self.session.sim.world,
+                npc: &npc,
+                speaker: &player,
+                utterance: &text,
+                history: &history,
+            },
+            request_id,
+        );
         if let Some(c) = self.conv.as_mut() {
             c.pending = Some(PendingDecision {
                 request_id,
@@ -599,6 +824,19 @@ impl SimCore {
         }
         match commit.spoken {
             Some(line) => {
+                // Record the NPC's reply for short-term memory.
+                if let Some(ac) = self.active_conversation.as_mut() {
+                    if ac.npc == npc {
+                        ac.turns.push_back(ConversationTurn {
+                            speaker: npc.clone(),
+                            text: line.clone(),
+                        });
+                        ac.last_active = self.now;
+                        while ac.turns.len() > MAX_CONVERSATION_TURNS {
+                            ac.turns.pop_front();
+                        }
+                    }
+                }
                 self.dialogue_push(DialogueLine {
                     speaker: npc.as_str().to_string(),
                     text: line.clone(),
@@ -852,11 +1090,23 @@ impl SimCore {
             EngineState::Ready { model_id, .. } => model_id.clone(),
             _ => "unknown".into(),
         };
+        // The answer is resolved against the conversation as it stands now:
+        // the context carries the same prior turns the prompt was rendered
+        // from (the current utterance excluded, since it is passed
+        // separately), so the rendered prompt — and the provenance prompt on
+        // the fallback path — show the full exchange. The canonical
+        // agenda/obligation checks and the heuristic fallback's keyword
+        // matching still key on the current utterance and world state
+        // (commitments), not on prior turns.
+        let history = self.prior_turns(&npc, &text);
         let decision = NpcPolicy.resolve(
-            &self.session.sim.world,
-            &npc,
-            &ActorId::new(PLAYER),
-            &text,
+            &NpcRequestContext {
+                world: &self.session.sim.world,
+                npc: &npc,
+                speaker: &ActorId::new(PLAYER),
+                utterance: &text,
+                history: &history,
+            },
             pending.request,
             result,
             &model_id,
@@ -935,6 +1185,26 @@ impl SimCore {
             regenerations: 0,
         });
         id
+    }
+
+    /// Start or refresh a persistent conversation with an NPC.
+    fn begin_active_conversation(&mut self, npc: ActorId) {
+        let already = self
+            .active_conversation
+            .as_ref()
+            .map(|ac| ac.npc == npc)
+            .unwrap_or(false);
+        if already {
+            if let Some(ac) = self.active_conversation.as_mut() {
+                ac.last_active = self.now;
+            }
+            return;
+        }
+        self.active_conversation = Some(ActiveConversation {
+            npc,
+            last_active: self.now,
+            turns: VecDeque::new(),
+        });
     }
 
     fn set_stage(&mut self, stage: VoiceStage) {
@@ -1115,6 +1385,12 @@ impl SimCore {
         self.abort_active("loaded a save");
         self.bump_audio_epoch();
         self.world_epoch += 1;
+        // The active conversation belongs to the old timeline. Its turns are
+        // session-scoped short-term context and are deliberately not saved;
+        // letting them survive a restore (an imported save may come from a
+        // completely different session) would leak dialogue that never
+        // happened in the restored world into future prompts.
+        self.active_conversation = None;
         let config = rpg_sim::SimConfig {
             enable_background: true,
             enable_director: true,
@@ -1145,11 +1421,14 @@ impl SimCore {
         }
     }
 
-    /// Nearest living named NPC in the same room, within the talk radius.
-    pub fn nearby(&self) -> Option<ActorId> {
+    /// All living named NPCs in the same room within the talk radius, sorted
+    /// by distance to the player.
+    pub fn nearby_all(&self) -> Vec<ActorId> {
         let world = &self.session.sim.world;
-        let player = world.actor(&ActorId::new(PLAYER))?;
-        world
+        let Some(player) = world.actor(&ActorId::new(PLAYER)) else {
+            return Vec::new();
+        };
+        let mut candidates: Vec<_> = world
             .actors
             .values()
             .filter(|a| a.id.0 != PLAYER)
@@ -1157,13 +1436,22 @@ impl SimCore {
             .filter(|a| a.status == ActorStatus::Alive)
             .filter(|a| a.location == player.location)
             .filter(|a| a.pos.distance(player.pos) <= self.cfg.talk_radius)
-            .min_by(|a, b| {
-                a.pos
-                    .distance(player.pos)
-                    .partial_cmp(&b.pos.distance(player.pos))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .map(|a| a.id.clone())
+            .map(|a| (a.pos.distance(player.pos), a.id.clone()))
+            .collect();
+        candidates.sort_by(|a, b| {
+            a.0.partial_cmp(&b.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.cmp(&b.1))
+        });
+        candidates.into_iter().map(|(_, id)| id).collect()
+    }
+
+    /// Nearest living named NPC in the same room, within the talk radius.
+    /// First of [`Self::nearby_all`]: the candidate list is already sorted by
+    /// distance (ties broken by id), which is exactly what the previous
+    /// dedicated scan selected.
+    pub fn nearby(&self) -> Option<ActorId> {
+        self.nearby_all().into_iter().next()
     }
 
     /// Build the immutable view the renderer draws.
@@ -1316,6 +1604,7 @@ impl SimCore {
                 .conv
                 .as_ref()
                 .and_then(|c| c.npc.as_ref())
+                .or_else(|| self.active_conversation.as_ref().map(|ac| &ac.npc))
                 .map(|n| n.as_str().to_string()),
             stage_seconds: self
                 .conv
@@ -1398,6 +1687,10 @@ impl SimCore {
             player_pos,
             player_location,
             nearby,
+            talking_to: self
+                .active_conversation
+                .as_ref()
+                .map(|ac| ac.npc.as_str().to_string()),
             dialogue: self.dialogue.clone(),
             engine_name,
             model_id,
@@ -1448,4 +1741,129 @@ fn format_stacks(world: &World, stacks: &[rpg_domain::world::ItemStack]) -> Stri
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+#[cfg(test)]
+mod conversation_memory_tests {
+    use super::*;
+    use rpg_agents::{DecisionSource, NpcDecision};
+    use rpg_domain::action::{ActionProposal, ProposalSource};
+
+    fn core() -> SimCore {
+        SimCore::new(
+            Session::new(2026),
+            CoreConfig::default(),
+            Arc::new(Telemetry::new()),
+        )
+    }
+
+    fn npc_says(npc: &ActorId, text: &str) -> NpcDecision {
+        NpcDecision {
+            proposal: ActionProposal {
+                actor: npc.clone(),
+                action: Action::Speak {
+                    target: Some(ActorId::new(PLAYER)),
+                    text: text.into(),
+                    loudness: Loudness::Normal,
+                },
+                source: ProposalSource::NpcModel,
+                rationale: "unit test".into(),
+            },
+            source: DecisionSource::Model,
+            prompt: String::new(),
+            raw: None,
+        }
+    }
+
+    fn spoken_history(c: &SimCore, npc: &ActorId, current: &str) -> Vec<(String, String)> {
+        c.prior_turns(npc, current)
+            .into_iter()
+            .map(|(s, t)| (s.as_str().to_string(), t))
+            .collect()
+    }
+
+    #[test]
+    fn current_utterance_is_excluded_but_prior_turns_are_kept() {
+        let mut c = core();
+        c.session.teleport_player_to("priest");
+        let priest = ActorId::new("priest");
+
+        // First player turn: the utterance is the only recorded turn and is
+        // excluded (it is passed separately as the current one).
+        c.player_turn("First question.".into());
+        assert!(spoken_history(&c, &priest, "First question.").is_empty());
+
+        // The NPC's committed reply is part of the conversation memory.
+        c.commit(priest.clone(), npc_says(&priest, "First reply."), false);
+        // Next player turn: both prior turns must now be in the history while
+        // the new utterance stays out of it.
+        c.player_turn("Second question.".into());
+        assert_eq!(
+            spoken_history(&c, &priest, "Second question."),
+            vec![
+                (PLAYER.to_string(), "First question.".to_string()),
+                ("priest".to_string(), "First reply.".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn trailing_record_is_only_dropped_when_it_is_the_current_utterance() {
+        let mut c = core();
+        c.session.teleport_player_to("priest");
+        let priest = ActorId::new("priest");
+        c.player_turn("hello".into());
+        c.commit(priest.clone(), npc_says(&priest, "hello"), false);
+        // The NPC's own trailing text must never be mistaken for the current
+        // utterance: a player echo keeps the full prior exchange in history.
+        c.player_turn("hello".into());
+        assert_eq!(
+            spoken_history(&c, &priest, "hello"),
+            vec![
+                (PLAYER.to_string(), "hello".to_string()),
+                ("priest".to_string(), "hello".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn history_is_scoped_to_the_conversation_partner() {
+        let mut c = core();
+        c.session.teleport_player_to("priest");
+        let priest = ActorId::new("priest");
+        let spy = ActorId::new("spy");
+        c.player_turn("A question for you.".into());
+        c.commit(priest.clone(), npc_says(&priest, "An answer."), false);
+        c.player_turn("A follow-up.".into());
+        // Another NPC — even one standing nearby — must not inherit the
+        // priest's conversation.
+        assert!(spoken_history(&c, &spy, "A follow-up.").is_empty());
+        // Switching targets replaces the active conversation entirely: the
+        // priest's history is gone, and the spy starts empty.
+        c.begin_active_conversation(spy.clone());
+        assert!(spoken_history(&c, &priest, "A follow-up.").is_empty());
+        assert!(spoken_history(&c, &spy, "A follow-up.").is_empty());
+    }
+
+    #[test]
+    fn loading_a_save_ends_the_conversation_and_its_history() {
+        let mut c = core();
+        c.session.teleport_player_to("priest");
+        let priest = ActorId::new("priest");
+        c.player_turn("Before the save.".into());
+        c.commit(priest.clone(), npc_says(&priest, "Before the load."), false);
+        assert!(c.snapshot().talking_to.as_deref() == Some("priest"));
+
+        let save = rpg_persistence::SaveFile::from_sim(&c.session.sim);
+        c.restore_save(save, "unit test");
+        // The conversation belongs to the old timeline and must not leak its
+        // turns into the restored world.
+        assert_eq!(c.snapshot().talking_to, None);
+        assert!(spoken_history(&c, &priest, "Anything.").is_empty());
+        // A fresh turn still works and starts a clean conversation.
+        c.session.teleport_player_to("priest");
+        c.player_turn("After the load.".into());
+        assert_eq!(c.snapshot().talking_to.as_deref(), Some("priest"));
+        assert!(spoken_history(&c, &priest, "After the load.").is_empty());
+    }
 }

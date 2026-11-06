@@ -11,3 +11,6 @@ apps/web-game/tests/test-results/
 apps/web-game/tests/playwright-report/
 .env
 .env.*
+
+# Manual test screenshots (local verification artifacts)
+.test_screenshots/

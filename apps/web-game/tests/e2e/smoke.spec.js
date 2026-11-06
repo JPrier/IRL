@@ -179,7 +179,9 @@ test("save, load, export and import use the versioned save format", async ({ pag
   await download.saveAs(file);
   const text = fs.readFileSync(file, "utf8");
   const save = JSON.parse(text);
-  expect(save.version).toBe(1);
+  // v2 saves carry the stance-prose/private-biography migration (v1 is the
+  // supported legacy import format, so anything besides 1/2 is refused).
+  expect(save.version).toBe(2);
   expect(save.world).toBeTruthy();
 
   await page.setInputFiles("#import", file);

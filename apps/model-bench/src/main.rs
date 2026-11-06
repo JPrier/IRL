@@ -243,7 +243,7 @@ fn profile_bench(args: &[String], profile_path: &str) -> i32 {
     let mut decode_tokens = 0u32;
     for i in 0..turns {
         let utterance = phrasings[i % phrasings.len()];
-        let prompt = rpg_agents::render_npc_context(&world, &npc, &player, utterance);
+        let prompt = rpg_agents::render_npc_context(&world, &npc, &player, utterance, &[]);
         let req = InferenceRequest {
             id: i as u64 + 1,
             role: InferenceRole::NpcDecision,

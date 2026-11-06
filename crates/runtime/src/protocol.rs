@@ -9,7 +9,7 @@
 
 use rpg_domain::action::InvestigateTarget;
 use rpg_domain::geom::Vec2;
-use rpg_domain::ids::OfferId;
+use rpg_domain::ids::{ActorId, OfferId};
 use rpg_domain::ports::{InferenceError, InferenceRequest, InferenceResponse};
 
 /// Identifies one player-initiated conversation turn.
@@ -40,6 +40,13 @@ pub enum Command {
     PushToTalk(bool),
     /// Typed dialogue: the same gameplay path as a transcribed utterance.
     Say(String),
+    /// Explicitly select the NPC the player wants to talk to. Overrides the
+    /// current active conversation target.
+    SelectTarget(ActorId),
+    /// Cycle to the next eligible nearby NPC.
+    CycleTarget,
+    /// End the active conversation without starting a new one.
+    EndConversation,
     /// Abandon the active conversation turn at whatever stage it is in.
     CancelVoice,
     /// Accept a pending offer from an NPC.
@@ -615,6 +622,8 @@ pub struct Snapshot {
     pub player_pos: Vec2,
     pub player_location: String,
     pub nearby: Option<String>,
+    /// The NPC the player is currently in a conversation with, if any.
+    pub talking_to: Option<String>,
     pub dialogue: Vec<DialogueLine>,
     pub engine_name: String,
     pub model_id: String,

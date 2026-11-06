@@ -150,6 +150,13 @@ pub struct Goal {
     /// Optional stable predicate that marks the goal satisfied.
     #[serde(default)]
     pub predicate: Option<crate::action::QuestPredicate>,
+    /// Optional pursuit target: a location the actor will visit for this
+    /// goal. Authored content fills these; the autonomy layer consumes them.
+    #[serde(default)]
+    pub target_location: Option<LocationId>,
+    /// Optional pursuit target: another actor the goal is about.
+    #[serde(default)]
+    pub target_actor: Option<ActorId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -245,6 +252,19 @@ pub struct Actor {
     pub facing: f32,
     pub personality: Personality,
     pub values: Vec<String>,
+    /// A compact, authored biography used to ground the character's voice and
+    /// knowledge. Empty for procedurally generated actors. This is the public
+    /// persona: safe to render into prompts and to share in ordinary speech.
+    #[serde(default)]
+    pub biography: String,
+    /// Authored behaviour guidance the actor keeps private: what it deflects,
+    /// who it protects, what it conceals. This is *stance prose*, deliberately
+    /// not the literal secret — canonical secrets live in facts (holders +
+    /// sensitivity) and in `secret_allegiance`. Prompt rendering treats this as
+    /// guidance the actor may act on but never quote, so a model cannot leak
+    /// what it was never told.
+    #[serde(default)]
+    pub private_biography: String,
     pub affiliations: Vec<FactionId>,
     pub capabilities: Capabilities,
     pub inventory: Inventory,
@@ -268,6 +288,20 @@ pub struct Actor {
 impl Actor {
     pub fn is_alive(&self) -> bool {
         self.status == ActorStatus::Alive
+    }
+
+    /// The public biography as rendered into model prompts.
+    ///
+    /// This is *not* a sanitizer: it simply returns the authored public
+    /// persona, which is authored content that is safe to share in ordinary
+    /// speech by construction. The structural boundaries live elsewhere — the
+    /// prompt renderer never quotes [`Actor::private_biography`] (only its
+    /// presence is signalled as deflection guidance), and the persistence
+    /// layer sanitizes legacy saves whose `private_biography` still carried
+    /// literal secrets. Kept as a named seam so prompt renderers have one
+    /// obvious, single field to draw the character's public background from.
+    pub fn safe_biography(&self) -> String {
+        self.biography.clone()
     }
 
     pub fn has_flag(&self, f: &str) -> bool {
@@ -662,6 +696,21 @@ pub struct ContainerCommit {
 // The canonical world container
 // ---------------------------------------------------------------------------
 
+/// Structured, authored lore about the settlement. Shared public knowledge
+/// that every resident may draw on; personal knowledge stays on [`Actor`].
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct WorldLore {
+    pub settlement_name: String,
+    pub geography: String,
+    pub history: String,
+    pub culture: String,
+    pub landmarks: Vec<String>,
+    pub economy: String,
+    pub institutions: String,
+    pub recent_events: String,
+    pub everyday_knowledge: String,
+}
+
 /// All canonical, authoritative game state. The `sim` crate owns the logic
 /// that mutates this; every other layer only reads it (or proposes changes).
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -698,6 +747,9 @@ pub struct World {
     pub next_offer_id: u64,
     pub next_rumor_id: u64,
     pub next_goal_id: u64,
+    /// Authored, shared lore for the settlement.
+    #[serde(default)]
+    pub lore: WorldLore,
 }
 
 impl World {
@@ -735,6 +787,14 @@ impl World {
             .get(actor)
             .and_then(|a| a.beliefs.get(fact))
             .map(|b| b.believes_true)
+            .unwrap_or(false)
+    }
+
+    /// Has the actor heard about `fact`, whether or not they believe it?
+    pub fn has_heard(&self, actor: &ActorId, fact: &FactId) -> bool {
+        self.actors
+            .get(actor)
+            .map(|a| a.beliefs.contains_key(fact))
             .unwrap_or(false)
     }
 
@@ -846,6 +906,7 @@ mod tests {
             next_offer_id: 1,
             next_rumor_id: 1,
             next_goal_id: 1,
+            lore: WorldLore::default(),
         }
     }
 

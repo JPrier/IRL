@@ -8,7 +8,7 @@
 //! Every scenario is seeded and deterministic; replaying the same script must
 //! produce the same canonical event checksum.
 
-use rpg_agents::{HeuristicEngine, NpcPolicy};
+use rpg_agents::{HeuristicEngine, NpcPolicy, NpcRequestContext};
 use rpg_content::build_town;
 use rpg_domain::action::{
     Action, ActionProposal, InvestigateTarget, Loudness, ProposalSource, QuestPredicate,
@@ -17,6 +17,13 @@ use rpg_domain::action::{
 use rpg_domain::ids::*;
 use rpg_domain::ports::InferenceEngine;
 use rpg_sim::{SimConfig, Simulation, StepReport};
+use std::collections::VecDeque;
+
+/// How many conversation turns (player and NPC lines together) the session
+/// keeps for follow-up context. Mirrors the runtime's
+/// `rpg_runtime::MAX_CONVERSATION_TURNS` so eval exercises the same window
+/// the voice client does.
+const MAX_CONVERSATION_TURNS: usize = 12;
 
 /// A scripted/simulated player connected to a live simulation and NPC policy.
 pub struct Session {
@@ -26,6 +33,13 @@ pub struct Session {
     pub trace: Vec<String>,
     /// Provenance of every NPC decision, in order.
     pub decisions: Vec<(String, rpg_agents::DecisionSource)>,
+    /// Addressee of the ongoing conversation, if any.
+    pub conversation_target: Option<ActorId>,
+    /// Bounded short-term memory of the ongoing conversation, mirroring the
+    /// runtime's active-conversation semantics: one conversation at a time;
+    /// switching addressees drops it entirely (no per-NPC retention); turns
+    /// carry speaker attribution, the player's utterance first.
+    pub conversation_turns: VecDeque<(ActorId, String)>,
 }
 
 impl Session {
@@ -47,6 +61,8 @@ impl Session {
             next_request: 1,
             trace: Vec::new(),
             decisions: Vec::new(),
+            conversation_target: None,
+            conversation_turns: VecDeque::new(),
         }
     }
 
@@ -123,6 +139,16 @@ impl Session {
     /// Player speaks, then the addressed NPC decides and acts through the
     /// shared policy + inference engine.
     ///
+    /// The session tracks the ongoing conversation like the runtime's active
+    /// conversation does: only an accepted utterance opens or continues it;
+    /// addressing a different NPC drops it entirely (a new conversation never
+    /// inherits another's turns); the player's utterance and the NPC's
+    /// committed spoken line are recorded with speaker attribution, bounded
+    /// to [`MAX_CONVERSATION_TURNS`]. The decision's history view is the
+    /// recorded exchange *without* the current utterance (it is passed
+    /// separately, and removed by content, never by position), so the same
+    /// line is never rendered twice.
+    ///
     /// Returns the NPC's spoken reply text when the accepted action was
     /// `Speak`, so a voice client can synthesize exactly what the character
     /// said. Returns `None` when the speech did not reach the NPC or the NPC
@@ -130,12 +156,62 @@ impl Session {
     pub fn say(&mut self, target: &str, text: &str) -> Option<String> {
         // An NPC can only answer speech that actually reached them (in range
         // and audible). Rejected speech must not burn inference or produce an
-        // impossible response.
+        // impossible response — and never opens a conversation.
         if matches!(self.player_speak(target, text), ValidationOutcome::Accepted) {
-            self.npc_respond(target, text)
+            let npc = ActorId::new(target);
+            // A new addressee starts a fresh conversation: no inheritance
+            // from a previous NPC's exchange.
+            if self.conversation_target.as_ref() != Some(&npc) {
+                self.conversation_target = Some(npc.clone());
+                self.conversation_turns.clear();
+            }
+            // Record the player's turn, then resolve against the prior turns
+            // only (the runtime records the utterance first and strips the
+            // trailing copy when building the history view).
+            self.record_conversation_turn(ActorId::new(PLAYER), text.to_string());
+            let history = self.prior_turns(&npc, text);
+            let spoken = self.npc_respond_with_history(target, text, &history);
+            // Record the NPC's committed reply — only a spoken line counts;
+            // a rejected action said nothing and must not enter the memory.
+            if let Some(line) = &spoken {
+                self.record_conversation_turn(npc, line.clone());
+            }
+            spoken
         } else {
             None
         }
+    }
+
+    /// Append a turn to the ongoing conversation, keeping the memory bounded
+    /// to [`MAX_CONVERSATION_TURNS`] (oldest turns are dropped first).
+    fn record_conversation_turn(&mut self, speaker: ActorId, text: String) {
+        self.conversation_turns.push_back((speaker, text));
+        while self.conversation_turns.len() > MAX_CONVERSATION_TURNS {
+            self.conversation_turns.pop_front();
+        }
+    }
+
+    /// Prior turns of the ongoing conversation with `npc`, mirroring the
+    /// runtime's `prior_turns`: the current utterance is also the final
+    /// recorded turn at this point, so that trailing record is removed — but
+    /// only when it actually is that utterance (same speaker and text),
+    /// never by position alone.
+    fn prior_turns(&self, npc: &ActorId, current: &str) -> Vec<(ActorId, String)> {
+        if self.conversation_target.as_ref() != Some(npc) {
+            return Vec::new();
+        }
+        let mut turns: Vec<(ActorId, String)> = self
+            .conversation_turns
+            .iter()
+            .map(|(who, said)| (who.clone(), said.clone()))
+            .collect();
+        if turns
+            .last()
+            .is_some_and(|(who, said)| who.0 == PLAYER && said == current)
+        {
+            turns.pop();
+        }
+        turns
     }
 
     /// The player's half of a conversational turn: commit the utterance as a
@@ -162,8 +238,13 @@ impl Session {
     /// Run the NPC decision for a heard utterance and return the line the NPC
     /// should speak aloud, when the accepted action has one.
     ///
+    /// This is the primitive for callers that manage the conversation
+    /// themselves: unlike [`Session::say`], it consults no session memory —
+    /// the decision runs with an empty history unless the caller uses
+    /// [`Session::npc_respond_with_history`].
+    ///
     /// * `Speak` → its `text`.
-    /// * `MakeOffer` → its `note` ("what you promise in return").
+    /// * `MakeOffer` → its `note`.
     /// * `Promise` → its `terms`.
     /// * `Threaten` → its `demand`.
     ///
@@ -171,17 +252,29 @@ impl Session {
     /// authoritative simulation; the voice client reads exactly this text and
     /// never invents dialogue.
     pub fn npc_respond(&mut self, npc: &str, text: &str) -> Option<String> {
+        self.npc_respond_with_history(npc, text, &[])
+    }
+
+    /// Run the NPC decision for a heard utterance with explicit conversation
+    /// history. The history is rendered into the model prompt so the NPC can
+    /// resolve follow-up references.
+    pub fn npc_respond_with_history(
+        &mut self,
+        npc: &str,
+        text: &str,
+        history: &[(ActorId, String)],
+    ) -> Option<String> {
         let npc_id = ActorId::new(npc);
         let player = ActorId::new(PLAYER);
         let request_id = self.next_request_id();
-        let decision = NpcPolicy.decide(
-            &self.sim.world,
-            &npc_id,
-            &player,
-            text,
-            self.engine.as_mut(),
-            request_id,
-        );
+        let ctx = NpcRequestContext {
+            world: &self.sim.world,
+            npc: &npc_id,
+            speaker: &player,
+            utterance: text,
+            history,
+        };
+        let decision = NpcPolicy.decide(&ctx, request_id, self.engine.as_mut());
         self.commit_npc_decision(npc, decision).spoken
     }
 
@@ -657,7 +750,7 @@ fn grocer_conditional_bargain(seed: u64) -> ScenarioResult {
         let knows_before = s
             .sim
             .world
-            .believes(&ActorId::new(PLAYER), &FactId::new("f_grocer_ledger"));
+            .has_heard(&ActorId::new(PLAYER), &FactId::new("f_grocer_ledger"));
         check(
             &mut checks,
             "not_disclosed_before_medicine",
@@ -695,12 +788,12 @@ fn grocer_conditional_bargain(seed: u64) -> ScenarioResult {
         let knows_after = s
             .sim
             .world
-            .believes(&ActorId::new(PLAYER), &FactId::new("f_grocer_ledger"));
+            .has_heard(&ActorId::new(PLAYER), &FactId::new("f_grocer_ledger"));
         check(
             &mut checks,
             "ledger_disclosed_after_bargain",
             knows_after,
-            "player believes ledger fact",
+            "player heard ledger fact",
         );
     }
     finish("grocer_conditional_bargain", seed, &s, checks)
@@ -990,6 +1083,7 @@ fn knowledge_boundaries(seed: u64) -> ScenarioResult {
         &ActorId::new("grocer"),
         &ActorId::new(PLAYER),
         "Who leads the mafia?",
+        &[],
     );
     check(
         &mut checks,
@@ -1152,6 +1246,25 @@ mod tests {
         }
     }
 
+    /// Autonomy regression: every scenario must keep passing across many
+    /// seeds now that NPCs autonomously pursue goals between ticks. Goals
+    /// (Marta's protective watch, Renn's investigation) may fire during any
+    /// scenario, so this guards against autonomy disturbing scripted
+    /// expectations or breaking deterministic replay.
+    #[test]
+    fn all_scenarios_pass_across_seeds_with_autonomy() {
+        for seed in [1u64, 7, 42, 2026, 98765] {
+            for result in run_all(seed) {
+                assert!(
+                    result.passed(),
+                    "scenario {} failed at seed {}\n{result:?}",
+                    result.name,
+                    seed
+                );
+            }
+        }
+    }
+
     /// No-weights regression test for the real-model interaction shape: a
     /// scripted model that only "speaks" still gets the canonical bargain,
     /// and the satisfied deal is honoured on the next turn.
@@ -1205,8 +1318,349 @@ mod tests {
         assert!(
             s.sim
                 .world
-                .believes(&ActorId::new(PLAYER), &FactId::new("f_grocer_ledger")),
-            "player should learn the ledger fact once the deal is honoured"
+                .has_heard(&ActorId::new(PLAYER), &FactId::new("f_grocer_ledger")),
+            "player should hear the ledger fact once the deal is honoured"
         );
+    }
+
+    /// A deterministic model stand-in that records every prompt it is asked
+    /// to complete and always "speaks", so tests can assert exactly what the
+    /// decision context carried (history rendering) without any LLM.
+    struct PromptCapture {
+        prompts: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        warmed: bool,
+    }
+
+    impl PromptCapture {
+        fn new(prompts: std::sync::Arc<std::sync::Mutex<Vec<String>>>) -> Self {
+            Self {
+                prompts,
+                warmed: false,
+            }
+        }
+    }
+
+    impl rpg_domain::ports::InferenceEngine for PromptCapture {
+        fn engine_name(&self) -> String {
+            "prompt-capture".into()
+        }
+        fn model_id(&self) -> String {
+            "capture-v1".into()
+        }
+        fn warm(&mut self) -> Result<(), rpg_domain::ports::InferenceError> {
+            self.warmed = true;
+            Ok(())
+        }
+        fn complete(
+            &mut self,
+            req: &rpg_domain::ports::InferenceRequest,
+        ) -> Result<rpg_domain::ports::InferenceResponse, rpg_domain::ports::InferenceError>
+        {
+            if !self.warmed {
+                self.warm()?;
+            }
+            self.prompts.lock().unwrap().push(req.prompt.clone());
+            Ok(rpg_domain::ports::InferenceResponse {
+                completion_tokens: 1,
+                text: r#"{"action":"speak","text":"Understood."}"#.into(),
+                ..Default::default()
+            })
+        }
+    }
+
+    /// Regression for the eval-history gap: `say` must track the ongoing
+    /// conversation like the runtime does and feed the *prior* exchange into
+    /// the decision context on follow-ups (prompt capture proves what the
+    /// model/heuristic path resolved from). Switching addressees must start
+    /// clean in both directions — no inheritance.
+    #[test]
+    fn follow_up_history_reaches_the_decision_and_switching_starts_clean() {
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut s = Session::with_engine(2026, Box::new(PromptCapture::new(prompts.clone())));
+        s.teleport_player_to("grocer");
+
+        // First contact: the decision context starts with an empty history.
+        s.say(
+            "grocer",
+            "I need to see your ledger. The one with the dock payments.",
+        );
+        let prompt1 = prompts.lock().unwrap()[0].clone();
+        assert!(
+            !prompt1.contains("Recent conversation"),
+            "a first contact must start with an empty history"
+        );
+        assert_eq!(
+            (
+                s.conversation_target.as_ref().map(|a| a.as_str()),
+                s.conversation_turns.len()
+            ),
+            (Some("grocer"), 2),
+            "the accepted exchange must be recorded with both speakers"
+        );
+
+        // Follow-up: the prior exchange — the player's line and the grocer's
+        // committed offer note — must reach the decision context, and the
+        // current utterance must not be duplicated into the history.
+        s.say("grocer", "What about it?");
+        let prompt2 = prompts.lock().unwrap()[1].clone();
+        assert!(
+            prompt2.contains("Recent conversation"),
+            "the follow-up prompt must include the conversation history"
+        );
+        assert!(
+            prompt2.contains(r#"player: "I need to see your ledger"#),
+            "the prior player turn must carry speaker attribution: {prompt2}"
+        );
+        assert!(
+            prompt2.contains("grocer: \"Bring me medicine"),
+            "the NPC's committed reply must be in the history: {prompt2}"
+        );
+        assert_eq!(
+            prompt2.matches("What about it?").count(),
+            1,
+            "the current utterance must appear exactly once (never duplicated in history)"
+        );
+
+        // Switching to another NPC starts a fresh conversation: the new
+        // addressee's context carries no trace of the grocer's exchange.
+        s.teleport_player_to("dockworker");
+        s.say("dockworker", "Do you watch the docks?");
+        let prompt3 = prompts.lock().unwrap()[2].clone();
+        assert!(
+            !prompt3.contains("Recent conversation"),
+            "a switched-to NPC must start with an empty history"
+        );
+        assert!(
+            !prompt3.contains("dock payments"),
+            "the dockworker's prompt must not inherit the grocer's conversation"
+        );
+
+        // Switching back is equally clean: no per-NPC retention across a
+        // switch, mirroring the runtime's active-conversation reset.
+        s.teleport_player_to("grocer");
+        s.say("grocer", "Back again — anything new?");
+        let prompt4 = prompts.lock().unwrap()[3].clone();
+        assert!(
+            !prompt4.contains("Recent conversation"),
+            "returning to a former addressee must start clean too"
+        );
+        assert!(
+            !prompt4.contains("What about it?"),
+            "the earlier exchange must not leak across the switch"
+        );
+    }
+
+    /// The recorded memory is bounded: older turns are dropped first, so a
+    /// long session's decision context shows only the recent exchange window.
+    #[test]
+    fn conversation_history_is_bounded() {
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut s = Session::with_engine(2026, Box::new(PromptCapture::new(prompts.clone())));
+        s.teleport_player_to("grocer");
+        for i in 1..=8 {
+            s.say("grocer", &format!("question note {i}"));
+        }
+        assert_eq!(prompts.lock().unwrap().len(), 8);
+        let prompt = prompts.lock().unwrap()[7].clone();
+        // Twelve turns (six exchanges of player + NPC) fit; the oldest
+        // exchange has been evicted by the eighth follow-up.
+        assert!(
+            !prompt.contains("note 1") && !prompt.contains("note 2"),
+            "the oldest exchanges must have been evicted from the bounded window"
+        );
+        assert!(
+            prompt.contains("note 3") && prompt.contains("note 7"),
+            "the recent exchange window must still be present: {prompt}"
+        );
+        assert_eq!(
+            prompt.matches("question note 8").count(),
+            1,
+            "the current utterance must not be duplicated into the bounded history"
+        );
+        assert!(s.conversation_turns.len() <= MAX_CONVERSATION_TURNS);
+    }
+
+    /// The deterministic fallback path (no model) completes the multi-turn
+    /// bargain on a follow-up turn exactly like the runtime's fallback, and
+    /// the session's tracked memory carries the whole exchange with speaker
+    /// attribution.
+    #[test]
+    fn heuristic_fallback_resolves_follow_up_bargain_with_history() {
+        let mut s = Session::new(2026);
+        s.teleport_player_to("grocer");
+
+        // Turn 1: the heuristic offers the designed conditional bargain.
+        s.say("grocer", "I need to see your ledger.");
+        assert!(
+            s.sim
+                .world
+                .offers
+                .values()
+                .any(|o| o.from.as_str() == "grocer"),
+            "the heuristic must propose the conditional bargain"
+        );
+        let offer = s
+            .sim
+            .world
+            .offers
+            .values()
+            .find(|o| o.from.as_str() == "grocer")
+            .cloned()
+            .expect("conditional offer");
+        assert!(matches!(
+            s.player_do(Action::AcceptOffer { offer: offer.id }),
+            ValidationOutcome::Accepted
+        ));
+        s.give("medicine", 1);
+        assert!(matches!(
+            s.player_do(Action::TransferItem {
+                target: ActorId::new("grocer"),
+                item: ItemId::new("medicine"),
+                qty: 1,
+            }),
+            ValidationOutcome::Accepted
+        ));
+        s.tick();
+        assert!(
+            s.sim
+                .world
+                .commitments
+                .values()
+                .any(|c| c.state == rpg_domain::social::CommitmentState::Satisfied),
+            "delivery must satisfy the deal"
+        );
+
+        // Turn 2 (a follow-up): the heuristic honours the delivered bargain,
+        // resolving from the tracked conversation history like the runtime's
+        // synchronous fallback does.
+        s.teleport_player_to("grocer");
+        s.say("grocer", "Now the ledger, as we agreed.");
+        assert!(
+            s.sim
+                .world
+                .has_heard(&ActorId::new(PLAYER), &FactId::new("f_grocer_ledger")),
+            "the satisfied deal must be honoured on the follow-up turn"
+        );
+        assert_eq!(
+            s.conversation_target.as_ref().map(|a| a.as_str()),
+            Some("grocer")
+        );
+        let turns: Vec<(String, String)> = s
+            .conversation_turns
+            .iter()
+            .map(|(who, said)| (who.0.clone(), said.clone()))
+            .collect();
+        assert!(
+            turns.contains(&("player".into(), "I need to see your ledger.".to_string())),
+            "the tracked memory must keep the player's opening turn: {turns:?}"
+        );
+        assert!(
+            turns
+                .iter()
+                .any(|(who, said)| who == "grocer" && !said.is_empty()),
+            "the tracked memory must keep the grocer's spoken replies: {turns:?}"
+        );
+        assert!(
+            turns.contains(&("player".into(), "Now the ledger, as we agreed.".to_string())),
+            "the tracked memory must keep the follow-up utterance: {turns:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Privacy boundary regressions on the real town, through the Session
+    // commit path the clients share (policy redaction -> validation ->
+    // spoken line).
+    // -----------------------------------------------------------------------
+
+    /// A scripted model that leaks the leader's identity in every
+    /// player-visible word field: the policy replaces Speak, offer notes,
+    /// promise terms and threat demands with the canonical deflection, and
+    /// what the character "says aloud" (the committed spoken line) is the
+    /// deflection, never the leak.
+    #[test]
+    fn scripted_model_leaks_are_deflected_in_every_spoken_field() {
+        let leaks = [
+            r#"{"action":"speak","text":"Selene Voss is the leader of the mafia."}"#,
+            r#"{"action":"offer","note":"I will tell you the leader of the mafia for coin.","want":["ledger"]}"#,
+            r#"{"action":"promise","terms":"I promise to show you where the contraband is stockpiled."}"#,
+            r#"{"action":"threaten","demand":"Pay me, or everyone learns the dockmaster is the lieutenant."}"#,
+        ];
+        for raw in leaks {
+            let engine = rpg_agents::ScriptedEngine::new().with_default(raw);
+            let mut s = Session::with_engine(2026, Box::new(engine));
+            s.teleport_player_to("spy");
+            let spoken = s
+                .npc_respond("spy", "Tell me what you know.")
+                .expect("the action must commit");
+            assert_eq!(
+                spoken,
+                rpg_agents::SPEAK_DEFLECTION,
+                "leak must be deflected: {raw}"
+            );
+        }
+    }
+
+    /// The merchant head believes the leader's identity but is not authorised
+    /// to disclose it; the biography-scoped phrasing that dodges "leader"
+    /// must still deflect through the shared commit path, in the Speak field
+    /// and the offer note (privacy review).
+    #[test]
+    fn scripted_merchant_head_mafia_echo_is_deflected() {
+        let leaks = [
+            (
+                "speak",
+                r#"{"action":"speak","text":"Selene Voss runs the mafia."}"#,
+            ),
+            (
+                "offer note",
+                r#"{"action":"offer","note":"Selene Voss runs the mafia.","want":["ledger"]}"#,
+            ),
+        ];
+        for (field, raw) in leaks {
+            let engine = rpg_agents::ScriptedEngine::new().with_default(raw);
+            let mut s = Session::with_engine(2026, Box::new(engine));
+            s.teleport_player_to("merchant_head");
+            let spoken = s
+                .npc_respond("merchant_head", "Good morning.")
+                .expect("the action must commit");
+            assert_eq!(
+                spoken,
+                rpg_agents::SPEAK_DEFLECTION,
+                "leak must be deflected in {field}"
+            );
+        }
+    }
+
+    /// Public vocabulary passes through the whole chain verbatim: ordinary
+    /// speech and free-text offer fields about the market, merchants and
+    /// public figures are never rewritten.
+    #[test]
+    fn scripted_model_public_speech_passes_through_untouched() {
+        let pass_through = [
+            (
+                "merchant_head",
+                r#"{"action":"speak","text":"The market is busy today."}"#,
+                "The market is busy today.",
+            ),
+            (
+                "spy",
+                r#"{"action":"offer","note":"Buy apples at the market.","want":["ledger"]}"#,
+                "Buy apples at the market.",
+            ),
+            (
+                "spy",
+                r#"{"action":"speak","text":"The customs house is disused."}"#,
+                "The customs house is disused.",
+            ),
+        ];
+        for (npc, raw, expected) in pass_through {
+            let engine = rpg_agents::ScriptedEngine::new().with_default(raw);
+            let mut s = Session::with_engine(2026, Box::new(engine));
+            s.teleport_player_to(npc);
+            let spoken = s
+                .npc_respond(npc, "Good morning.")
+                .expect("the action must commit");
+            assert_eq!(spoken, expected, "{npc} must speak verbatim");
+        }
     }
 }
