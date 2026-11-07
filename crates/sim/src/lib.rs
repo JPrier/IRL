@@ -234,6 +234,15 @@ pub struct SimTransient {
     /// persisted for exact continuation (old saves load with the default).
     #[serde(default)]
     pub planner: rpg_behavior::PlannerState,
+    /// Formal punitive-sanction identity ledger (plan I-6 I6a): the
+    /// (evidence fact × subject) incidents already punished. One incident is
+    /// punishable exactly once — retold evidence about the same incident
+    /// never permits repeat punishment, while a genuinely new incident (a
+    /// new fact) is a new identity and stays actionable. Persisted so a
+    /// save/load cycle cannot forget who was already punished (old saves
+    /// load with an empty ledger).
+    #[serde(default)]
+    pub sanctions: BTreeSet<(FactId, ActorId)>,
 }
 
 /// A recorded public entry point, used for input/proposal replay.
@@ -292,6 +301,8 @@ pub struct Simulation {
     /// The most recent planner pass (observability of the budget/work caps;
     /// rebuilt identically by replay, never persisted).
     last_planner_pass: PlannerPassRecord,
+    /// Formal punitive-sanction identity ledger (see `SimTransient::sanctions`).
+    pub sanctions: BTreeSet<(FactId, ActorId)>,
 }
 
 impl Simulation {
@@ -312,6 +323,7 @@ impl Simulation {
             autonomy: GoalAutonomy::default(),
             deal_intentions: BTreeMap::new(),
             planner: rpg_behavior::PlannerState::default(),
+            sanctions: BTreeSet::new(),
             recording: true,
             outcomes: Vec::new(),
             causal_traces: Vec::new(),
@@ -358,6 +370,7 @@ impl Simulation {
             autonomy: transient.autonomy,
             deal_intentions: transient.deal_intentions,
             planner: transient.planner,
+            sanctions: transient.sanctions,
             recording: true,
             outcomes: Vec::new(),
             causal_traces: Vec::new(),
@@ -376,6 +389,7 @@ impl Simulation {
             autonomy: self.autonomy.clone(),
             deal_intentions: self.deal_intentions.clone(),
             planner: self.planner.clone(),
+            sanctions: self.sanctions.clone(),
         }
     }
 
@@ -681,6 +695,14 @@ impl Simulation {
             }
             Action::Pay { target, amount } => {
                 in_range(target)?;
+                // Paying oneself is not an action: money would not move and
+                // the "transfer" must not fake a wealth-need gain — reject
+                // the nonsensical act neutrally before any state can change.
+                if *target == proposal.actor {
+                    return Err(RejectReason::Invalid(
+                        "paying oneself is not a transfer".into(),
+                    ));
+                }
                 // Payment must be a real transfer: zero or negative amounts
                 // would move nothing (or mint money) — reject before any
                 // mutation.
@@ -718,6 +740,15 @@ impl Simulation {
                 evidence,
             } => {
                 in_range(target)?;
+                // A sanction is never self-directed: punishing (or
+                // commending) oneself moves nothing and means nothing —
+                // reject the nonsensical act neutrally before any state
+                // can change.
+                if *target == proposal.actor {
+                    return Err(RejectReason::Invalid(
+                        "a sanction cannot target its own authority".into(),
+                    ));
+                }
                 // AUTHORITY: a sanction is an institutional act; the proposer
                 // must actually hold institutional authority (capability or
                 // the canonical authority flag). Without it the act is
@@ -749,6 +780,23 @@ impl Simulation {
                     let target_actor = self.world.actor(target).expect("checked in_range");
                     if target_actor.inventory.money < *amount {
                         return Err(RejectReason::InsufficientFunds);
+                    }
+                }
+                // IDENTITY (plan I-6 I6a): one incident — (evidence fact ×
+                // subject) — is formally punishable exactly once, by any
+                // authority, no matter how often the evidence is retold.
+                // Repeat punishment is rejected neutrally (no fine, no
+                // appraisal); a genuinely distinct incident cites a
+                // different fact and remains actionable. Praise is
+                // commendation, not punishment, and sits outside the
+                // identity ledger.
+                if !matches!(kind, SanctionKind::Praise) {
+                    for fact in evidence {
+                        if self.sanctions.contains(&(fact.clone(), target.clone())) {
+                            return Err(RejectReason::Invalid(format!(
+                                "{target} has already been formally sanctioned over {fact}"
+                            )));
+                        }
                     }
                 }
             }
@@ -2472,7 +2520,16 @@ impl Simulation {
 
     /// Move money between actors (contractual component of deals). The
     /// caller validates funds first, so this conserves the total exactly.
+    /// Identical parties are a structural no-op (net-change-aware: a
+    /// "transfer" to oneself moves nothing, fakes no events and — critically
+    /// — must not fake a wealth-need gain through the deplete/satisfy
+    /// asymmetry; the validation gate already rejects self-directed acts,
+    /// this guard keeps the shared lowering honest if any path ever reaches
+    /// it with identical parties).
     fn transfer_money(&mut self, from: &ActorId, to: &ActorId, amount: i64) {
+        if from == to {
+            return;
+        }
         if let Some(a) = self.world.actor_mut(from) {
             a.inventory.money -= amount;
         }
@@ -2511,8 +2568,13 @@ impl Simulation {
     /// caller validates custody first, so this is `qty` in validated flows).
     /// Settlement evidence must record this *actual* count, not the
     /// requested one (§4.3: `DealPartialDelivery` is evidence of what was
-    /// really delivered).
+    /// really delivered). Identical parties are a no-op (a self-transfer
+    /// moves nothing and must not fake a wealth-need movement — same
+    /// net-change-aware rule as `transfer_money`).
     fn move_item(&mut self, from: &ActorId, to: &ActorId, item: &ItemId, qty: u32) -> u32 {
+        if from == to {
+            return 0;
+        }
         let removed = self
             .world
             .actor_mut(from)
@@ -2898,6 +2960,16 @@ impl Simulation {
         evidence: Vec<FactId>,
     ) -> ValidationOutcome {
         let (tick, minute) = (self.world.tick, self.world.minute_of_day);
+        // IDENTITY (plan I-6 I6a): dispatch records the punished incident
+        // identities exactly once, right here — the one authoritative site
+        // a punitive sanction passes through. Same identity policy the
+        // validation gate enforces (and candidate generation respects): one
+        // (evidence fact × subject) incident is punishable exactly once.
+        if !matches!(kind, SanctionKind::Praise) {
+            for fact in &evidence {
+                self.sanctions.insert((fact.clone(), target.clone()));
+            }
+        }
         self.effects_buf.push(Effect::Sanction {
             authority: proposal.actor.clone(),
             subject: target.clone(),
@@ -3810,13 +3882,17 @@ impl Simulation {
         }
         // Deal responses (behavior-engine Phase 2): an actor with a due
         // obligation answers it through the ranked options. The same at-post
-        // gate applies: a due deal never hijacks a schedule move.
+        // gate applies: a due deal never hijacks a schedule move. A dropped
+        // proposal's sampled decision record goes with it — a pending
+        // decision must never outlive its proposal and mis-attribute itself
+        // to the actor's next unrelated trace.
         for p in self.deal_response_proposals(&acted) {
             let at_post = match routine.iter().find(|r| r.actor == p.actor) {
                 Some(r) => matches!(r.action, Action::Idle),
                 None => true,
             };
             if !at_post {
+                self.pending_decisions.remove(&p.actor);
                 continue;
             }
             claimed.insert(p.actor.clone());
@@ -3831,12 +3907,16 @@ impl Simulation {
         // needs, gated emotion responses and existing plans — continuing
         // plans on the fast path and replanning under explicit per-activation
         // work caps. Same at-post gate: a plan never hijacks a schedule move.
+        // A dropped proposal's sampled decision record goes with it — a
+        // pending decision must never outlive its proposal and mis-attribute
+        // itself to the actor's next unrelated trace.
         for p in self.planner_proposals(&acted, &claimed) {
             let at_post = match routine.iter().find(|r| r.actor == p.actor) {
                 Some(r) => matches!(r.action, Action::Idle),
                 None => true,
             };
             if !at_post {
+                self.pending_decisions.remove(&p.actor);
                 continue;
             }
             if let Some(pos) = routine.iter().position(|r| r.actor == p.actor) {
@@ -4330,7 +4410,10 @@ impl Simulation {
             .activation
             .ensure_order(&eligible.iter().cloned().collect::<Vec<_>>());
         self.planner.prune_abandoned(tick);
-        let activated = self.planner.activation.pick(&eligible, &priority, budget);
+        let activated = self
+            .planner
+            .activation
+            .pick(&eligible, &priority, budget, tick);
 
         // 3. Per-activation work, under explicit caps.
         for actor in activated {
@@ -4338,6 +4421,9 @@ impl Simulation {
             let signal_count = self.planner.take_signals(&actor).len();
             let mut work = 0usize;
             let mut replanned = false;
+            // The intention this activation switches from, when the plan it
+            // retired is re-deliberated below (§4.2 switch bookkeeping).
+            let mut switch_from: Option<rpg_behavior::Intention> = None;
 
             // Fast path: the persistent plan continues without
             // re-deliberation while it stays valid (design §4.3, T2.1).
@@ -4365,24 +4451,34 @@ impl Simulation {
                             });
                             continue;
                         }
-                        out.push(ActionProposal {
-                            actor: actor.clone(),
-                            action: plan.action.clone(),
-                            source: ProposalSource::NpcPolicy,
-                            rationale: format!("plan: {} (fast path)", plan.intention.option),
-                        });
-                        self.last_planner_pass.activations.push(PlannerActivation {
-                            actor,
-                            signals: signal_count,
-                            work,
-                            replanned,
-                        });
-                        continue;
+                        if signal_count == 0 {
+                            out.push(ActionProposal {
+                                actor: actor.clone(),
+                                action: plan.action.clone(),
+                                source: ProposalSource::NpcPolicy,
+                                rationale: format!("plan: {} (fast path)", plan.intention.option),
+                            });
+                            self.last_planner_pass.activations.push(PlannerActivation {
+                                actor,
+                                signals: signal_count,
+                                work,
+                                replanned,
+                            });
+                            continue;
+                        }
+                        // Relevant signals arrived (the actor's own
+                        // appraisal, question, contract, need, gate, offer or
+                        // delivered claim): bounded reconsideration (design
+                        // §4.3 medium path). The plan stays installed and is
+                        // ranked as the incumbent below — it is kept unless a
+                        // challenger beats it through the switch penalty.
                     }
                     rpg_behavior::Replan::Replan(rpg_behavior::ReplanReason::GoalSatisfied) => {
                         // The plan reached its predicate: retire it and
                         // re-deliberate below (the same activation may adopt
-                        // the next grounded plan).
+                        // the next grounded plan). The retired intention is
+                        // the `previous` a fresh adoption switches from.
+                        switch_from = Some(plan.intention.clone());
                         self.planner.plans.remove(&actor);
                     }
                     rpg_behavior::Replan::Replan(rpg_behavior::ReplanReason::Abandoned) => {
@@ -4406,9 +4502,11 @@ impl Simulation {
                 }
             }
 
-            // Re-plan/deliberate: generate the actor's local candidates,
-            // bounded by the per-activation work cap (enforced inside
-            // generation).
+            // Re-plan/deliberate (a fresh adoption, a retirement, or — when
+            // relevant signals arrived during an active plan — a bounded
+            // reconsideration of the incumbent): generate the actor's local
+            // candidates, bounded by the per-activation work cap (enforced
+            // inside generation).
             replanned = true;
             let generated = rpg_agents::planner_candidates::planner_candidates(
                 &self.world,
@@ -4418,6 +4516,7 @@ impl Simulation {
                 &self.config.emotions,
                 self.config.talk_radius,
                 candidate_cap,
+                &self.sanctions,
             );
             work += generated.len();
             let candidates: Vec<&rpg_agents::planner_candidates::PlannerCandidate> = generated
@@ -4427,7 +4526,8 @@ impl Simulation {
                 .collect();
             if candidates.is_empty() {
                 // Nothing grounded to do — an activation with no work spent
-                // is honest no-op (bounded deliberation, §4.3).
+                // is honest no-op (bounded deliberation, §4.3). A plan that
+                // was merely reconsidered stays installed.
                 self.last_planner_pass.activations.push(PlannerActivation {
                     actor,
                     signals: signal_count,
@@ -4436,6 +4536,17 @@ impl Simulation {
                 });
                 continue;
             }
+            // The live incumbent (an active plan under reconsideration) is
+            // ranked *as* the current intention: challengers pay the §4.2
+            // switch penalty (η_i·switch_i), so signals genuinely reopen
+            // deliberation without defeating intention persistence.
+            let previous = self
+                .planner
+                .plans
+                .get(&actor)
+                .map(|p| p.intention.clone())
+                .or(switch_from);
+            let incumbent = previous.as_ref().map(|i| i.option.clone());
             let params = rpg_behavior::Params {
                 switch_penalty: 2.0,
                 tau: self.config.utility_sampling.tau,
@@ -4451,7 +4562,7 @@ impl Simulation {
                     .iter()
                     .map(|c| c.option.clone())
                     .collect::<Vec<_>>(),
-                None,
+                incumbent.as_deref(),
                 params,
                 &needs,
                 &self.config.needs,
@@ -4509,6 +4620,26 @@ impl Simulation {
                     tau: params.tau,
                 },
             );
+            // Reconsideration kept the incumbent: the plan is *not*
+            // re-adopted (its adopted tick and failure history persist —
+            // intention persistence, §4.3); it simply continues this tick.
+            if let Some(plan) = self.planner.plans.get(&actor).cloned() {
+                if plan.intention.option == sampled.id {
+                    out.push(ActionProposal {
+                        actor: actor.clone(),
+                        action: plan.action.clone(),
+                        source: ProposalSource::NpcPolicy,
+                        rationale: format!("plan: {} (reconsidered: kept)", plan.intention.option),
+                    });
+                    self.last_planner_pass.activations.push(PlannerActivation {
+                        actor,
+                        signals: signal_count,
+                        work,
+                        replanned,
+                    });
+                    continue;
+                }
+            }
             let plan = rpg_behavior::planner::adopt_plan(
                 &candidate.summary,
                 candidate.option.id.clone(),
@@ -4519,6 +4650,7 @@ impl Simulation {
                     predicate: None,
                 },
                 tick,
+                previous.as_ref(),
             );
             self.planner.plans.insert(actor.clone(), plan);
             out.push(ActionProposal {

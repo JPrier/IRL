@@ -753,6 +753,7 @@ fn t4_10a_sanction_candidate_requires_authority_and_evidence() {
         &s.config.emotions,
         s.config.talk_radius,
         8,
+        &BTreeSet::new(),
     );
     assert!(
         !witness_candidates
@@ -927,6 +928,7 @@ fn t4_10b_excuse_deal_candidate_is_grounding_gated() {
         &s.config.emotions,
         s.config.talk_radius,
         8,
+        &BTreeSet::new(),
     );
     assert!(
         !debtor_candidates
@@ -1240,4 +1242,775 @@ fn t0_5b_save_load_preserves_plans_sampling_and_continues_identically() {
     });
     let old: rpg_sim::SimTransient = serde_json::from_value(legacy).unwrap();
     assert!(old.planner.plans.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// T4.1c (adversarial, review F1): sustained signal load cannot starve the
+// rotation. One actor is re-signaled every tick while two others are
+// eligible through persistent plans; budget 1 must still rotate through all
+// three, and the fairness state must survive save/load exactly.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn t4_1c_sustained_signal_load_cannot_starve_the_rotation() {
+    let mut s = sim(world_fixture());
+    // n1 ("X") is perpetually gated *at* its flee destination: the bully
+    // stays in the hall, n1 already fled to the docks, and the fear gate
+    // keeps firing (re-signaling n1) every single tick.
+    s.world
+        .actors
+        .insert(a("bully").clone(), actor("bully", HALL, 4.0));
+    {
+        let n1 = s.world.actor_mut(&a("n1")).unwrap();
+        n1.location = LocationId::new(DOCKS);
+        n1.pos = Vec2::new(33.0, 5.0);
+        n1.relationship_mut(&a("bully")).fear = 0.9;
+    }
+    // n2/n3 ("Y"/"Z") are eligible through persistent, open-ended plans.
+    let criteria = rpg_domain::behavior_types::AbandonmentCriteria {
+        after_failed_attempts: None,
+        predicate: None,
+    };
+    for (id, other) in [("n2", "n1"), ("n3", "n2")] {
+        let plan = rpg_behavior::planner::adopt_plan(
+            "stay close to a friend",
+            format!("seek_comfort_move:{other}"),
+            Action::MoveTo {
+                location: LocationId::new(MARKET),
+            },
+            None,
+            criteria.clone(),
+            0,
+            None,
+        );
+        s.planner.plans.insert(a(id), plan);
+    }
+
+    let mut activated: BTreeMap<String, usize> = BTreeMap::new();
+    for step in 0..24 {
+        // Sustained load: the fear gate is topped up every tick, so n1 is
+        // re-signaled and priority-claimed every single tick.
+        fear_of(&mut s, "n1", 0.8);
+        s.step(Vec::new());
+        assert!(
+            s.last_planner_pass().activations.len() <= 1,
+            "activation budget exceeded at step {step}"
+        );
+        for act in &s.last_planner_pass().activations {
+            *activated.entry(act.actor.0.clone()).or_default() += 1;
+        }
+    }
+    for id in ["n1", "n2", "n3"] {
+        let count = activated.get(id).copied().unwrap_or(0);
+        assert!(
+            count >= 1,
+            "{id} starved under sustained signal load (activations: {activated:?})"
+        );
+    }
+
+    // Replay stability: the rotation state round-trips through the same
+    // persistence path and both runs continue identically.
+    let json = serde_json::to_string(&s.transient()).unwrap();
+    let transient: rpg_sim::SimTransient = serde_json::from_str(&json).unwrap();
+    let mut restored = Simulation::restore_full(
+        s.seed,
+        s.world.clone(),
+        s.events.clone(),
+        s.rng.clone(),
+        transient,
+        s.ops.clone(),
+        s.initial_world.clone(),
+        s.config.clone(),
+    );
+    for _ in 0..12 {
+        s.step(Vec::new());
+        restored.step(Vec::new());
+    }
+    assert_eq!(s.events.checksum(), restored.events.checksum());
+    assert_eq!(
+        serde_json::to_string(&s.planner).unwrap(),
+        serde_json::to_string(&restored.planner).unwrap(),
+        "planner state (incl. rotation history) must round-trip identically"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T4.10c (adversarial, review F2): sanction identity — one incident
+// (evidence fact × subject) is punishable exactly once, across candidate
+// generation AND authoritative dispatch, surviving save/load; a genuinely
+// distinct incident remains actionable; money stays conserved.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn t4_10c_sanction_identity_is_enforced_once_across_generation_and_dispatch() {
+    let mut s = sim(world_fixture());
+    add_fact(
+        &mut s.world,
+        "f_assault",
+        FactCategory::Crime,
+        Sensitivity::Public,
+    );
+    add_fact(
+        &mut s.world,
+        "f_assault_2",
+        FactCategory::Crime,
+        Sensitivity::Public,
+    );
+    s.world
+        .actors
+        .insert(a("vandal").clone(), actor("vandal", HALL, 5.0));
+    s.world
+        .actors
+        .insert(a("witness").clone(), actor("witness", HALL, 6.0));
+    s.world
+        .actors
+        .insert(a("witness2").clone(), actor("witness2", HALL, 7.0));
+    s.world
+        .actors
+        .insert(a("captain").clone(), actor("captain", HALL, 6.0));
+    s.world
+        .actor_mut(&a("captain"))
+        .unwrap()
+        .capabilities
+        .can_arrest = true;
+    s.world
+        .actor_mut(&a("captain"))
+        .unwrap()
+        .relationship_mut(&a("witness"))
+        .trust = 1.0;
+    for id in ["vandal", "captain"] {
+        s.world.actor_mut(&a(id)).unwrap().inventory.money = 100;
+    }
+    let money_before: i64 = s.world.actors.values().map(|a| a.inventory.money).sum();
+
+    // Incident 1: vandal threatens the witness; two witnesses saw it and
+    // both report (corroboration grounds the subject with real confidence).
+    apply(
+        &mut s,
+        "vandal",
+        Action::Threaten {
+            target: a("witness"),
+            demand: "leave the docks".into(),
+        },
+    );
+    let threat_1 = last_event(&s, |k| matches!(k, EventKind::ThreatMade { .. }))
+        .map(|e| e.id)
+        .expect("threat event");
+    let (t, m) = (s.world.tick, s.world.minute_of_day);
+    for w in ["witness", "witness2"] {
+        record_provenance_evidence(
+            &mut s.world,
+            &mut s.events,
+            t,
+            m,
+            &a(w),
+            &FactId::new("f_assault"),
+            true,
+            &Provenance::Witnessed { event: threat_1 },
+        );
+        apply(
+            &mut s,
+            w,
+            Action::ReportCrime {
+                authority: a("captain"),
+                evidence: vec![FactId::new("f_assault")],
+            },
+        );
+    }
+    let mut sanctioned = false;
+    for _ in 0..4 {
+        s.step(Vec::new());
+        if last_event(&s, |k| matches!(k, EventKind::SanctionIssued { .. })).is_some() {
+            sanctioned = true;
+            break;
+        }
+    }
+    assert!(sanctioned, "the authority must sanction a real incident");
+    assert_eq!(s.world.actor(&a("vandal")).unwrap().inventory.money, 90);
+    assert_eq!(s.world.actor(&a("captain")).unwrap().inventory.money, 110);
+
+    // The identity ledger is persisted (transient save state).
+    let json = serde_json::to_string(&s.transient()).unwrap();
+    let transient: rpg_sim::SimTransient = serde_json::from_str(&json).unwrap();
+    assert!(
+        transient
+            .sanctions
+            .contains(&(FactId::new("f_assault"), a("vandal"))),
+        "the punished incident identity must persist through save/load"
+    );
+    let mut restored = Simulation::restore_full(
+        s.seed,
+        s.world.clone(),
+        s.events.clone(),
+        s.rng.clone(),
+        transient,
+        s.ops.clone(),
+        s.initial_world.clone(),
+        s.config.clone(),
+    );
+
+    // Sustained report/retelling load — 12 more steps of the SAME evidence,
+    // in the original run and in the restored one: no repeat punishment.
+    for target in [&mut s, &mut restored] {
+        for _ in 0..12 {
+            apply(
+                target,
+                "witness",
+                Action::ReportCrime {
+                    authority: a("captain"),
+                    evidence: vec![FactId::new("f_assault")],
+                },
+            );
+            target.step(Vec::new());
+        }
+        let fines = target
+            .events
+            .all()
+            .iter()
+            .filter(|e| {
+                matches!(
+                    &e.kind,
+                    EventKind::SanctionIssued { subject, evidence, .. }
+                        if subject == &a("vandal")
+                            && evidence.contains(&FactId::new("f_assault"))
+                )
+            })
+            .count();
+        assert_eq!(
+            fines, 1,
+            "the same incident/evidence must not permit repeat punishment"
+        );
+        assert_eq!(
+            target.world.actor(&a("vandal")).unwrap().inventory.money,
+            90,
+            "no repeated fine"
+        );
+        // Autonomous generation respects the identity: the authority
+        // generates no sanction candidate over adjudicated evidence.
+        let captain_candidates = rpg_agents::planner_candidates::planner_candidates(
+            &target.world,
+            &a("captain"),
+            &target.events,
+            &target.config.needs,
+            &target.config.emotions,
+            target.config.talk_radius,
+            8,
+            &target.sanctions,
+        );
+        assert!(
+            !captain_candidates
+                .iter()
+                .any(|c| c.option.id.starts_with("sanction:")),
+            "an adjudicated incident must not be re-proposed by generation"
+        );
+    }
+
+    // An externally repeated proposal is rejected neutrally (authoritative
+    // validation/dispatch side of the identity policy).
+    let outcome = s.apply(&ActionProposal {
+        actor: a("captain"),
+        action: Action::Sanction {
+            target: a("vandal"),
+            kind: SanctionKind::Fine { amount: 10 },
+            evidence: vec![FactId::new("f_assault")],
+        },
+        source: ProposalSource::Player,
+        rationale: String::new(),
+    });
+    assert!(
+        matches!(outcome, rpg_domain::action::ValidationOutcome::Rejected(_)),
+        "a repeat sanction over unchanged evidence must be rejected"
+    );
+    assert_eq!(s.world.actor(&a("vandal")).unwrap().inventory.money, 90);
+    assert!(
+        !matches!(
+            outcome,
+            rpg_domain::action::ValidationOutcome::Pending { .. }
+        ),
+        "the rejection is neutral — no pending side state"
+    );
+
+    // A genuinely distinct incident (a new fact with its own origin event)
+    // remains actionable: one more sanction, exactly once.
+    apply(
+        &mut s,
+        "vandal",
+        Action::Threaten {
+            target: a("witness"),
+            demand: "leave the docks again".into(),
+        },
+    );
+    let threat_2 = last_event(&s, |k| matches!(k, EventKind::ThreatMade { .. }))
+        .map(|e| e.id)
+        .expect("second threat event");
+    let (t2, m2) = (s.world.tick, s.world.minute_of_day);
+    for w in ["witness", "witness2"] {
+        record_provenance_evidence(
+            &mut s.world,
+            &mut s.events,
+            t2,
+            m2,
+            &a(w),
+            &FactId::new("f_assault_2"),
+            true,
+            &Provenance::Witnessed { event: threat_2 },
+        );
+        apply(
+            &mut s,
+            w,
+            Action::ReportCrime {
+                authority: a("captain"),
+                evidence: vec![FactId::new("f_assault_2")],
+            },
+        );
+    }
+    let mut sanctioned_2 = false;
+    for _ in 0..12 {
+        s.step(Vec::new());
+        if let Some(e) = s.events.all().iter().rev().find(|e| {
+            matches!(
+                &e.kind,
+                EventKind::SanctionIssued { evidence, .. }
+                    if evidence.contains(&FactId::new("f_assault_2"))
+            )
+        }) {
+            match &e.kind {
+                EventKind::SanctionIssued {
+                    subject, evidence, ..
+                } => {
+                    assert_eq!(subject, &a("vandal"));
+                    assert_eq!(evidence, &vec![FactId::new("f_assault_2")]);
+                    sanctioned_2 = true;
+                }
+                _ => unreachable!(),
+            }
+            break;
+        }
+    }
+    assert!(
+        sanctioned_2,
+        "a genuinely distinct incident must remain actionable"
+    );
+    assert_eq!(
+        s.world.actor(&a("vandal")).unwrap().inventory.money,
+        80,
+        "exactly one fine per distinct incident"
+    );
+    // Conservation: fines moved money, they never minted or destroyed it.
+    let total: i64 = s.world.actors.values().map(|a| a.inventory.money).sum();
+    assert_eq!(
+        total, money_before,
+        "money is conserved modulo recorded transfers"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T3.9c (review F3): self-directed payments/fines are rejected neutrally —
+// no money movement, no fictitious `NeedChanged`, no ledger entry — while a
+// legitimate distinct-party transfer keeps its exactly-once effects.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn t3_9c_self_payment_and_self_sanction_are_neutrally_rejected() {
+    let mut s = sim(world_fixture());
+    add_fact(
+        &mut s.world,
+        "f_note",
+        FactCategory::Observation,
+        Sensitivity::Public,
+    );
+    s.world
+        .actors
+        .insert(a("captain").clone(), actor("captain", HALL, 6.0));
+    s.world
+        .actor_mut(&a("captain"))
+        .unwrap()
+        .capabilities
+        .can_arrest = true;
+    s.world.actor_mut(&a("captain")).unwrap().inventory.money = 100;
+    seed_belief(&mut s.world, "captain", "f_note");
+
+    let need_events_of = |sim: &Simulation, id: &str| {
+        sim.events
+            .all()
+            .iter()
+            .filter(|e| {
+                matches!(
+                    &e.kind,
+                    EventKind::NeedChanged { actor, .. } if actor == &a(id)
+                )
+            })
+            .count()
+    };
+    let needs_before = need_events_of(&s, "captain");
+
+    // Self-payment: rejected; money unchanged; no payment event; no
+    // need-movement event.
+    let outcome = s.apply(&ActionProposal {
+        actor: a("captain"),
+        action: Action::Pay {
+            target: a("captain"),
+            amount: 50,
+        },
+        source: ProposalSource::Player,
+        rationale: String::new(),
+    });
+    assert!(
+        matches!(outcome, rpg_domain::action::ValidationOutcome::Rejected(_)),
+        "self-payment must be rejected"
+    );
+    assert_eq!(
+        s.world.actor(&a("captain")).unwrap().inventory.money,
+        100,
+        "a rejected self-payment moves no money"
+    );
+    assert!(
+        s.events
+            .all()
+            .iter()
+            .all(|e| !matches!(&e.kind, EventKind::MoneyPaid { from, to, .. } if from == to)),
+        "no self-directed payment event"
+    );
+    assert_eq!(
+        need_events_of(&s, "captain"),
+        needs_before,
+        "no fictitious NeedChanged from a self-payment"
+    );
+
+    // Self-fine: rejected; no sanction event; money unchanged; and the
+    // rejected (never dispatched) act records no sanction identity.
+    let outcome = s.apply(&ActionProposal {
+        actor: a("captain"),
+        action: Action::Sanction {
+            target: a("captain"),
+            kind: SanctionKind::Fine { amount: 10 },
+            evidence: vec![FactId::new("f_note")],
+        },
+        source: ProposalSource::Player,
+        rationale: String::new(),
+    });
+    assert!(
+        matches!(outcome, rpg_domain::action::ValidationOutcome::Rejected(_)),
+        "a self-fine must be rejected"
+    );
+    assert_eq!(s.world.actor(&a("captain")).unwrap().inventory.money, 100);
+    assert!(
+        last_event(&s, |k| matches!(k, EventKind::SanctionIssued { .. })).is_none(),
+        "no sanction was issued"
+    );
+    assert_eq!(need_events_of(&s, "captain"), needs_before);
+    assert!(
+        s.sanctions.is_empty(),
+        "only dispatched sanctions record identity"
+    );
+
+    // The shared settlement path cannot even be constructed with identical
+    // parties: a self-deal has no counterparty and is validated out at
+    // proposal time (so no settlement transfer is reachable with identical
+    // parties; the shared transfer lowering additionally no-ops on them).
+    let outcome = s.apply(&ActionProposal {
+        actor: a("captain"),
+        action: Action::ProposeDeal {
+            target: a("captain"),
+            terms: "self deal".into(),
+            condition: QuestPredicate::HasMoney {
+                actor: a("captain"),
+                amount: 1,
+            },
+            performance: QuestPredicate::HasMoney {
+                actor: a("captain"),
+                amount: 1,
+            },
+            condition_deadline_minute: None,
+            performance_deadline_minute: None,
+            give: vec![],
+            money: 0,
+            note: String::new(),
+        },
+        source: ProposalSource::Player,
+        rationale: String::new(),
+    });
+    assert!(
+        matches!(outcome, rpg_domain::action::ValidationOutcome::Rejected(_)),
+        "a self-deal must be rejected (no identical-party settlement is reachable)"
+    );
+
+    // Compatibility: a legitimate transfer keeps its exactly-once effects.
+    s.world
+        .actors
+        .insert(a("payer").clone(), actor("payer", HALL, 5.0));
+    s.world.actor_mut(&a("payer")).unwrap().inventory.money = 100;
+    let outcome = s.apply(&ActionProposal {
+        actor: a("payer"),
+        action: Action::Pay {
+            target: a("captain"),
+            amount: 30,
+        },
+        source: ProposalSource::Player,
+        rationale: String::new(),
+    });
+    assert!(
+        !matches!(outcome, rpg_domain::action::ValidationOutcome::Rejected(_)),
+        "a legitimate payment must apply"
+    );
+    assert_eq!(s.world.actor(&a("payer")).unwrap().inventory.money, 70);
+    assert_eq!(s.world.actor(&a("captain")).unwrap().inventory.money, 130);
+    assert_eq!(
+        need_events_of(&s, "captain"),
+        needs_before + 1,
+        "a real transfer moves the recipient's wealth need exactly once"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T4.4b (review F4): relevant signals genuinely reconsider an active plan,
+// the current intention's switch penalty is supplied in that pathway, and
+// sustained signals never defeat the caps or the plan's persistence.
+// ---------------------------------------------------------------------------
+
+fn reconsideration_fixture(with_plan: bool) -> Simulation {
+    let mut cfg = config();
+    // Deterministic argmax: isolates the switch-penalty wiring from the
+    // softmax draw (sampling is covered by T2.9b).
+    cfg.utility_sampling.enabled = false;
+    let mut s = Simulation::new(world_fixture(), 2026, cfg);
+    s.world
+        .actors
+        .insert(a("bully").clone(), actor("bully", HALL, 4.0));
+    // n2 already stands at its flee destination (flee candidate cost 0); n3
+    // is the near source of its conflicted report (the query candidate).
+    {
+        let n2 = s.world.actor_mut(&a("n2")).unwrap();
+        n2.location = LocationId::new(DOCKS);
+        n2.pos = Vec2::new(33.0, 5.0);
+        n2.relationship_mut(&a("bully")).fear = 0.9;
+        n2.emotions.adjust(EmotionKind::Fear, 0.8, 1.0);
+        let n3 = s.world.actor_mut(&a("n3")).unwrap();
+        n3.location = LocationId::new(DOCKS);
+        n3.pos = Vec2::new(33.0, 5.0);
+    }
+    add_fact(
+        &mut s.world,
+        "f_conflict",
+        FactCategory::Observation,
+        Sensitivity::Public,
+    );
+    record_provenance_evidence(
+        &mut s.world,
+        &mut s.events,
+        0,
+        480,
+        &a("n2"),
+        &FactId::new("f_conflict"),
+        true,
+        &Provenance::Told {
+            by: a("n1"),
+            event: None,
+        },
+    );
+    record_provenance_evidence(
+        &mut s.world,
+        &mut s.events,
+        0,
+        480,
+        &a("n2"),
+        &FactId::new("f_conflict"),
+        false,
+        &Provenance::Told {
+            by: a("n3"),
+            event: None,
+        },
+    );
+    // The trigger fact the claimer lawfully holds and may share.
+    add_fact(
+        &mut s.world,
+        "f_noise",
+        FactCategory::Observation,
+        Sensitivity::Public,
+    );
+    seed_belief(&mut s.world, "n3", "f_noise");
+    if with_plan {
+        let plan = rpg_behavior::planner::adopt_plan(
+            "get away from bully",
+            "flee:bully:docks",
+            Action::MoveTo {
+                location: LocationId::new(DOCKS),
+            },
+            None,
+            rpg_domain::behavior_types::AbandonmentCriteria {
+                after_failed_attempts: None,
+                predicate: None,
+            },
+            0,
+            None,
+        );
+        s.planner.plans.insert(a("n2"), plan);
+    }
+    s
+}
+
+#[test]
+fn t4_4b_relevant_signals_reconsider_an_active_plan_with_switch_costs() {
+    // Fixture A: an active flee plan + a delivered claim (a relevant event).
+    // The claim must trigger *genuine* reconsideration — but the query
+    // challenger (raw utility above the incumbent) cannot beat the incumbent
+    // through the §4.2 switch penalty, so the plan is KEPT, not re-adopted.
+    let mut s = reconsideration_fixture(true);
+    apply(
+        &mut s,
+        "n3",
+        Action::ShareClaim {
+            target: a("n2"),
+            fact: FactId::new("f_noise"),
+            assertive: true,
+            deceptive: false,
+        },
+    );
+    s.step(Vec::new());
+    let activation = s
+        .last_planner_pass()
+        .activations
+        .iter()
+        .find(|act| act.actor == a("n2"))
+        .expect("n2 must be activated");
+    assert!(
+        activation.replanned && activation.work > 0,
+        "the relevant signal must trigger genuine reconsideration (candidates generated)"
+    );
+    let plan = s.planner.plans.get(&a("n2")).expect("plan persists");
+    assert_eq!(
+        plan.intention.option, "flee:bully:docks",
+        "the challenger must not beat the incumbent through the switch penalty"
+    );
+    assert_eq!(
+        plan.adopted_tick, 0,
+        "a kept incumbent is never re-adopted (adopted tick preserved)"
+    );
+    assert_eq!(plan.intention.switches, 0, "no switch occurred");
+    assert_eq!(plan.intention.failed_attempts, 0, "no failure recorded");
+
+    // Sustained signal load (the fear gate re-signals every tick): the
+    // reconsideration stays bounded (per-activation work cap) and never
+    // defeats intention persistence — the plan is never thrashed away.
+    for step in 1..6 {
+        fear_of(&mut s, "n2", 0.8);
+        s.step(Vec::new());
+        let plan = s.planner.plans.get(&a("n2")).expect("plan persists");
+        assert_eq!(plan.intention.option, "flee:bully:docks");
+        assert_eq!(
+            plan.adopted_tick, 0,
+            "still never re-adopted at step {step}"
+        );
+        assert!(
+            s.last_planner_pass().activations.len() <= 1,
+            "budget is a hard cap under sustained load"
+        );
+        for act in &s.last_planner_pass().activations {
+            assert!(
+                act.work <= s.config.activation.max_candidates_per_activation,
+                "per-activation work cap holds under sustained load"
+            );
+        }
+    }
+
+    // Fixture B (control): the same world without an active plan. The same
+    // delivered claim leads a fresh deliberation — with no current intention
+    // there is no switch penalty, and the challenger (the query) wins.
+    let mut control = reconsideration_fixture(false);
+    apply(
+        &mut control,
+        "n3",
+        Action::ShareClaim {
+            target: a("n2"),
+            fact: FactId::new("f_noise"),
+            assertive: true,
+            deceptive: false,
+        },
+    );
+    control.step(Vec::new());
+    let control_plan = control
+        .planner
+        .plans
+        .get(&a("n2"))
+        .expect("the fresh deliberation must adopt a plan");
+    assert!(
+        control_plan.intention.option.starts_with("query:"),
+        "without a current intention the challenger wins: {}",
+        control_plan.intention.option
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T2.9c (review finding): a proposal dropped at the at-post gate must take
+// its sampled decision record with it — a pending decision never
+// mis-attributes itself to the actor's next unrelated trace.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn t2_9c_dropped_at_post_proposal_leaves_no_stale_decision_record() {
+    let mut s = sim(world_fixture());
+    s.world
+        .actors
+        .insert(a("bully").clone(), actor("bully", HALL, 4.0));
+    fear_of(&mut s, "n2", 0.8);
+    s.world
+        .actor_mut(&a("n2"))
+        .unwrap()
+        .relationship_mut(&a("bully"))
+        .fear = 0.9;
+    // n2 is not at its post: the schedule demands the docks while n2 stands
+    // in the hall, so the planner's proposal for it is dropped at the gate.
+    s.world
+        .actor_mut(&a("n2"))
+        .unwrap()
+        .schedule
+        .push(rpg_domain::world::ScheduleEntry {
+            start_min: 0,
+            end_min: 1440,
+            location: LocationId::new(DOCKS),
+            activity: "watch the docks".into(),
+            public: false,
+        });
+    add_fact(
+        &mut s.world,
+        "f_other",
+        FactCategory::Observation,
+        Sensitivity::Public,
+    );
+    seed_belief(&mut s.world, "n1", "f_other");
+    apply(
+        &mut s,
+        "n1",
+        Action::ShareClaim {
+            target: a("n2"),
+            fact: FactId::new("f_other"),
+            assertive: true,
+            deceptive: false,
+        },
+    );
+
+    let traces_before = s.causal_traces.len();
+    s.step(Vec::new());
+    // The planner genuinely sampled a decision for n2 this step...
+    let activation = s
+        .last_planner_pass()
+        .activations
+        .iter()
+        .find(|act| act.actor == a("n2"))
+        .expect("n2 must have been activated (fixture premise)");
+    assert!(activation.replanned, "fixture: a candidate was considered");
+    // ...but its proposal was dropped at the at-post gate: the only n2
+    // proposal that actually applied is the schedule move, and its trace
+    // must carry no decision (the dropped decision went with its proposal).
+    let new_traces = &s.causal_traces[traces_before..];
+    assert!(
+        new_traces.iter().any(|t| t.actor == a("n2")),
+        "the schedule move applied"
+    );
+    for t in new_traces {
+        assert!(
+            t.decision.is_none(),
+            "a dropped proposal's decision must not mis-attribute to an unrelated trace"
+        );
+    }
 }

@@ -25,6 +25,7 @@ use rpg_domain::events::{Event, EventKind, EventLog};
 use rpg_domain::ids::*;
 use rpg_domain::needs::{NeedKind, NeedsConfig};
 use rpg_domain::world::{Actor, ActorKind, FactCategory, World};
+use std::collections::BTreeSet;
 
 /// One planner candidate: the utility option the ranking kernel scores plus
 /// the concrete typed action the plan would propose (validated by the sim).
@@ -78,7 +79,11 @@ pub fn is_one_shot_option(option: &str) -> bool {
 /// `max_candidates` is the per-activation work cap, enforced *inside*
 /// generation (an activation never considers more than its cap, whatever the
 /// world throws at it; design §9.2.4, M6); no actor-id literals; no
-/// world-truth reads.
+/// world-truth reads. `already_sanctioned` is the formal punitive-sanction
+/// ledger the actor must respect: an incident (evidence fact × subject)
+/// that was already punished is never re-proposed (repeat punishment is a
+/// policy violation, not a plan).
+#[allow(clippy::too_many_arguments)]
 pub fn planner_candidates(
     world: &World,
     npc: &ActorId,
@@ -87,6 +92,7 @@ pub fn planner_candidates(
     emotions_config: &EmotionsConfig,
     talk_radius: f32,
     max_candidates: usize,
+    already_sanctioned: &BTreeSet<(FactId, ActorId)>,
 ) -> Vec<PlannerCandidate> {
     let Some(actor) = world.actor(npc) else {
         return Vec::new();
@@ -106,7 +112,7 @@ pub fn planner_candidates(
         &mut out,
         cap,
     );
-    institutional_candidates(world, npc, events, &mut out, cap);
+    institutional_candidates(world, npc, events, already_sanctioned, &mut out, cap);
     need_candidates(world, npc, needs_config, talk_radius, &mut out, cap);
     out
 }
@@ -463,7 +469,20 @@ fn needs_company(world: &World, npc: &ActorId) -> bool {
 /// fact whose provenance names no originator yields no subject — the
 /// authority does not sanction on a bare assertion.
 fn believed_crime(world: &World, npc: &ActorId, events: &EventLog) -> Option<(FactId, ActorId)> {
-    let actor = world.actor(npc)?;
+    believed_crimes(world, npc, events).into_iter().next()
+}
+
+/// Every believed crime the actor can ground (bounded by the held
+/// proposition window), in the actor's deterministic held-proposition order.
+/// Grounding per fact is the same chain-origin rule as [`believed_crime`];
+/// the list shape lets standing duty skip an incident that was already
+/// formally punished and act on the next one — an adjudicated incident must
+/// never hide a genuinely distinct one behind it.
+fn believed_crimes(world: &World, npc: &ActorId, events: &EventLog) -> Vec<(FactId, ActorId)> {
+    let mut out: Vec<(FactId, ActorId)> = Vec::new();
+    let Some(actor) = world.actor(npc) else {
+        return out;
+    };
     let facts = held_propositions(world, npc, 8);
     for fact in facts {
         let Some(f) = world.fact(&fact) else {
@@ -515,11 +534,11 @@ fn believed_crime(world: &World, npc: &ActorId, events: &EventLog) -> Option<(Fa
         });
         if let Some(subject) = subject {
             if subject != *npc && world.actor(&subject).is_some_and(|a| a.is_alive()) {
-                return Some((fact, subject));
+                out.push((fact, subject));
             }
         }
     }
-    None
+    out
 }
 
 /// The nearest living authority actor (common knowledge of who the
@@ -545,11 +564,16 @@ fn nearest_authority(world: &World, npc: &ActorId) -> Option<ActorId> {
 /// reaction); (b) excuse an *overdue due* contract with evidence the
 /// authority actually holds. The gates are real contract state and the
 /// authority's own knowledge — an authority without the grounding generates
-/// nothing, and nobody else generates either.
+/// nothing, and nobody else generates either. The standing duty also
+/// respects the sanction identity policy: an (evidence fact × subject)
+/// incident that was already formally punished is not re-proposed —
+/// retold evidence about the same incident never produces repeat
+/// punishment (the authoritative gate enforces the same identity).
 fn institutional_candidates(
     world: &World,
     npc: &ActorId,
     events: &EventLog,
+    already_sanctioned: &BTreeSet<(FactId, ActorId)>,
     out: &mut Vec<PlannerCandidate>,
     cap: usize,
 ) {
@@ -559,8 +583,13 @@ fn institutional_candidates(
     if !(actor.capabilities.can_arrest || actor.has_flag("authority")) || out.len() >= cap {
         return;
     }
-    // Standing duty: the grounded sanction on real evidence.
-    if let Some((fact, culprit)) = believed_crime(world, npc, events) {
+    // Standing duty: the grounded sanction on real evidence. An incident
+    // that was already formally punished is skipped — standing duty moves on
+    // to the next believed crime instead of re-punishing.
+    if let Some((fact, culprit)) = believed_crimes(world, npc, events)
+        .into_iter()
+        .find(|(fact, culprit)| !already_sanctioned.contains(&(fact.clone(), culprit.clone())))
+    {
         let near = matches!(
             (world.actor(&culprit), world.actor(npc)),
             (Some(c), Some(m)) if c.location == m.location && c.pos.distance(m.pos) <= 6.0

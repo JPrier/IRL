@@ -8,7 +8,9 @@
 //!   least one activation slot per window (design §8
 //!   `pick_active_agents_with_budget`), with explicit per-step budget and
 //!   per-activation work caps (design §9.2.4, M6). Relevant events
-//!   (signals) activate sooner; nothing here lets one actor monopolize
+//!   (signals) activate sooner — but a signal claim may jump the rotation
+//!   queue at most once per full rotation window, so sustained signal load
+//!   cannot starve the rotation; nothing here lets one actor monopolize
 //!   activations or lets an unrelated event spawn work.
 //! * **Persistent plans** ([`Plan`]): the adopted plan with its concrete
 //!   next step, its satisfaction predicate and abandonment criteria
@@ -106,6 +108,14 @@ pub struct ActivationState {
     pub order: Vec<ActorId>,
     /// Round-robin cursor into `order`.
     pub cursor: usize,
+    /// Tick of each actor's most recent activation. A priority (signal)
+    /// claim may jump the rotation queue at most once per full rotation
+    /// window (`order.len()` ticks) — the bound that keeps sustained
+    /// signal load from starving the rotation (design §8: every eligible
+    /// NPC receives at least one activation slot per window even when
+    /// another actor is re-signaled every tick).
+    #[serde(default)]
+    pub last_activated: BTreeMap<ActorId, u64>,
 }
 
 impl ActivationState {
@@ -131,34 +141,59 @@ impl ActivationState {
     /// round-robin from the cursor over the rest, each picked actor
     /// advancing the cursor past itself. Deterministic; no actor can be
     /// activated twice in one step; the budget is a hard cap.
+    ///
+    /// Non-starvation under sustained signal load (design §8: every
+    /// eligible NPC receives at least one activation slot per window): a
+    /// priority actor may *jump* the queue at most once per full rotation
+    /// window (`order.len()` ticks since its last activation of any kind).
+    /// Within the window a re-signaled actor waits its ordinary rotation
+    /// turn — so a persistently re-signaled actor cannot monopolize a
+    /// budget shared with other eligible actors, while a *freshly*
+    /// relevant actor still activates sooner.
     pub fn pick(
         &mut self,
         eligible: &BTreeSet<ActorId>,
         priority: &[ActorId],
         budget: usize,
+        now: u64,
     ) -> Vec<ActorId> {
         let mut picked: Vec<ActorId> = Vec::new();
         if budget == 0 || self.order.is_empty() {
             return picked;
         }
+        let len = self.order.len();
+        let window = len.max(1) as u64;
         for a in priority {
             if picked.len() >= budget {
                 return picked;
             }
-            if eligible.contains(a) && !picked.contains(a) {
+            if !eligible.contains(a) || picked.contains(a) {
+                continue;
+            }
+            // Jump only outside this actor's fairness window; inside it the
+            // signal holder waits for its ordinary rotation slot below.
+            let may_jump = self
+                .last_activated
+                .get(a)
+                .is_none_or(|t| now.saturating_sub(*t) >= window);
+            if may_jump {
+                if let Some(idx) = self.order.iter().position(|o| o == a) {
+                    self.cursor = (idx + 1) % len;
+                }
+                self.last_activated.insert(a.clone(), now);
                 picked.push(a.clone());
             }
         }
         if picked.len() >= budget {
             return picked;
         }
-        let len = self.order.len();
         for i in 0..len {
             let idx = (self.cursor + i) % len;
             let a = &self.order[idx];
             if eligible.contains(a) && !picked.contains(a) {
                 picked.push(a.clone());
                 self.cursor = (idx + 1) % len;
+                self.last_activated.insert(a.clone(), now);
                 if picked.len() >= budget {
                     break;
                 }
@@ -239,6 +274,9 @@ impl PlannerState {
 
 /// Adoption bundle the sim uses to create a plan. Kept explicit so the sim
 /// cannot accidentally build a plan without its abandonment criteria.
+/// `previous` is the intention the actor is switching away from (when it has
+/// one): `Intention::adopt` counts the switch (§4.2 η_i·switch_i
+/// bookkeeping), so the trace shows oscillation honestly.
 pub fn adopt_plan(
     summary: &str,
     option: impl Into<String>,
@@ -246,6 +284,7 @@ pub fn adopt_plan(
     satisfaction: Option<rpg_domain::action::QuestPredicate>,
     abandonment: AbandonmentCriteria,
     adopted_tick: u64,
+    previous: Option<&crate::intentions::Intention>,
 ) -> Plan {
     Plan {
         summary: summary.to_string(),
@@ -255,7 +294,7 @@ pub fn adopt_plan(
             satisfaction,
             abandonment,
             adopted_tick,
-            None,
+            previous,
         ),
         action,
         adopted_tick,
@@ -281,8 +320,8 @@ mod tests {
         let eligible: BTreeSet<ActorId> = ids.iter().cloned().collect();
         let mut seen: BTreeSet<ActorId> = BTreeSet::new();
         // Budget 1: four ticks cover all four actors.
-        for _ in 0..4 {
-            let picked = state.pick(&eligible, &[], 1);
+        for tick in 0..4 {
+            let picked = state.pick(&eligible, &[], 1, tick);
             assert_eq!(picked.len(), 1);
             let first = picked[0].clone();
             seen.insert(first);
@@ -296,10 +335,11 @@ mod tests {
         let mut state = ActivationState::default();
         state.ensure_order(&ids);
         let eligible: BTreeSet<ActorId> = ids.iter().cloned().collect();
-        let picked = state.pick(&eligible, &[ActorId::new("c")], 2);
+        let picked = state.pick(&eligible, &[ActorId::new("c")], 2, 0);
         assert_eq!(picked[0], ActorId::new("c"));
-        // The rotation continues fairly from where it was.
-        assert_eq!(picked[1], ActorId::new("a"));
+        // The rotation continues fairly from after the priority actor (the
+        // jump advanced the cursor past it).
+        assert_eq!(picked[1], ActorId::new("d"));
     }
 
     #[test]
@@ -308,13 +348,69 @@ mod tests {
         let mut state = ActivationState::default();
         state.ensure_order(&ids);
         let eligible: BTreeSet<ActorId> = ids.iter().cloned().collect();
-        let picked = state.pick(&eligible, &[], 2);
+        let picked = state.pick(&eligible, &[], 2, 0);
         assert_eq!(picked.len(), 2);
         // Not eligible actors are skipped and do not consume the budget.
         let mut half: BTreeSet<ActorId> = BTreeSet::new();
         half.insert(ActorId::new("b"));
-        let picked = state.pick(&half, &[], 3);
+        let picked = state.pick(&half, &[], 3, 1);
         assert_eq!(picked, vec![ActorId::new("b")]);
+    }
+
+    #[test]
+    fn persistent_signal_holder_cannot_starve_the_rotation() {
+        // Adversarial regression (review F1): one actor is re-signaled on
+        // every tick while two others are eligible through persistent plans;
+        // budget 1 must still rotate through all three.
+        let x = ActorId::new("x");
+        let y = ActorId::new("y");
+        let z = ActorId::new("z");
+        let mut state = ActivationState::default();
+        state.ensure_order(&[x.clone(), y.clone(), z.clone()]);
+        let eligible: BTreeSet<ActorId> = [x.clone(), y.clone(), z.clone()].into();
+        let mut seen: BTreeMap<ActorId, usize> = BTreeMap::new();
+        for tick in 0..24u64 {
+            let picked = state.pick(&eligible, std::slice::from_ref(&x), 1, tick);
+            assert_eq!(picked.len(), 1, "budget is a hard cap at tick {tick}");
+            *seen.entry(picked[0].clone()).or_default() += 1;
+        }
+        for id in [&x, &y, &z] {
+            let count = seen.get(id).copied().unwrap_or(0);
+            assert!(count >= 1, "{id} starved under sustained signal load");
+        }
+        // The window bound also keeps the signal holder from monopolizing:
+        // with three actors it cannot be activated more than once per
+        // window, i.e. at most every other slot here.
+        assert!(
+            seen[&x] <= seen[&y] + 2,
+            "signal holder monopolized activations: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn a_fresh_signal_jumps_immediately_but_only_once_per_window() {
+        let x = ActorId::new("x");
+        let y = ActorId::new("y");
+        let mut state = ActivationState::default();
+        state.ensure_order(&[y.clone(), x.clone()]);
+        let eligible: BTreeSet<ActorId> = [x.clone(), y.clone()].into();
+        // Tick 0: the fresh signal jumps ahead of the rotation.
+        assert_eq!(
+            state.pick(&eligible, std::slice::from_ref(&x), 1, 0),
+            vec![x.clone()]
+        );
+        // Tick 1: the re-signal does not jump again within the window (the
+        // other eligible actor takes its slot).
+        assert_eq!(
+            state.pick(&eligible, std::slice::from_ref(&x), 1, 1),
+            vec![y.clone()]
+        );
+        // Tick 2: the window (len = 2) has elapsed — the signal holder may
+        // jump again.
+        assert_eq!(
+            state.pick(&eligible, std::slice::from_ref(&x), 1, 2),
+            vec![x.clone()]
+        );
     }
 
     #[test]
