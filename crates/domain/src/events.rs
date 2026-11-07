@@ -340,7 +340,12 @@ pub enum EventKind {
     },
     /// The answer an actor gave to an authoritative question: exactly what
     /// their own evidence ledger supports (polarities, confidence, whether
-    /// their reports conflict), or `unknown` — never the world's truth.
+    /// their reports conflict), `unknown` when they cannot answer — never
+    /// the world's truth — or `refused` when they decline to disclose
+    /// (design §3.1: knowledge is not permission). A refusal is a distinct,
+    /// truthful answer of its own: it carries no polarities, confidence or
+    /// evidence and is never conflated with ignorance.
+    /// `#[serde(default)]` keeps older saves loading.
     QueryAnswered {
         answerer: ActorId,
         asker: ActorId,
@@ -349,6 +354,8 @@ pub enum EventKind {
         confidence: f32,
         contradicted: bool,
         unknown: bool,
+        #[serde(default)]
+        refused: bool,
         origin: EventId,
     },
     /// An institutional/social consequence was imposed (SANCTION lowering,
@@ -605,9 +612,12 @@ impl EventKind {
                 confidence,
                 contradicted,
                 unknown,
+                refused,
                 ..
             } => {
-                if *unknown {
+                if *refused {
+                    format!("{answerer} declined to answer {asker}'s question about {about}")
+                } else if *unknown {
                     format!("{answerer} could not answer {asker}'s question about {about}")
                 } else {
                     format!(

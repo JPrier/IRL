@@ -380,9 +380,9 @@ fn every_accepted_action_produces_typed_effects() {
                 authority: b.clone(),
                 evidence: vec![FactId::new("f_x")],
             },
-            // F1: the authority's tie toward the reporter moves (trust,
-            // respect) — the relationship mutation is typed.
-            vec!["assert", "request", "change_tie"],
+            // F1 + review D1-b: the authority's reading of the report is a
+            // typed, contextual appraisal; the tie change stays typed too.
+            vec!["assert", "request", "change_tie", "appraise"],
         ),
         (
             Action::HideEvidence {
@@ -893,12 +893,19 @@ fn rumor_propagation_keeps_a_provenance_chain() {
 // Foundation repairs F1–F9 (bounded repair pass before Phase 2)
 // ---------------------------------------------------------------------------
 
-/// F1: the authority's tie toward the reporter moves with exact deltas, and
-/// the relationship mutation is typed.
+/// F1 + review D1-b: the authority's reading of a crime report is a directed
+/// contextual appraisal — kernel-equality for the authority's own value
+/// profile and prior edge, exactly once, citing the typed `CrimeReported`
+/// event — never the legacy universal trust/respect delta. Directionality:
+/// only the authority's edge moves.
 #[test]
-fn f1_report_crime_records_exact_relationship_deltas() {
+fn f1_report_crime_appraises_contextually_exactly_once_and_directional() {
     let (world, player, b) = fixture();
     let mut sim = Simulation::new(world, 5, sim_config());
+    let (player_before, b_before) = (
+        sim.world.actor(&player).unwrap().relationship(&b).clone(),
+        sim.world.actor(&b).unwrap().relationship(&player).clone(),
+    );
     let out = apply(
         &mut sim,
         &player,
@@ -907,26 +914,77 @@ fn f1_report_crime_records_exact_relationship_deltas() {
             evidence: vec![FactId::new("f_x")],
         },
     );
-    assert!(matches!(out, ValidationOutcome::Accepted));
-    let rel = sim.world.actor(&b).unwrap().relationship(&player);
-    assert_eq!(rel.trust, 0.1, "exact trust delta");
-    assert_eq!(rel.respect, 0.05, "exact respect delta");
-    assert_eq!(rel.familiarity, 0.0, "no other dimension moved");
-    assert_eq!(rel.suspicion, 0.0, "no other dimension moved");
-    // Direction: the reporter's tie toward the authority is untouched.
-    let reporter_rel = sim.world.actor(&player).unwrap().relationship(&b);
-    assert_eq!(reporter_rel.trust, 0.0);
-    assert_eq!(reporter_rel.respect, 0.0);
-    // The mutation is typed (authority -> reporter).
+    assert!(matches!(out, ValidationOutcome::Accepted), "{out:?}");
+    // Kernel equality: the authority's edge moved by EXACTLY the contextual
+    // AccurateClaim appraisal the kernel computes for its own profile and
+    // prior edge — no legacy universal delta may ride along.
+    let authority = sim.world.actor(&b).unwrap();
+    let profile = rpg_social::appraisal_profile(authority, &NeedsConfig::default());
+    let b_edge_before = rpg_behavior::ContextualEdge::from_relationship(&b_before);
+    let delta = rpg_behavior::appraise(
+        &rpg_behavior::AppraisedEvent::AccurateClaim,
+        &profile,
+        &b_edge_before,
+    );
+    let expected = rpg_behavior::apply_delta(&b_edge_before, &delta);
+    let rel = authority.relationship(&player);
+    assert_eq!(
+        rpg_behavior::ContextualEdge::from_relationship(&rel),
+        expected,
+        "production report-crime == the contextual kernel for the authority's profile"
+    );
+    // The legacy aggregate dims the removed fixed write used are untouched.
+    assert_eq!(
+        rel.trust, b_before.trust,
+        "legacy universal trust delta is gone"
+    );
+    assert_eq!(rel.suspicion, b_before.suspicion, "no suspicion ride-along");
+    assert_ne!(
+        rel.trust_accuracy, b_before.trust_accuracy,
+        "the appraisal actually moved the contextual edge"
+    );
+    // Directionality: the reporter's edge toward the authority is untouched.
+    assert_eq!(
+        sim.world.actor(&player).unwrap().relationship(&b),
+        player_before,
+        "Rel(reporter,authority) must not move: relationships are directed"
+    );
+    // Exactly one appraisal, citing the typed report as its causal origin.
+    let report_event = sim
+        .events
+        .all()
+        .iter()
+        .find(|e| matches!(e.kind, EventKind::CrimeReported { .. }))
+        .expect("the report is typed");
+    let appraisals: Vec<_> = sim
+        .events
+        .all()
+        .iter()
+        .filter(|e| matches!(e.kind, EventKind::AppraisalRecorded { .. }))
+        .collect();
+    assert_eq!(appraisals.len(), 1, "exactly one appraisal per report");
+    assert_eq!(
+        appraisals[0].caused_by,
+        vec![report_event.id],
+        "the appraisal cites the real causal event"
+    );
+    // The mutation is typed (authority -> reporter) and appraised.
     let outcome = sim.outcomes.last().unwrap();
     assert!(outcome.effects.iter().any(|e| matches!(
         e,
         rpg_domain::behavior_types::Effect::ChangeTie { from, to, .. }
             if from == &b && to == &player
     )));
+    assert!(outcome.effects.iter().any(|e| matches!(
+        e,
+        rpg_domain::behavior_types::Effect::Appraise { subject, .. } if subject == &b
+    )));
 }
 
 /// F2: hearing an utterance builds familiarity with a typed tie change.
+/// (Exposure-maintenance class — design §3.2 audit: directed, single-
+/// dimension perceptual exposure from the real `SpeechEmitted` event, not a
+/// valenced appraisal; classified background mutation pending M1/I-6.)
 #[test]
 fn f2_speak_builds_familiarity_with_a_change_tie_effect() {
     let (world, player, b) = fixture();
@@ -2072,4 +2130,714 @@ fn t4_10_arrest_takes_custody_through_the_authority_route() {
         Some(rpg_domain::behavior_types::Effect::Sanction { authority, subject, .. })
             if authority == &b && subject == &player
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Review D1-a: QUERY delivery is gated by the ShareClaim disclosure
+// permission (design §3.1/§9.1.2) — refusals are truthful, typed, distinct
+// from ignorance, and leak nothing.
+// ---------------------------------------------------------------------------
+
+/// A Private/Secret/InnerCircle fact whose canonical holder is the third
+/// party `c`: `b` can be *taught* it without becoming authorized to disclose
+/// it (knowledge is not permission).
+fn sensitive_fact(id: &str, statement: &str, sensitivity: Sensitivity, holder: &str) -> Fact {
+    Fact {
+        id: FactId::new(id),
+        statement: statement.into(),
+        truth: true,
+        sensitivity,
+        category: FactCategory::Organization,
+        prerequisites: vec![],
+        eligible_holders: vec![ActorId::new(holder)],
+        eligible_containers: vec![],
+        committed: true,
+        placed_at: None,
+    }
+}
+
+/// Production QUERY dispatch (review D1-a; design §3.1 "protect secrets by
+/// restricting disclosure choices", §9.1.2; plan I-5 G2): the ShareClaim
+/// authorization gates EVERY answer delivery — ledger answers and the
+/// authored-belief fallback alike — across all sensitive classes. Anyone may
+/// ask (no asker-knowledge requirement); an unauthorized answerer refuses; an
+/// authorized answerer still answers epistemically — never world truth.
+#[test]
+fn t4_9b_query_respects_disclosure_permission_and_refuses_truthfully() {
+    let (mut world, player, b) = fixture();
+    // Forbidden-to-answer facts: canonical holder is the third party `c`.
+    world.facts.insert(
+        FactId::new("f_private"),
+        sensitive_fact("f_private", "a private matter", Sensitivity::Private, "c"),
+    );
+    world.facts.insert(
+        FactId::new("f_secretfact"),
+        sensitive_fact("f_secretfact", "a secret", Sensitivity::Secret, "c"),
+    );
+    world.facts.insert(
+        FactId::new("f_inner2"),
+        sensitive_fact(
+            "f_inner2",
+            "an inner-circle matter",
+            Sensitivity::InnerCircle,
+            "c",
+        ),
+    );
+    // Authored-fallback facts (no ledger entries): `b` authored-believes the
+    // allowed one FALSE while the world truth is TRUE — the delivered
+    // polarity must follow the belief, never the truth.
+    world.facts.insert(
+        FactId::new("f_auth_priv"),
+        sensitive_fact(
+            "f_auth_priv",
+            "a private authored belief",
+            Sensitivity::Private,
+            "c",
+        ),
+    );
+    world.facts.insert(
+        FactId::new("f_auth_priv_ok"),
+        sensitive_fact(
+            "f_auth_priv_ok",
+            "an owned private authored belief",
+            Sensitivity::Private,
+            "b",
+        ),
+    );
+    // Authorized-to-answer variants: `b` is the canonical holder.
+    world.facts.insert(
+        FactId::new("f_private_ok"),
+        sensitive_fact(
+            "f_private_ok",
+            "an owned private fact",
+            Sensitivity::Private,
+            "b",
+        ),
+    );
+    world.facts.insert(
+        FactId::new("f_secret_ok"),
+        sensitive_fact("f_secret_ok", "an owned secret", Sensitivity::Secret, "b"),
+    );
+    world.facts.insert(
+        FactId::new("f_inner_ok"),
+        sensitive_fact(
+            "f_inner_ok",
+            "an owned inner-circle fact",
+            Sensitivity::InnerCircle,
+            "b",
+        ),
+    );
+    let mut sim = Simulation::new(world, 5, sim_config());
+
+    // Teach `b` every ledger fact (evidence, not belief snapshots).
+    let (tick, minute) = (sim.world.tick, sim.world.minute_of_day);
+    for fact in [
+        "f_private",
+        "f_secretfact",
+        "f_inner2",
+        "f_private_ok",
+        "f_secret_ok",
+        "f_inner_ok",
+    ] {
+        rpg_behavior::record_provenance_evidence(
+            &mut sim.world,
+            &mut sim.events,
+            tick,
+            minute,
+            &b,
+            &FactId::new(fact),
+            true,
+            &Provenance::Assumed,
+        );
+    }
+    // The authored fallback: `b` authored-believes both fallback facts FALSE
+    // (no ledger entries — answer_query must take the belief path).
+    for fact in ["f_auth_priv", "f_auth_priv_ok"] {
+        sim.world.actor_mut(&b).unwrap().beliefs.insert(
+            FactId::new(fact),
+            Belief {
+                fact: FactId::new(fact),
+                believes_true: false,
+                confidence: 0.9,
+                source: Provenance::Assumed,
+                acquired_tick: 0,
+            },
+        );
+    }
+    // The asker knows NOTHING about any of these facts: questions are
+    // permitted without the asker knowing the fact (validated in-range and
+    // fact-exists only).
+    assert!(
+        !sim.world
+            .actor(&player)
+            .unwrap()
+            .beliefs
+            .contains_key(&FactId::new("f_private")),
+        "fixture precondition: the asker does not know the fact"
+    );
+
+    let refused_of = |sim: &Simulation, fact: &str| {
+        sim.events
+            .all()
+            .iter()
+            .rev()
+            .find(|e| {
+                matches!(
+                    &e.kind,
+                    EventKind::QueryAnswered { answerer, about, .. }
+                        if answerer == &b && about.as_str() == fact
+                )
+            })
+            .map(|e| e.kind.clone())
+            .expect("an answer event was recorded")
+    };
+    let ask = |sim: &mut Simulation, fact: &str| -> ValidationOutcome {
+        apply(
+            sim,
+            &player,
+            Action::Query {
+                target: b.clone(),
+                about: FactId::new(fact),
+            },
+        )
+    };
+
+    // (1) FORBIDDEN: every sensitive class — ledger evidence in hand, the
+    // unauthorized answerer refuses. The question itself is ACCEPTED
+    // (asking needs no knowledge); the refusal transmits no polarity,
+    // confidence or evidence and writes nothing into the asker's mind.
+    for fact in ["f_private", "f_secretfact", "f_inner2"] {
+        let b_evidence_before = sim
+            .world
+            .epistemics
+            .evidence_about(&b, &FactId::new(fact))
+            .len();
+        let out = ask(&mut sim, fact);
+        assert!(
+            matches!(out, ValidationOutcome::Accepted),
+            "the question about {fact} must be permitted: {out:?}"
+        );
+        assert!(
+            matches!(
+                refused_of(&sim, fact),
+                EventKind::QueryAnswered { refused: true, unknown: false, polarities, confidence: 0.0, .. }
+                    if polarities.is_empty()
+            ),
+            "{fact}: the unauthorized answerer refuses, distinctly from ignorance: {out:?}"
+        );
+        assert!(
+            !player_knows_marker(&sim, fact),
+            "{fact}: the refusal delivers no evidence and no belief"
+        );
+        assert_eq!(
+            sim.world
+                .epistemics
+                .evidence_about(&b, &FactId::new(fact))
+                .len(),
+            b_evidence_before,
+            "{fact}: the secret is not removed from the refusing answerer's memory"
+        );
+        assert!(
+            sim.world.facts.get(&FactId::new(fact)).unwrap().truth,
+            "{fact}: world truth untouched"
+        );
+        // The refusal moves no tie and shares no claim.
+        let outcome = sim.outcomes.last().unwrap();
+        assert!(
+            !outcome
+                .effects
+                .iter()
+                .any(|e| matches!(e, rpg_domain::behavior_types::Effect::ChangeTie { .. })),
+            "{fact}: a refusal is not exposure: {outcome:?}"
+        );
+        assert!(
+            !outcome
+                .effects
+                .iter()
+                .any(|e| matches!(e, rpg_domain::behavior_types::Effect::Assert { .. })),
+            "{fact}: a refusal asserts nothing: {outcome:?}"
+        );
+        assert!(
+            !sim.events.all().iter().any(|e| matches!(
+                &e.kind,
+                EventKind::ClaimShared { fact: f, .. } if f.as_str() == fact
+            )),
+            "{fact}: no claim delivery happened"
+        );
+    }
+
+    // (2) AUTHORIZED: the canonical holder answers the same kinds of
+    // question (allowed recipient: the holder may tell anyone) — the answer
+    // stays epistemically bounded (the holder's own polarity at ledger or
+    // belief confidence), never world truth.
+    let out = ask(&mut sim, "f_private_ok");
+    assert!(matches!(out, ValidationOutcome::Accepted), "{out:?}");
+    assert!(matches!(
+        refused_of(&sim, "f_private_ok"),
+        EventKind::QueryAnswered { refused: false, unknown: false, polarities, .. }
+            if polarities == vec![true]
+    ));
+    assert!(
+        player_knows_marker(&sim, "f_private_ok"),
+        "the authorized answer was delivered as provenance-bound evidence"
+    );
+    let out = ask(&mut sim, "f_secret_ok");
+    assert!(matches!(out, ValidationOutcome::Accepted), "{out:?}");
+    assert!(matches!(
+        refused_of(&sim, "f_secret_ok"),
+        EventKind::QueryAnswered {
+            refused: false,
+            unknown: false,
+            ..
+        }
+    ));
+    assert!(player_knows_marker(&sim, "f_secret_ok"));
+    // InnerCircle: the flag is required in ADDITION to holder status.
+    let out = ask(&mut sim, "f_inner_ok");
+    assert!(matches!(out, ValidationOutcome::Accepted), "{out:?}");
+    assert!(
+        matches!(
+            refused_of(&sim, "f_inner_ok"),
+            EventKind::QueryAnswered { refused: true, .. }
+        ),
+        "an inner-circle holder without the flag refuses"
+    );
+    assert!(!player_knows_marker(&sim, "f_inner_ok"));
+    sim.world
+        .actor_mut(&b)
+        .unwrap()
+        .flags
+        .insert("inner_circle".into());
+    let out = ask(&mut sim, "f_inner_ok");
+    assert!(matches!(out, ValidationOutcome::Accepted), "{out:?}");
+    assert!(matches!(
+        refused_of(&sim, "f_inner_ok"),
+        EventKind::QueryAnswered {
+            refused: false,
+            unknown: false,
+            ..
+        }
+    ));
+    assert!(player_knows_marker(&sim, "f_inner_ok"));
+
+    // (3) AUTHORED FALLBACK: the same gate applies to belief-only answers.
+    // Unauthorized: refused. Authorized: delivered at the BELIEF's polarity
+    // (false) — the world truth (true) never leaks through the answer.
+    let out = ask(&mut sim, "f_auth_priv");
+    assert!(matches!(out, ValidationOutcome::Accepted), "{out:?}");
+    assert!(matches!(
+        refused_of(&sim, "f_auth_priv"),
+        EventKind::QueryAnswered { refused: true, unknown: false, polarities, .. }
+            if polarities.is_empty()
+    ));
+    assert!(!player_knows_marker(&sim, "f_auth_priv"));
+    let out = ask(&mut sim, "f_auth_priv_ok");
+    assert!(matches!(out, ValidationOutcome::Accepted), "{out:?}");
+    assert!(
+        matches!(
+            refused_of(&sim, "f_auth_priv_ok"),
+            EventKind::QueryAnswered { refused: false, unknown: false, polarities, .. }
+                if polarities == vec![false]
+        ),
+        "the authored fallback reports the answerer's own stance, not world truth"
+    );
+    assert!(player_knows_marker(&sim, "f_auth_priv_ok"));
+    assert!(
+        sim.world
+            .facts
+            .get(&FactId::new("f_auth_priv_ok"))
+            .unwrap()
+            .truth,
+        "world truth untouched by the delivered authored answer"
+    );
+
+    // (4) IGNORANCE preserved: a public fact nobody holds stays Unknown —
+    // distinct from a refusal (refused=false there).
+    sim.world.facts.insert(
+        FactId::new("f_public_unknown"),
+        sensitive_fact(
+            "f_public_unknown",
+            "unknown to all",
+            Sensitivity::Public,
+            "c",
+        ),
+    );
+    let out = ask(&mut sim, "f_public_unknown");
+    assert!(matches!(out, ValidationOutcome::Accepted), "{out:?}");
+    assert!(matches!(
+        refused_of(&sim, "f_public_unknown"),
+        EventKind::QueryAnswered { refused: false, unknown: true, polarities, .. }
+            if polarities.is_empty()
+    ));
+}
+
+/// Helper for the t4_9b assertions: the asker holds provenance-bound evidence
+/// about `fact` (delivery marker).
+fn player_knows_marker(sim: &Simulation, fact: &str) -> bool {
+    !sim.world
+        .epistemics
+        .evidence_about(&ActorId::new(PLAYER), &FactId::new(fact))
+        .is_empty()
+}
+
+/// Review D1-a: a refusal is never conflated with ignorance — the same
+/// answerer, in one session, gives both answer types and the typed events
+/// differ in both fields (and neither leaks content).
+#[test]
+fn t4_9c_query_refusal_is_distinct_from_ignorance() {
+    let (mut world, player, b) = fixture();
+    world.facts.insert(
+        FactId::new("f_pub"),
+        Fact {
+            id: FactId::new("f_pub"),
+            statement: "public but unobserved".into(),
+            truth: true,
+            sensitivity: Sensitivity::Public,
+            category: FactCategory::Observation,
+            prerequisites: vec![],
+            eligible_holders: vec![],
+            eligible_containers: vec![],
+            committed: true,
+            placed_at: None,
+        },
+    );
+    world.facts.insert(
+        FactId::new("f_priv"),
+        sensitive_fact("f_priv", "a private matter", Sensitivity::Private, "c"),
+    );
+    let mut sim = Simulation::new(world, 5, sim_config());
+    let (tick, minute) = (sim.world.tick, sim.world.minute_of_day);
+    rpg_behavior::record_provenance_evidence(
+        &mut sim.world,
+        &mut sim.events,
+        tick,
+        minute,
+        &b,
+        &FactId::new("f_priv"),
+        true,
+        &Provenance::Assumed,
+    );
+    let out = apply(
+        &mut sim,
+        &player,
+        Action::Query {
+            target: b.clone(),
+            about: FactId::new("f_pub"),
+        },
+    );
+    assert!(matches!(out, ValidationOutcome::Accepted), "{out:?}");
+    let out = apply(
+        &mut sim,
+        &player,
+        Action::Query {
+            target: b.clone(),
+            about: FactId::new("f_priv"),
+        },
+    );
+    assert!(matches!(out, ValidationOutcome::Accepted), "{out:?}");
+    let answers: Vec<_> = sim
+        .events
+        .all()
+        .iter()
+        .filter(|e| matches!(&e.kind, EventKind::QueryAnswered { answerer, .. } if answerer == &b))
+        .collect();
+    assert_eq!(answers.len(), 2);
+    assert!(matches!(
+        &answers[0].kind,
+        EventKind::QueryAnswered {
+            unknown: true,
+            refused: false,
+            ..
+        }
+    ));
+    assert!(matches!(
+        &answers[1].kind,
+        EventKind::QueryAnswered {
+            unknown: false,
+            refused: true,
+            ..
+        }
+    ));
+    // Neither answer wrote anything into the asker's mind.
+    assert!(sim
+        .world
+        .epistemics
+        .evidence_about(&player, &FactId::new("f_pub"))
+        .is_empty());
+    assert!(sim
+        .world
+        .epistemics
+        .evidence_about(&player, &FactId::new("f_priv"))
+        .is_empty());
+    assert!(!sim
+        .world
+        .actor(&player)
+        .unwrap()
+        .beliefs
+        .contains_key(&FactId::new("f_priv")));
+}
+
+// ---------------------------------------------------------------------------
+// Review D1-b: typed deal breach, broken commitment and report-crime are
+// directed contextual appraisals (kernel-equality, exactly once, directional)
+// — no universal deltas.
+// ---------------------------------------------------------------------------
+
+/// A typed deal breach is the creditor's contextual PromiseBroken appraisal:
+/// kernel-equality for the creditor's own value profile, exactly once,
+/// citing the typed `DealViolated` event — never the legacy universal
+/// trust/anger/respect delta. Breach is dispatched through the production
+/// route (the debtor walks away from a due deal: FSM
+/// `(PerformanceDue, Cancel{Debtor}) ⇒ Violated`), with no maintenance pass
+/// between the appraisal and the assertion. A hot-headed creditor appraises
+/// the SAME breach differently (context), and only the creditor's edge moves
+/// (directionality).
+#[test]
+fn d1b_deal_breach_appraises_contextually_exactly_once_and_directional() {
+    let (world, player, b) = fixture();
+    let mut sim = Simulation::new(world, 5, sim_config());
+    // A second, hot-headed creditor: the same breach must read differently.
+    let mut hothead = bare_actor("hothead", 4.0, ActorKind::Npc);
+    hothead.personality.reciprocity = 1.0;
+    sim.world.actors.insert(hothead.id.clone(), hothead);
+    let hothead = ActorId::new("hothead");
+
+    let propose = |sim: &mut Simulation, creditor: &ActorId| {
+        let out = apply(
+            sim,
+            &player,
+            Action::ProposeDeal {
+                target: creditor.clone(),
+                terms: "timely delivery".into(),
+                condition: QuestPredicate::Flag("ordered".into()),
+                performance: QuestPredicate::HasItem {
+                    actor: creditor.clone(),
+                    item: ItemId::new("coin"),
+                    qty: 1,
+                },
+                condition_deadline_minute: None,
+                performance_deadline_minute: None,
+                give: vec![],
+                money: 0,
+                note: "deliver the medicine".into(),
+            },
+        );
+        assert!(matches!(out, ValidationOutcome::Pending { .. }), "{out:?}");
+        *sim.world.deals.keys().max().unwrap()
+    };
+    let deal_b = propose(&mut sim, &b);
+    let deal_h = propose(&mut sim, &hothead);
+    sim.world.set_flag("ordered");
+    for (creditor, deal) in [(&b, deal_b), (&hothead, deal_h)] {
+        let out = apply(&mut sim, creditor, Action::AcceptDeal { deal });
+        assert!(matches!(out, ValidationOutcome::Accepted), "{out:?}");
+    }
+    let b_before = sim.world.actor(&b).unwrap().relationship(&player).clone();
+    let h_before = sim
+        .world
+        .actor(&hothead)
+        .unwrap()
+        .relationship(&player)
+        .clone();
+
+    // One deterministic step: the condition holds, so both deals reach
+    // `PerformanceDue` through the deal pipeline (no relationship mutation:
+    // the edges were neutral, and decay skips zero edges).
+    sim.step(Vec::new());
+    assert_eq!(
+        sim.world.deals.get(&deal_b).unwrap().state,
+        rpg_domain::deal::DealState::PerformanceDue
+    );
+    assert_eq!(
+        sim.world.deals.get(&deal_h).unwrap().state,
+        rpg_domain::deal::DealState::PerformanceDue
+    );
+    // The debtor walks away from BOTH due deals: the FSM maps the unilateral
+    // debtor cancellation onto the Violated path (production dispatch).
+    for deal in [deal_b, deal_h] {
+        let out = apply(&mut sim, &player, Action::CancelDeal { deal });
+        assert!(matches!(out, ValidationOutcome::Accepted), "{out:?}");
+        assert_eq!(
+            sim.world.deals.get(&deal).unwrap().state,
+            rpg_domain::deal::DealState::Violated
+        );
+    }
+
+    // Kernel equality per creditor profile: production breach == exactly one
+    // contextual PromiseBroken appraisal through the creditor's own values.
+    for (creditor, before) in [(&b, &b_before), (&hothead, &h_before)] {
+        let observer = sim.world.actor(creditor).unwrap();
+        let profile = rpg_social::appraisal_profile(observer, &NeedsConfig::default());
+        let edge_before = rpg_behavior::ContextualEdge::from_relationship(before);
+        let delta = rpg_behavior::appraise(
+            &rpg_behavior::AppraisedEvent::PromiseBroken,
+            &profile,
+            &edge_before,
+        );
+        let expected = rpg_behavior::apply_delta(&edge_before, &delta);
+        let rel = observer.relationship(&player);
+        assert_eq!(
+            rpg_behavior::ContextualEdge::from_relationship(&rel),
+            expected,
+            "production breach == the contextual kernel for {creditor}'s profile"
+        );
+        // No legacy universal delta may ride along: the removed fixed write
+        // moved the aggregate `trust`/`respect` dims.
+        assert_eq!(
+            rel.trust, before.trust,
+            "legacy universal trust delta is gone ({creditor})"
+        );
+        assert_ne!(
+            rel.trust_benevolence, before.trust_benevolence,
+            "the appraisal actually moved the contextual edge ({creditor})"
+        );
+        // Directionality: the debtor's edge toward the creditor is untouched.
+        assert_eq!(
+            sim.world.actor(&player).unwrap().relationship(creditor),
+            rpg_domain::world::Relationship::default(),
+            "Rel(debtor,creditor) must not move: relationships are directed"
+        );
+    }
+    // Context: the same event, different value profiles — different deltas.
+    let b_rel = sim.world.actor(&b).unwrap().relationship(&player).clone();
+    let h_rel = sim
+        .world
+        .actor(&hothead)
+        .unwrap()
+        .relationship(&player)
+        .clone();
+    assert_ne!(
+        b_rel.anger, h_rel.anger,
+        "the hot-headed creditor angers more: appraisals are context-dependent"
+    );
+
+    // Exactly one appraisal per breach, each citing its real causal event.
+    let violations = sim
+        .events
+        .all()
+        .iter()
+        .filter(|e| matches!(e.kind, EventKind::DealViolated { .. }))
+        .count();
+    assert_eq!(violations, 2, "one typed violation per breached deal");
+    let appraisals: Vec<_> = sim
+        .events
+        .all()
+        .iter()
+        .filter(|e| matches!(e.kind, EventKind::AppraisalRecorded { .. }))
+        .collect();
+    assert_eq!(appraisals.len(), 2, "exactly one appraisal per breach");
+    let violation_ids: std::collections::BTreeSet<_> = sim
+        .events
+        .all()
+        .iter()
+        .filter(|e| matches!(e.kind, EventKind::DealViolated { .. }))
+        .map(|e| e.id)
+        .collect();
+    for a in &appraisals {
+        assert_eq!(
+            a.caused_by.len(),
+            1,
+            "each appraisal cites exactly its causal event"
+        );
+        assert!(
+            violation_ids.contains(&a.caused_by[0]),
+            "the appraisal's origin is the DealViolated event"
+        );
+    }
+}
+
+/// A broken commitment (production BreakPromise route) is the creditor's
+/// contextual PromiseBroken appraisal — kernel equality for the creditor's
+/// value profile, exactly once, citing the typed `CommitmentBroken` event —
+/// never the legacy universal trust/anger/respect delta. Directionality: only
+/// the creditor's edge moves.
+#[test]
+fn d1b_break_promise_appraises_contextually_exactly_once_and_directional() {
+    let (world, player, b) = fixture();
+    let mut sim = Simulation::new(world, 5, sim_config());
+    let out = apply(
+        &mut sim,
+        &player,
+        Action::Promise {
+            target: b.clone(),
+            terms: "help".into(),
+            predicate: QuestPredicate::Flag("never_done".into()),
+            deadline: None,
+        },
+    );
+    let commitment = match &out {
+        ValidationOutcome::Pending {
+            commitment: Some(c),
+            ..
+        } => *c,
+        other => panic!("expected a pending commitment, got {other:?}"),
+    };
+    let b_before = sim.world.actor(&b).unwrap().relationship(&player).clone();
+    let player_before = sim.world.actor(&player).unwrap().relationship(&b).clone();
+
+    let out = apply(&mut sim, &player, Action::BreakPromise { commitment });
+    assert!(matches!(out, ValidationOutcome::Accepted), "{out:?}");
+
+    // Kernel equality for the creditor's own profile.
+    let observer = sim.world.actor(&b).unwrap();
+    let profile = rpg_social::appraisal_profile(observer, &NeedsConfig::default());
+    let edge_before = rpg_behavior::ContextualEdge::from_relationship(&b_before);
+    let delta = rpg_behavior::appraise(
+        &rpg_behavior::AppraisedEvent::PromiseBroken,
+        &profile,
+        &edge_before,
+    );
+    let expected = rpg_behavior::apply_delta(&edge_before, &delta);
+    let rel = observer.relationship(&player);
+    assert_eq!(
+        rpg_behavior::ContextualEdge::from_relationship(&rel),
+        expected,
+        "production break-promise == the contextual kernel for the creditor's profile"
+    );
+    assert_eq!(
+        rel.trust, b_before.trust,
+        "legacy universal trust delta is gone"
+    );
+    assert_eq!(rel.suspicion, b_before.suspicion);
+    assert_ne!(
+        rel.trust_benevolence, b_before.trust_benevolence,
+        "the appraisal actually moved the contextual edge"
+    );
+    // Directionality: the breaker's edge toward the creditor is untouched.
+    assert_eq!(
+        sim.world.actor(&player).unwrap().relationship(&b),
+        player_before,
+        "Rel(debtor,creditor) must not move: relationships are directed"
+    );
+    // The promise-break emotion is written mind-locally (I-4b).
+    assert!(
+        observer.emotions.value(EmotionKind::Anger) > 0.0,
+        "the broken promise registered as anger (mind-local)"
+    );
+    // Exactly one appraisal citing the typed CommitmentBroken event.
+    let broken_event = sim
+        .events
+        .all()
+        .iter()
+        .find(|e| matches!(e.kind, EventKind::CommitmentBroken { .. }))
+        .expect("the break is typed");
+    let appraisals: Vec<_> = sim
+        .events
+        .all()
+        .iter()
+        .filter(|e| matches!(e.kind, EventKind::AppraisalRecorded { .. }))
+        .collect();
+    assert_eq!(appraisals.len(), 1, "exactly one appraisal per break");
+    assert_eq!(appraisals[0].caused_by, vec![broken_event.id]);
+    // The typed effects: tie change + appraise.
+    let outcome = sim.outcomes.last().unwrap();
+    assert!(outcome.effects.iter().any(|e| matches!(
+        e,
+        rpg_domain::behavior_types::Effect::ChangeTie { from, to, .. }
+            if from == &b && to == &player
+    )));
+    assert!(outcome.effects.iter().any(|e| matches!(
+        e,
+        rpg_domain::behavior_types::Effect::Appraise { subject, .. } if subject == &b
+    )));
 }

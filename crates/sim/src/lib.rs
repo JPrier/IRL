@@ -1168,6 +1168,15 @@ impl Simulation {
             observed.push(a.clone());
         }
         // Speaking builds familiarity with everyone who heard it.
+        //
+        // Exposure-maintenance classification (design §3.2 audit): this is
+        // NOT an appraisal of the utterance's social meaning — it is
+        // directed, single-dimension perceptual exposure bookkeeping caused
+        // by the real typed `SpeechEmitted` event (familiarity decays at
+        // rate 0.0: cumulative exposure, not a feeling). Valenced
+        // relationship change stays with the contextual appraisal pathway;
+        // this write is a classified background mutation pending the M1
+        // mutation-audit pass (plan I-6).
         let (tick, minute) = (self.world.tick, self.world.minute_of_day);
         self.events.push(
             tick,
@@ -1636,7 +1645,7 @@ impl Simulation {
         commitment: CommitmentId,
     ) -> ValidationOutcome {
         let (tick, minute) = (self.world.tick, self.world.minute_of_day);
-        social::break_commitment(
+        let broken = social::break_commitment(
             &mut self.world,
             &mut self.events,
             tick,
@@ -1644,11 +1653,37 @@ impl Simulation {
             commitment,
             &proposal.actor,
         );
-        self.effects_buf.push(Effect::ChangeTie {
-            from: proposal.actor.clone(),
-            to: proposal.actor.clone(),
-            summary: format!("broke commitment #{}", commitment.raw()),
-        });
+        // The creditor's APPRAISE of the broken promise (design §3.2; plan
+        // I-4): a directed, contextual PromiseBroken appraisal exactly once,
+        // citing the typed `CommitmentBroken` event — never the legacy
+        // universal trust/anger/respect delta (review D1-b).
+        if let Some(broken_event) = broken {
+            let parties = self
+                .world
+                .commitments
+                .get(&commitment)
+                .map(|c| (c.creditor.clone(), c.debtor.clone()));
+            if let Some((creditor, debtor)) = parties {
+                if creditor != debtor {
+                    self.effects_buf.push(Effect::ChangeTie {
+                        from: creditor.clone(),
+                        to: debtor.clone(),
+                        summary: format!("commitment #{} broken", commitment.raw()),
+                    });
+                    self.effects_buf.push(Effect::Appraise {
+                        subject: creditor.clone(),
+                        regarding: debtor.clone(),
+                        summary: "saw the promise broken".into(),
+                    });
+                    self.record_appraisal(
+                        &creditor,
+                        &debtor,
+                        AppraisedEvent::PromiseBroken,
+                        broken_event,
+                    );
+                }
+            }
+        }
         self.effects_buf.push(Effect::CreateEvent {
             summary: format!("commitment #{} broken", commitment.raw()),
         });
@@ -2202,30 +2237,17 @@ impl Simulation {
                 );
             }
             DealEvent::Violate { reason } => {
-                // A breach is appraised by the creditor (mind-local; the tie
-                // update is the social layer's directed edge write).
+                // A breach is appraised by the creditor through the directed
+                // contextual pathway (design §3.2; plan I-4): ΔR from the
+                // creditor's own values and current edge, exactly once —
+                // never a universal delta (review D1-b). The typed
+                // `DealViolated` event is the causal origin the appraisal
+                // cites.
                 let (debtor, creditor) = {
                     let d = self.world.deals.get(&deal_id)?;
                     (d.debtor.clone(), d.creditor.clone())
                 };
-                social::adjust_relationship(
-                    &mut self.world,
-                    &creditor,
-                    &debtor,
-                    &social::RelationshipDelta::new()
-                        .trust(-0.3)
-                        .anger(0.25)
-                        .respect(-0.2),
-                );
-                self.effects_buf.push(Effect::ChangeTie {
-                    from: creditor,
-                    to: debtor,
-                    summary: format!("deal #{} violated ({})", deal_id.raw(), reason.name()),
-                });
-                self.effects_buf.push(Effect::CreateEvent {
-                    summary: format!("deal #{} violated", deal_id.raw()),
-                });
-                self.events.push(
+                let violation_event = self.events.push(
                     tick,
                     m,
                     None,
@@ -2235,6 +2257,25 @@ impl Simulation {
                     },
                     Vec::new(),
                     Vec::new(),
+                );
+                self.effects_buf.push(Effect::ChangeTie {
+                    from: creditor.clone(),
+                    to: debtor.clone(),
+                    summary: format!("deal #{} violated ({})", deal_id.raw(), reason.name()),
+                });
+                self.effects_buf.push(Effect::CreateEvent {
+                    summary: format!("deal #{} violated", deal_id.raw()),
+                });
+                self.effects_buf.push(Effect::Appraise {
+                    subject: creditor.clone(),
+                    regarding: debtor.clone(),
+                    summary: "saw the promise broken".into(),
+                });
+                self.record_appraisal(
+                    &creditor,
+                    &debtor,
+                    AppraisedEvent::PromiseBroken,
+                    violation_event,
                 );
             }
             DealEvent::Excuse => {
@@ -2507,10 +2548,16 @@ impl Simulation {
     /// plan I-5 G2): the question is dispatched as `Effect::Query`, the
     /// answer is derived from the target's own evidence ledger via
     /// `answer_query` — never from world truth — and both the question and
-    /// the answer are event-sourced. When the target holds evidence, the
-    /// answer is *delivered* as a truthful assertion of what they hold (the
-    /// asker gains provenance-bound evidence via the shared acceptance
-    /// mechanic); when they hold nothing, the typed answer is Unknown.
+    /// the answer are event-sourced. Disclosure permission (design §3.1
+    /// "protect secrets by restricting disclosure choices", §9.1.2) gates
+    /// EVERY answer delivery — ledger answers and the authored-belief
+    /// fallback alike — through the same authorization a `ShareClaim` of
+    /// the fact requires (review D1-a): knowing a secret does not force
+    /// telling it. Anyone may *ask* (the asker needs no knowledge of the
+    /// fact); only the answer is gated. An unauthorized answerer refuses:
+    /// a truthful, typed answer of its own (`refused`, never conflated
+    /// with `unknown`) that transmits no polarity, confidence or evidence
+    /// and writes nothing into the asker's mind.
     fn do_query(
         &mut self,
         proposal: &ActionProposal,
@@ -2537,17 +2584,38 @@ impl Simulation {
             Vec::new(),
             vec![target.clone()],
         );
+        // PERMISSION before delivery (the ShareClaim disclosure gate,
+        // design §9.1.2): the answerer must be authorized to disclose this
+        // fact — evaluated once, for ledger answers and the authored-belief
+        // fallback alike. A question itself is never gated on knowledge.
+        let authorized = self
+            .world
+            .actor(&target)
+            .map(|answerer| {
+                self.validate_disclosure_permission(answerer, &about)
+                    .is_ok()
+            })
+            .unwrap_or(false);
         // The answer is the target's own epistemic state, never world truth.
         let answer = rpg_behavior::answer_query(&self.world, &target, &about);
-        match &answer {
-            rpg_behavior::QueryAnswer::Unknown => {
+        let refused = !authorized && matches!(answer, rpg_behavior::QueryAnswer::Heard { .. });
+        match (&answer, refused) {
+            (rpg_behavior::QueryAnswer::Unknown, _) => {
                 // Knowing nothing is a real answer: the target cannot be
                 // made to disclose or invent the world's truth.
                 self.effects_buf.push(Effect::CreateEvent {
                     summary: format!("query about {} answered unknown", about.as_str()),
                 });
             }
-            rpg_behavior::QueryAnswer::Heard { polarities, .. } => {
+            (_, true) => {
+                // The refusal is the answer: the question is real, the
+                // decline is typed, and nothing about the proposition's
+                // content (polarity, confidence, evidence) crosses over.
+                self.effects_buf.push(Effect::CreateEvent {
+                    summary: format!("query about {} refused", about.as_str()),
+                });
+            }
+            (rpg_behavior::QueryAnswer::Heard { polarities, .. }, false) => {
                 // The answerer asserts what they hold: the majority polarity
                 // of their evidence (contradictions stay visible in the
                 // typed answer event; the asker's own appraisal of it is
@@ -2567,7 +2635,13 @@ impl Simulation {
                     false,
                 );
                 // Being asked and answered builds familiarity, as any
-                // delivered claim does.
+                // delivered claim does. Exposure-maintenance classification
+                // (design §3.2 audit): directed, single-dimension exposure
+                // caused by the real typed answer — not a valenced appraisal
+                // of the answer's content; a classified background mutation
+                // pending the M1 mutation-audit pass (plan I-6). The refusal
+                // branch deliberately writes nothing: a decline is not
+                // exposure the asker profits from.
                 social::adjust_relationship(
                     &mut self.world,
                     &target,
@@ -2583,6 +2657,7 @@ impl Simulation {
         }
         let (polarities, confidence, contradicted, unknown) = match answer {
             rpg_behavior::QueryAnswer::Unknown => (Vec::new(), 0.0, false, true),
+            rpg_behavior::QueryAnswer::Heard { .. } if refused => (Vec::new(), 0.0, false, false),
             rpg_behavior::QueryAnswer::Heard {
                 polarities,
                 confidence,
@@ -2601,6 +2676,7 @@ impl Simulation {
                 confidence,
                 contradicted,
                 unknown,
+                refused,
                 origin: question_event,
             },
             vec![question_event],
@@ -2911,27 +2987,48 @@ impl Simulation {
         authority: ActorId,
         evidence: Vec<FactId>,
     ) -> ValidationOutcome {
-        // Guards gain respect for credible reports and suspicion of the accused
-        // is *not* automatic; only the report itself is recorded.
-        social::adjust_relationship(
-            &mut self.world,
-            &authority,
-            &proposal.actor,
-            &social::RelationshipDelta::new().trust(0.1).respect(0.05),
+        let (tick, minute) = (self.world.tick, self.world.minute_of_day);
+        // PROCESS first: the typed report is the causal origin the
+        // authority's appraisal cites.
+        let report_event = self.events.push(
+            tick,
+            minute,
+            Some(proposal.actor.clone()),
+            EventKind::CrimeReported {
+                by: proposal.actor.clone(),
+                authority: authority.clone(),
+                evidence: evidence.clone(),
+            },
+            Vec::new(),
+            Vec::new(),
         );
-        // The authority's directed tie toward the reporter moved — the social
-        // mutation is typed (a self-report mutates nothing, so no effect).
+        // The authority's APPRAISE of the report (design §3.2; plan I-4): a
+        // directed, contextual reading of the credible report through the
+        // authority's own values and current edge, exactly once — never the
+        // legacy universal trust/respect delta (review D1-b). Suspicion of
+        // the accused is *not* automatic; only the report itself is
+        // recorded. (A self-report mutates nothing.)
         if authority != proposal.actor {
             self.effects_buf.push(Effect::ChangeTie {
                 from: authority.clone(),
                 to: proposal.actor.clone(),
-                summary: "received a credible report (trust, respect)".into(),
+                summary: "received a credible report".into(),
             });
+            self.effects_buf.push(Effect::Appraise {
+                subject: authority.clone(),
+                regarding: proposal.actor.clone(),
+                summary: "found the report credible".into(),
+            });
+            self.record_appraisal(
+                &authority,
+                &proposal.actor,
+                AppraisedEvent::AccurateClaim,
+                report_event,
+            );
         }
         // Shared report mechanic (behavior-engine Phase 1): the authority
         // *receives* each reported fact as provenance-bound evidence — claim
         // separation means a report does not silently become belief.
-        let (tick, minute) = (self.world.tick, self.world.minute_of_day);
         for fact in &evidence {
             rpg_behavior::record_provenance_evidence(
                 &mut self.world,
@@ -2962,19 +3059,6 @@ impl Simulation {
             to: authority.clone(),
             demand: "investigate the reported crime".into(),
         });
-        let (tick, minute) = (self.world.tick, self.world.minute_of_day);
-        self.events.push(
-            tick,
-            minute,
-            Some(proposal.actor.clone()),
-            EventKind::CrimeReported {
-                by: proposal.actor.clone(),
-                authority,
-                evidence,
-            },
-            Vec::new(),
-            Vec::new(),
-        );
         ValidationOutcome::Accepted
     }
 

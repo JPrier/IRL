@@ -544,6 +544,15 @@ pub fn assert_claim(
     );
 
     // Being told something repeatedly builds familiarity.
+    //
+    // Exposure-maintenance classification (design §3.2 audit): this is NOT
+    // an appraisal of the claim's content or truth — it is directed,
+    // single-dimension perceptual exposure from the real typed delivery
+    // (`ClaimShared`; the causal event the acceptance mechanic emitted).
+    // Familiarity decays at rate 0.0: cumulative exposure bookkeeping, not
+    // a feeling. Valenced relationship change stays with the contextual
+    // appraisal pathway; this write is a classified background mutation
+    // pending the M1 mutation-audit pass (plan I-6).
     adjust_relationship(world, to, from, &RelationshipDelta::new().familiarity(0.1));
 
     ShareOutcome {
@@ -639,7 +648,11 @@ pub fn satisfy_commitments(
     satisfied
 }
 
-/// Break a pending commitment. Raises the creditor's anger and lowers trust.
+/// Break a pending commitment. Returns the typed `CommitmentBroken` event id
+/// so the authoritative call site can route the creditor's APPRAISE through
+/// the directed contextual pathway (design §3.2: no universal deltas — review
+/// D1-b). The relationship consequence is *not* written here: the legacy
+/// fixed trust/anger/respect delta lived in this function and was removed.
 pub fn break_commitment(
     world: &mut World,
     events: &mut EventLog,
@@ -647,26 +660,13 @@ pub fn break_commitment(
     minute: u32,
     id: CommitmentId,
     by: &ActorId,
-) {
-    let Some(c) = world.commitments.get_mut(&id) else {
-        return;
-    };
+) -> Option<EventId> {
+    let c = world.commitments.get_mut(&id)?;
     if c.state != CommitmentState::Pending {
-        return;
+        return None;
     }
     c.state = CommitmentState::Broken;
-    let creditor = c.creditor.clone();
-    let debtor = c.debtor.clone();
-    adjust_relationship(
-        world,
-        &creditor,
-        &debtor,
-        &RelationshipDelta::new()
-            .trust(-0.4)
-            .anger(0.35)
-            .respect(-0.2),
-    );
-    events.push(
+    Some(events.push(
         tick,
         minute,
         Some(by.clone()),
@@ -676,7 +676,7 @@ pub fn break_commitment(
         },
         Vec::new(),
         Vec::new(),
-    );
+    ))
 }
 
 /// Register a new rumor. Returns its id.
