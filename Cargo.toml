@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/domain",
+    "crates/behavior",
     "crates/perception",
     "crates/social",
     "crates/narrative",
@@ -33,6 +34,7 @@ rust-version = "1.91"
 
 [workspace.dependencies]
 rpg_domain = { path = "crates/domain" }
+rpg_behavior = { path = "crates/behavior" }
 rpg_perception = { path = "crates/perception" }
 rpg_social = { path = "crates/social" }
 rpg_narrative = { path = "crates/narrative" }

@@ -6,12 +6,17 @@
 //! All functions are deterministic given the same [`DeterministicRng`] state
 //! and mutate only canonical [`World`] state (plus the append-only event log).
 
+use rpg_behavior::{
+    AftermathThresholds, AppraisalProfile, AppraisedEvent, ContextualEdge, DecayRates,
+};
 use rpg_domain::action::QuestPredicate;
+use rpg_domain::emotions::{EmotionKind, EmotionsConfig};
 use rpg_domain::events::{EventKind, EventLog};
 use rpg_domain::ids::*;
+use rpg_domain::needs::NeedsConfig;
 use rpg_domain::rng::DeterministicRng;
 use rpg_domain::social::{Commitment, CommitmentKind, CommitmentState, Rumor};
-use rpg_domain::world::{evaluate_predicate, Belief, Provenance, World};
+use rpg_domain::world::{evaluate_predicate, Actor, Belief, Provenance, RelMemory, World};
 
 /// A bundle of relationship deltas. Missing fields are zero.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -101,6 +106,226 @@ pub fn adjust_relationship(
     rel.clamp_all();
 }
 
+// ---------------------------------------------------------------------------
+// Directed contextual relationship pathway (behavior-engine Phase 3; design
+// §3.2, plan I-4). The *appraised* update: ΔR_ij = f(e, V_i, B_i, goals_i,
+// R_ij, context) — never a universal delta.
+// ---------------------------------------------------------------------------
+
+/// What one appraised event did to the observer's mind (result record; the
+/// caller event-sources it). The edge deltas, the emotion writes and the
+/// interpretation are all recorded so causal traces and tests can audit the
+/// provenance (T3.6, T3.12).
+#[derive(Clone, Debug, PartialEq)]
+pub struct AppraisalOutcome {
+    pub subject: ActorId,
+    pub regarding: ActorId,
+    /// The observer's interpretation (design §3.2: the same event may be
+    /// read as affection, bribery, humiliation, coercion…).
+    pub interpretation: String,
+    /// Raw directed deltas computed by the appraisal kernel.
+    pub delta: rpg_behavior::DirectedDelta,
+    /// The saturating-updated edge (already applied to canonical state).
+    pub edge_after: rpg_behavior::ContextualEdge,
+    /// Emotion deltas actually applied (sensitivity-scaled, pre-clamp).
+    pub emotions: Vec<(rpg_domain::emotions::EmotionKind, f32)>,
+}
+
+/// Extract the observer's value profile `V_i` from authored personality,
+/// value tags and the current needs state (the `goals_i` input of design
+/// §3.2: a deprived safety need amplifies fear appraisals). Pure function of
+/// canonical state; no actor-id special cases.
+pub fn appraisal_profile(actor: &Actor, needs_config: &NeedsConfig) -> AppraisalProfile {
+    let p = &actor.personality;
+    let tag = |t: &str| actor.values.iter().any(|v| v == t) || p.has_tag(t);
+    let mut greed: f32 = 0.5;
+    if p.has_tag("greedy") {
+        greed += 0.3;
+    }
+    if tag("wealth") {
+        greed += 0.15;
+    }
+    if tag("generosity") {
+        greed -= 0.2;
+    }
+    let mut pride: f32 = 0.5;
+    if p.has_tag("proud") {
+        pride += 0.3;
+    }
+    if tag("self-reliance") || tag("dignity") {
+        pride += 0.15;
+    }
+    if tag("humility") {
+        pride -= 0.2;
+    }
+    AppraisalProfile {
+        greed: greed.clamp(0.0, 1.0),
+        pride: pride.clamp(0.0, 1.0),
+        bravery: (0.5 * p.risk_tolerance + 0.5 * (1.0 - p.self_preservation)).clamp(0.0, 1.0),
+        reciprocity: p.reciprocity.clamp(0.0, 1.0),
+        forgiveness: (0.5 + 0.4 * p.agreeableness).clamp(0.0, 1.0),
+        safety_urgency: actor
+            .needs
+            .urgency(rpg_domain::needs::NeedKind::Safety, needs_config),
+    }
+}
+
+/// Per-actor emotion sensitivities (T3.11): personality scales how strongly
+/// an appraised event moves each emotion, which shifts where the response
+/// thresholds effectively cross. Pure function of canonical state.
+pub fn emotion_sensitivity(actor: &Actor, config: &EmotionsConfig) -> [f32; 6] {
+    let p = &actor.personality;
+    let mut s = config.sensitivity;
+    s[EmotionKind::Fear.index()] *= 1.0 + 0.5 * (1.0 - p.risk_tolerance) + 0.25 * p.neuroticism;
+    s[EmotionKind::Anger.index()] *= 1.0 + 0.4 * p.reciprocity;
+    s[EmotionKind::Joy.index()] *= 1.0 + 0.3 * p.extraversion;
+    s[EmotionKind::Grief.index()] *= 1.0 + 0.25 * p.neuroticism;
+    s[EmotionKind::Pride.index()] *= 1.0 + 0.3 * (1.0 - p.agreeableness);
+    s[EmotionKind::Shame.index()] *= 1.0 + 0.3 * (1.0 - p.risk_tolerance);
+    s
+}
+
+/// The observer's interpretation of an event (design §3.2: "the recipient
+/// may infer affection, bribery, humiliation, coercion, or a hidden
+/// motive"). Rule-based over the profile; recorded as appraisal provenance
+/// (T3.6).
+fn interpret(event: &AppraisedEvent, profile: &AppraisalProfile) -> String {
+    match event {
+        AppraisedEvent::GiftReceived { .. } => {
+            if profile.pride >= 0.7 && profile.greed < 0.6 {
+                "read the gift as a bribe"
+            } else if profile.greed >= 0.7 {
+                "was delighted by the gift"
+            } else {
+                "felt grateful for the gift"
+            }
+        }
+        AppraisedEvent::AccurateClaim => "found the claim accurate",
+        AppraisedEvent::DeceptionExposed => "discovered a deception",
+        AppraisedEvent::ThreatReceived { .. } => "felt threatened",
+        AppraisedEvent::ComfortReceived { .. } => "felt comforted",
+        AppraisedEvent::HarmInflicted { .. } => "was harmed",
+        AppraisedEvent::PromiseKept => "saw the promise kept",
+        AppraisedEvent::PromiseBroken => "saw the promise broken",
+        AppraisedEvent::InsultReceived { .. } => "felt insulted",
+        AppraisedEvent::PraiseReceived => "felt appreciated",
+        AppraisedEvent::Sanctioned { .. } => "was sanctioned",
+    }
+    .to_string()
+}
+
+/// Apply one appraised event to the observer's mind (design §3.2; plan I-4 +
+/// I-4b): compute the directed contextual deltas from the observer's value
+/// profile and current edge (no universal deltas), apply them with
+/// saturation, write the event's emotions (mind-local, sensitivity-scaled),
+/// and record the appraisal memory with event + interpretation provenance
+/// (T3.6). Returns `None` for a self-appraisal or an unknown actor.
+pub fn apply_appraised_event(
+    world: &mut World,
+    subject: &ActorId,
+    regarding: &ActorId,
+    event: AppraisedEvent,
+    origin_event: Option<EventId>,
+    emotions_config: &EmotionsConfig,
+    needs_config: &NeedsConfig,
+) -> Option<AppraisalOutcome> {
+    if subject == regarding || world.actor(subject).is_none() || world.actor(regarding).is_none() {
+        return None;
+    }
+    let (profile, sensitivities, edge_before) = {
+        let actor = world.actor(subject).unwrap();
+        (
+            appraisal_profile(actor, needs_config),
+            emotion_sensitivity(actor, emotions_config),
+            ContextualEdge::from_relationship(&actor.relationship(regarding)),
+        )
+    };
+    let delta = rpg_behavior::appraise(&event, &profile, &edge_before);
+    let edge_after = rpg_behavior::apply_delta(&edge_before, &delta);
+    let interpretation = interpret(&event, &profile);
+    let mut emotions_written = Vec::new();
+    let now_tick = world.tick;
+    {
+        let actor = world.actor_mut(subject)?;
+        let rel = actor.relationship_mut(regarding);
+        rel.trust_accuracy = edge_after.trust_accuracy;
+        rel.trust_benevolence = edge_after.trust_benevolence;
+        rel.affection = edge_after.affection;
+        rel.respect = edge_after.respect;
+        rel.fear = edge_after.fear;
+        rel.anger = edge_after.anger;
+        rel.obligation = edge_after.obligation;
+        rel.familiarity = edge_after.familiarity;
+        rel.perceived_power = edge_after.perceived_power;
+        rel.clamp_all();
+        for (kind, d) in rpg_behavior::emotion_deltas(&event, &profile) {
+            let scaled = d * sensitivities[kind.index()];
+            if scaled == 0.0 {
+                continue;
+            }
+            actor.emotions.adjust(kind, scaled, 1.0);
+            emotions_written.push((kind, scaled));
+        }
+        actor.push_rel_memory(
+            regarding.clone(),
+            RelMemory {
+                event: origin_event,
+                interpretation: interpretation.clone(),
+                salience: 1.0,
+                tick: now_tick,
+            },
+        );
+    }
+    Some(AppraisalOutcome {
+        subject: subject.clone(),
+        regarding: regarding.clone(),
+        interpretation,
+        delta,
+        edge_after,
+        emotions: emotions_written,
+    })
+}
+
+/// Maintenance pass (called from the sim's deterministic step pipeline):
+/// per-dimension relationship decay toward 0, appraisal-memory salience
+/// decay, and the forgiveness/retaliation aftermath policy applied to anger
+/// decay (T3.5: an actor whose state reaches the forgiveness branch cools
+/// faster). Classified background mutation (plan G4): regular decay is
+/// non-evented.
+pub fn decay_relationships(world: &mut World, rates: &DecayRates, salience_decay: f32) {
+    for actor in world.actors.values_mut() {
+        // The actor's real dispositions drive the aftermath policy and the
+        // disposition-scaled forgiveness decay (T3.5).
+        let profile = AppraisalProfile {
+            reciprocity: actor.personality.reciprocity.clamp(0.0, 1.0),
+            forgiveness: (0.5 + 0.4 * actor.personality.agreeableness).clamp(0.0, 1.0),
+            ..AppraisalProfile::default()
+        };
+        for rel in actor.relationships.values_mut() {
+            let mut edge = ContextualEdge::from_relationship(rel);
+            let outcome = rpg_behavior::aftermath(&edge, &profile, &AftermathThresholds::default());
+            let mut rates = *rates;
+            rates.anger = rpg_behavior::aftermath_anger_decay(rates.anger, outcome, &profile);
+            rpg_behavior::decay_edge(&mut edge, &rates);
+            rel.trust_accuracy = edge.trust_accuracy;
+            rel.trust_benevolence = edge.trust_benevolence;
+            rel.affection = edge.affection;
+            rel.respect = edge.respect;
+            rel.fear = edge.fear;
+            rel.anger = edge.anger;
+            rel.obligation = edge.obligation;
+            rel.familiarity = edge.familiarity;
+            rel.perceived_power = edge.perceived_power;
+        }
+        for entries in actor.rel_memory.values_mut() {
+            for m in entries.iter_mut() {
+                m.salience = (m.salience - salience_decay).max(0.0);
+            }
+            entries.retain(|m| m.salience > 0.0);
+        }
+    }
+}
+
 /// Outcome of one actor telling another a fact.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShareOutcome {
@@ -110,10 +335,13 @@ pub struct ShareOutcome {
     pub newly_learned: bool,
 }
 
-/// Record a belief on an actor. Returns true if the belief is new or changed
-/// from disbelief to belief.
+/// Write the legacy single-slot belief snapshot plus its `FactBelieved`
+/// event. This is the compatibility surface every downstream reader (prompt
+/// rendering, predicates, investigation) sees; the authoritative per-
+/// proposition evidence lives in `World::epistemics` (behavior-engine Phase
+/// 1). Shared by [`record_belief`] and [`share_claim`].
 #[allow(clippy::too_many_arguments)]
-pub fn record_belief(
+fn write_belief_snapshot(
     world: &mut World,
     events: &mut EventLog,
     tick: u64,
@@ -156,11 +384,61 @@ pub fn record_belief(
     newly
 }
 
+/// Record a belief on an actor. Returns true if the belief is new or changed
+/// from disbelief to belief.
+///
+/// Compatibility shim (behavior-engine Phase 1): the legacy snapshot is
+/// written exactly as before, and the same write is *also* recorded in the
+/// actor's evidence ledger with full provenance (channel, source chain,
+/// reliability), so every canonical belief write is event-sourced.
+#[allow(clippy::too_many_arguments)]
+pub fn record_belief(
+    world: &mut World,
+    events: &mut EventLog,
+    tick: u64,
+    minute: u32,
+    actor: &ActorId,
+    fact: &FactId,
+    believes_true: bool,
+    confidence: f32,
+    source: Provenance,
+) -> bool {
+    let newly = write_belief_snapshot(
+        world,
+        events,
+        tick,
+        minute,
+        actor,
+        fact,
+        believes_true,
+        confidence,
+        source.clone(),
+    );
+    rpg_behavior::record_provenance_evidence(
+        world,
+        events,
+        tick,
+        minute,
+        actor,
+        fact,
+        believes_true,
+        &source,
+    );
+    newly
+}
+
 /// `from` tells `to` about `fact`. The recipient's trust, the speaker's
 /// assertiveness and existing suspicion determine whether it is believed.
 ///
 /// The speaker must already believe the fact (or be lying deliberately); the
 /// caller is responsible for validating that. Returns what happened.
+///
+/// Behavior-engine Phase 1: delivery is now event-sourced — the recipient
+/// always records a provenance-bound evidence item (`EvidenceRecorded` event)
+/// whose source chain preserves the claim's origin, and acceptance is rolled
+/// from the relationship appraisal plus the correlation-protected prior. The
+/// legacy probability formula is unchanged for an empty ledger, and the
+/// `assertive` flag still weights the odds without ever forcing belief.
 #[allow(clippy::too_many_arguments)]
 pub fn share_claim(
     world: &mut World,
@@ -173,6 +451,32 @@ pub fn share_claim(
     fact: &FactId,
     assertive: bool,
 ) -> ShareOutcome {
+    assert_claim(
+        world, events, rng, tick, minute, from, to, fact, assertive, true, false,
+    )
+}
+
+/// The general ASSERT delivery (plan I-5): the same mechanism as
+/// [`share_claim`] but with the asserted polarity and the intentional-
+/// deception marker chosen by the caller. The authoritative sim lowering
+/// routes both truthful and deceptive claims through this single production
+/// pathway: the asserted polarity (never the speaker's belief) is what gets
+/// recorded in the evidence ledger and the `ClaimShared` event, `deceptive`
+/// marks the lie for the M2 provenance audit, and world truth is untouched.
+#[allow(clippy::too_many_arguments)]
+pub fn assert_claim(
+    world: &mut World,
+    events: &mut EventLog,
+    rng: &mut DeterministicRng,
+    tick: u64,
+    minute: u32,
+    from: &ActorId,
+    to: &ActorId,
+    fact: &FactId,
+    assertive: bool,
+    asserted_polarity: bool,
+    deceptive: bool,
+) -> ShareOutcome {
     let speaker_confidence = world
         .actor(from)
         .and_then(|a| a.beliefs.get(fact))
@@ -183,23 +487,48 @@ pub fn share_claim(
         .actor(to)
         .map(|a| a.relationship(from))
         .unwrap_or_default();
-    let trust = (1.0 + rel.trust) * 0.5; // 0..1
-    let suspicion = (1.0 + rel.suspicion) * 0.5;
-    let assertiveness = if assertive { 1.0 } else { 0.6 };
 
     // A confident trusted friend is believed; a distrusted one is doubted.
-    let mut p = 0.25 + 0.45 * trust + 0.25 * assertiveness + 0.2 * speaker_confidence
-        - 0.35 * suspicion
-        - 0.15 * rel.fear;
-    p = p.clamp(0.05, 0.97);
     // Assertiveness influences the odds but never guarantees belief: even a
     // bargain-backed disclosure must still be judged by the recipient's trust
-    // and suspicion. The recipient always *hears* the claim (a belief record
-    // is written either way); only conviction is rolled.
-    let believed = rng.chance(p);
+    // and suspicion. The recipient always *hears* the claim (an evidence item
+    // is recorded either way); only conviction is rolled.
+    let appraisal = rpg_behavior::RecipientAppraisal {
+        trust: rel.trust,
+        suspicion: rel.suspicion,
+        fear: rel.fear,
+        assertiveness: if assertive { 1.0 } else { 0.6 },
+    };
+    let draft = rpg_behavior::AssertionDraft {
+        speaker: Some(from.clone()),
+        proposition: fact.clone(),
+        asserted_polarity,
+        channel: rpg_domain::behavior_types::AcquisitionChannel::Told,
+        origin_event: None,
+        reliability: 0.6,
+        retold_chain: None,
+        deceptive,
+    };
+    let acceptance = rpg_behavior::accept_assertion(
+        world,
+        events,
+        tick,
+        minute,
+        to,
+        draft,
+        appraisal,
+        speaker_confidence,
+        assertive,
+        rng,
+    );
+    let believed = acceptance.believed;
+    let p = acceptance.probability;
     // Even when not fully believed, the recipient records an uncertain belief
-    // with provenance so the rumor can still propagate as a claim.
-    let newly = record_belief(
+    // with provenance so the rumor can still propagate as a claim. (The
+    // evidence item was already inserted by `accept_assertion`; this writes
+    // the legacy snapshot only. The provenance links the delivered claim —
+    // the `ClaimShared` event the acceptance path emitted.)
+    let newly = write_belief_snapshot(
         world,
         events,
         tick,
@@ -210,23 +539,8 @@ pub fn share_claim(
         if believed { p } else { (1.0 - p).max(0.1) },
         Provenance::Told {
             by: from.clone(),
-            event: None,
+            event: acceptance.claim_event,
         },
-    );
-
-    events.push(
-        tick,
-        minute,
-        Some(from.clone()),
-        EventKind::ClaimShared {
-            from: from.clone(),
-            to: to.clone(),
-            fact: fact.clone(),
-            assertive,
-            believed,
-        },
-        Vec::new(),
-        vec![to.clone()],
     );
 
     // Being told something repeatedly builds familiarity.
@@ -409,6 +723,12 @@ pub fn add_rumor(
 
 /// Propagate an existing rumor to another actor, potentially distorting the
 /// confidence. Returns true if the rumor reached `to`.
+///
+/// The delivery passes through the shared acceptance mechanic with the
+/// *actual reteller* as the direct source: the reteller passes on their own
+/// belief polarity — never the rumor record's world truth — and the
+/// recipient's belief is rolled (never forced), with a provenance-bound
+/// evidence item on their ledger.
 pub fn propagate_rumor(
     world: &mut World,
     events: &mut EventLog,
@@ -428,21 +748,67 @@ pub fn propagate_rumor(
     r.confidence = (r.confidence * decay).clamp(0.05, 1.0);
     r.hops += 1;
     r.chain.push(to.clone());
-    let (text, about, truth, confidence) = (r.text.clone(), r.about.clone(), r.truth, r.confidence);
+    let (text, about, confidence) = (r.text.clone(), r.about.clone(), r.confidence);
     let speaker = r.chain[r.chain.len() - 2].clone();
     if let Some(fact) = &about {
-        record_belief(
+        // The reteller's own conviction is what gets retold. When they hold
+        // no belief at all they pass the claim on as heard (polarity true) at
+        // the rumor's carried confidence.
+        let (retold_polarity, reteller_confidence) = world
+            .actor(&speaker)
+            .and_then(|a| a.beliefs.get(fact))
+            .map(|b| (b.believes_true, b.confidence))
+            .unwrap_or((true, confidence));
+        let rel = world
+            .actor(to)
+            .map(|a| a.relationship(&speaker))
+            .unwrap_or_default();
+        let appraisal = rpg_behavior::RecipientAppraisal {
+            trust: rel.trust,
+            suspicion: rel.suspicion,
+            fear: rel.fear,
+            assertiveness: 0.6,
+        };
+        let draft = rpg_behavior::AssertionDraft {
+            speaker: Some(speaker.clone()),
+            proposition: fact.clone(),
+            asserted_polarity: retold_polarity,
+            channel: rpg_domain::behavior_types::AcquisitionChannel::Told,
+            origin_event: None,
+            reliability: 0.6,
+            retold_chain: None,
+            deceptive: false,
+        };
+        let acceptance = rpg_behavior::accept_assertion(
+            world,
+            events,
+            tick,
+            minute,
+            to,
+            draft,
+            appraisal,
+            reteller_confidence,
+            false,
+            rng,
+        );
+        // Legacy snapshot so the rumor can keep propagating as a claim; the
+        // polarity is the rolled acceptance outcome, never world truth.
+        write_belief_snapshot(
             world,
             events,
             tick,
             minute,
             to,
             fact,
-            truth,
-            confidence,
+            acceptance.believed,
+            if acceptance.believed {
+                acceptance.probability
+            } else {
+                (1.0 - acceptance.probability).max(0.1)
+            },
             Provenance::Told {
                 by: speaker,
-                event: None,
+                event: acceptance.claim_event,
             },
         );
     }
@@ -583,8 +949,11 @@ mod tests {
             ledger: BTreeMap::new(),
             next_commitment_id: 1,
             next_offer_id: 1,
+            deals: BTreeMap::new(),
+            next_deal_id: 1,
             next_rumor_id: 1,
             next_goal_id: 1,
+            epistemics: Default::default(),
             lore: WorldLore::default(),
         }
     }
@@ -613,6 +982,10 @@ mod tests {
             flags: BTreeSet::new(),
             secret_allegiance: None,
             in_private_conversation_with: None,
+            bargain: None,
+            needs: Default::default(),
+            emotions: Default::default(),
+            rel_memory: BTreeMap::new(),
         }
     }
 
@@ -834,6 +1207,128 @@ mod tests {
         assert!(
             found_disbelief,
             "expected at least one seed where a distrusted speaker is not believed"
+        );
+    }
+
+    /// Regression (F8): rumor propagation passes through the shared
+    /// acceptance mechanic with the *actual reteller* — the reteller's own
+    /// belief polarity is what the recipient hears and records, never the
+    /// rumor record's world truth.
+    #[test]
+    fn f8_propagate_rumor_retells_the_retellers_belief_not_world_truth() {
+        let mut w = world_with(vec![actor("a"), actor("m"), actor("c")]);
+        let fact = FactId::new("f_rumor");
+        // The mid-chain reteller `m` heard the rumor and DISBELIEVES it;
+        // the rumor record's world truth is TRUE.
+        w.actor_mut(&ActorId::new("m")).unwrap().beliefs.insert(
+            fact.clone(),
+            rpg_domain::world::Belief {
+                fact: fact.clone(),
+                believes_true: false,
+                confidence: 0.8,
+                source: Provenance::Told {
+                    by: ActorId::new("a"),
+                    event: None,
+                },
+                acquired_tick: 0,
+            },
+        );
+        // Seed the rumor record mid-transmission: originated by `a`, now
+        // held by `m` (so `m` is the actual reteller of the next hop).
+        let id = RumorId(w.next_rumor_id);
+        w.next_rumor_id += 1;
+        w.rumors.push(Rumor {
+            id,
+            text: "the grocer is a smuggler".into(),
+            about: Some(fact.clone()),
+            truth: true,
+            source: ActorId::new("a"),
+            chain: vec![ActorId::new("a"), ActorId::new("m")],
+            confidence: 0.7,
+            created_tick: 0,
+            hops: 1,
+        });
+
+        let mut events = EventLog::new();
+        let mut rng = DeterministicRng::new(5);
+        assert!(propagate_rumor(
+            &mut w,
+            &mut events,
+            &mut rng,
+            1,
+            480,
+            id,
+            &ActorId::new("c")
+        ));
+
+        // The recipient records provenance-bound told evidence whose asserted
+        // polarity is the RETELLER's disbelief — never the world truth.
+        let entries = w.epistemics.evidence_about(&ActorId::new("c"), &fact);
+        assert_eq!(entries.len(), 1);
+        assert!(
+            !entries[0].asserted_polarity,
+            "the recipient heard m's disbelief, not the world truth"
+        );
+        assert_eq!(
+            entries[0].source_actor_id.as_ref().map(|a| a.as_str()),
+            Some("m"),
+            "the actual reteller is the evidence's source"
+        );
+        assert_eq!(
+            entries[0].acquisition_channel,
+            rpg_domain::behavior_types::AcquisitionChannel::Told
+        );
+        // The write is event-sourced: one EvidenceRecorded (causally linked
+        // to the delivery) and one ClaimShared from the actual reteller.
+        let claim = events
+            .all()
+            .iter()
+            .find(|e| {
+                matches!(
+                    &e.kind,
+                    EventKind::ClaimShared { from, to, .. }
+                        if from.as_str() == "m" && to.as_str() == "c"
+                )
+            })
+            .expect("the rumor delivery emits a ClaimShared event");
+        let recorded = events
+            .all()
+            .iter()
+            .find(|e| {
+                matches!(
+                    &e.kind,
+                    EventKind::EvidenceRecorded { observer, fact: f, .. }
+                        if observer.as_str() == "c" && f == &fact
+                )
+            })
+            .expect("the rumor delivery records evidence");
+        assert!(recorded.caused_by.contains(&claim.id));
+        // The legacy snapshot follows the rolled acceptance, not world truth.
+        let snapshot_believed = w
+            .actor(&ActorId::new("c"))
+            .unwrap()
+            .beliefs
+            .get(&fact)
+            .unwrap()
+            .believes_true;
+        match &claim.kind {
+            EventKind::ClaimShared { believed, .. } => {
+                assert_eq!(
+                    snapshot_believed, *believed,
+                    "the snapshot polarity is the acceptance roll, never world truth"
+                );
+            }
+            _ => unreachable!(),
+        }
+        // The reteller's own recorded disbelief survives (no world-truth
+        // write ever touched their polarity).
+        assert!(
+            !w.actor(&ActorId::new("m"))
+                .unwrap()
+                .beliefs
+                .get(&fact)
+                .unwrap()
+                .believes_true
         );
     }
 }

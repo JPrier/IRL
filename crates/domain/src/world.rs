@@ -4,6 +4,8 @@
 //! logic that mutates it; this crate only defines what state *is*. This keeps
 //! the domain independent of Bevy, model runtimes and storage.
 
+use crate::action::QuestPredicate;
+use crate::deal::Deal;
 use crate::geom::{GridPos, Rect, Vec2};
 use crate::ids::*;
 use crate::social::{Commitment, Offer, Rumor};
@@ -73,6 +75,15 @@ impl Personality {
 /// Multi-dimensional relationship from the perspective of the owning actor.
 /// All fields are in `-1.0 ..= 1.0` unless noted, and must be clamped by the
 /// mutation helpers in `social`.
+///
+/// The three `serde(default)` contextual dimensions belong to the behavior-
+/// engine relationship model (design §3.2, plan I-4): `trust` is split into
+/// **trust-in-accuracy** (will this actor's claims be true?) and
+/// **trust-in-benevolence** (will this actor act in my interest, e.g. keep a
+/// secret?), and `perceived_power` estimates the other's capability relative
+/// to mine. Context separation (T3.2): trusting someone's accuracy never
+/// implies trusting them with a secret. The legacy `trust` aggregate is
+/// untouched by the new pathway for API compatibility.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Relationship {
     /// Belief that the other will act in good faith.
@@ -95,6 +106,15 @@ pub struct Relationship {
     pub obligation: f32,
     /// How well the owner knows the other (0..1).
     pub familiarity: f32,
+    /// Trust-in-accuracy: expectation that the other's claims are true.
+    #[serde(default)]
+    pub trust_accuracy: f32,
+    /// Trust-in-benevolence: expectation that the other acts in my interest.
+    #[serde(default)]
+    pub trust_benevolence: f32,
+    /// How powerful the other is perceived to be relative to me (0..1).
+    #[serde(default)]
+    pub perceived_power: f32,
 }
 
 impl Default for Relationship {
@@ -110,6 +130,9 @@ impl Default for Relationship {
             suspicion: 0.0,
             obligation: 0.0,
             familiarity: 0.0,
+            trust_accuracy: 0.0,
+            trust_benevolence: 0.0,
+            perceived_power: 0.0,
         }
     }
 }
@@ -125,11 +148,14 @@ impl Relationship {
             &mut self.sadness,
             &mut self.temptation,
             &mut self.suspicion,
+            &mut self.trust_accuracy,
+            &mut self.trust_benevolence,
         ] {
             *v = v.clamp(-1.0, 1.0);
         }
         self.obligation = self.obligation.clamp(0.0, 1.0);
         self.familiarity = self.familiarity.clamp(0.0, 1.0);
+        self.perceived_power = self.perceived_power.clamp(0.0, 1.0);
     }
 
     /// A single scalar used only for coarse ordering, never for gameplay.
@@ -147,6 +173,13 @@ pub struct Goal {
     /// Higher runs first when the actor must choose.
     pub priority: f32,
     pub status: GoalStatus,
+    /// Urgency currently added to `priority` by an unmet need (design §3
+    /// `N` → goal urgency, plan I-4a). Set exactly at an event-sourced
+    /// `NeedThresholdCrossed`/`GoalUrgencyRaised` pair and cleared when the
+    /// need recovers (`GoalUrgencyReleased`), so escalation is bounded and
+    /// replayable (T3.8 hysteresis).
+    #[serde(default)]
+    pub need_boost: f32,
     /// Optional stable predicate that marks the goal satisfied.
     #[serde(default)]
     pub predicate: Option<crate::action::QuestPredicate>,
@@ -283,6 +316,70 @@ pub struct Actor {
     /// Whether the actor is currently in a private conversation.
     #[serde(default)]
     pub in_private_conversation_with: Option<ActorId>,
+    /// Content-declared conditional bargain (design §7 counteroffer): which
+    /// typed world condition this actor needs satisfied before it will
+    /// disclose a fact it holds. Authored content, not engine literals — the
+    /// generic bargaining pathway reads this structure; no engine module may
+    /// hardcode actor or fact ids for it.
+    #[serde(default)]
+    pub bargain: Option<Bargain>,
+    /// Needs state `N` (design §3, plan I-4a): safety, belonging, wealth,
+    /// health, status with per-need decay, satiation thresholds and latched
+    /// urgency (see [`crate::needs`]).
+    #[serde(default)]
+    pub needs: crate::needs::Needs,
+    /// Emotions state `E` (design §3, plan I-4b): temporary appraisal
+    /// variables written only by `APPRAISE` effects (mind-local; never world
+    /// truth — design §3 separation 7). See [`crate::emotions`].
+    #[serde(default)]
+    pub emotions: crate::emotions::Emotions,
+    /// Dyadic appraisal memory (design §5.1, plan I-4): bounded, salience-
+    /// decayed provenance for recent relationship appraisals (T3.6). Entries
+    /// carry the origin event id and the interpretation the observer made.
+    #[serde(default)]
+    pub rel_memory: BTreeMap<ActorId, Vec<RelMemory>>,
+}
+
+/// One recorded appraisal in an actor's relationship memory (T3.6): what
+/// event it came from, how the observer interpreted it, and how salient the
+/// memory currently is. Salience decays toward 0 in maintenance; the oldest
+/// lowest-salience entries are dropped to keep memory bounded.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct RelMemory {
+    /// The canonical event the appraisal was made about (provenance).
+    pub event: Option<EventId>,
+    /// The observer's interpretation (design §3.2: "the recipient may infer
+    /// affection, bribery, humiliation, coercion, or a hidden motive").
+    pub interpretation: String,
+    /// Salience `0.0..=1.0`; decays in maintenance (memory salience,
+    /// plan I-4), never erases the authoritative event.
+    pub salience: f32,
+    /// Tick the memory was formed.
+    pub tick: u64,
+}
+
+/// How many appraisal memories are kept per (observer, other) pair.
+pub const REL_MEMORY_CAP: usize = 16;
+
+impl Actor {
+    /// Record one appraisal memory about `other`, bounded: keep the newest
+    /// [`REL_MEMORY_CAP`] entries (this drops the *oldest* first; salience
+    /// decay happens in maintenance).
+    pub fn push_rel_memory(&mut self, other: ActorId, memory: RelMemory) {
+        let entries = self.rel_memory.entry(other).or_default();
+        entries.push(memory);
+        while entries.len() > REL_MEMORY_CAP {
+            entries.remove(0);
+        }
+    }
+}
+
+/// An authored conditional bargain: the condition the actor needs met (a
+/// typed world predicate) and the fact promised once it is.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Bargain {
+    pub condition: QuestPredicate,
+    pub disclose: FactId,
 }
 
 impl Actor {
@@ -729,6 +826,11 @@ pub struct World {
 
     pub commitments: BTreeMap<CommitmentId, Commitment>,
     pub offers: BTreeMap<OfferId, Offer>,
+    /// Typed conditional contracts (the deal FSM). `serde(default)` keeps
+    /// older v3 saves loadable without a version bump: deals simply start
+    /// empty on worlds saved before the FSM existed.
+    #[serde(default)]
+    pub deals: BTreeMap<DealId, Deal>,
     pub rumors: Vec<Rumor>,
 
     /// Structural damage 0..1 per location (1 = destroyed).
@@ -745,8 +847,17 @@ pub struct World {
 
     pub next_commitment_id: u64,
     pub next_offer_id: u64,
+    /// Next deal id (typed conditional contracts). `serde(default)` for old
+    /// saves.
+    #[serde(default)]
+    pub next_deal_id: u64,
     pub next_rumor_id: u64,
     pub next_goal_id: u64,
+    /// Canonical epistemic state: per-actor evidence ledgers and provenance
+    /// chains (behavior-engine Phase 0/1). `serde(default)` keeps v2 saves
+    /// loadable; `rpg_persistence` migrates them to v3 explicitly.
+    #[serde(default)]
+    pub epistemics: crate::behavior_types::Epistemics,
     /// Authored, shared lore for the settlement.
     #[serde(default)]
     pub lore: WorldLore,
@@ -847,6 +958,7 @@ pub fn evaluate_predicate(world: &World, pred: &crate::action::QuestPredicate) -
             .map(|a| a.location == *location)
             .unwrap_or(false),
         P::BelievesFact { actor, fact } => world.believes(actor, fact),
+        P::HeardFact { actor, fact } => world.has_heard(actor, fact),
         P::FactCommitted { fact } => world.fact(fact).map(|f| f.committed).unwrap_or(false),
         P::LocationRepaired { location } => world.damage_at(location) <= 0.0,
         P::FactionPaid {
@@ -897,6 +1009,7 @@ mod tests {
             },
             commitments: BTreeMap::new(),
             offers: BTreeMap::new(),
+            deals: BTreeMap::new(),
             rumors: Vec::new(),
             damage: BTreeMap::new(),
             location_items: BTreeMap::new(),
@@ -904,8 +1017,10 @@ mod tests {
             ledger: BTreeMap::new(),
             next_commitment_id: 1,
             next_offer_id: 1,
+            next_deal_id: 1,
             next_rumor_id: 1,
             next_goal_id: 1,
+            epistemics: Default::default(),
             lore: WorldLore::default(),
         }
     }

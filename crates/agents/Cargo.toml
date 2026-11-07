@@ -8,6 +8,7 @@ description = "Agentic RPG: NPC/director context construction, policies and infe
 
 [dependencies]
 rpg_domain.workspace = true
+rpg_behavior.workspace = true
 rpg_narrative.workspace = true
 rpg_social.workspace = true
 serde.workspace = true

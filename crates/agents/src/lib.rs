@@ -13,14 +13,17 @@
 //!
 //! Agents never mutate world state; they only propose.
 
+use rpg_behavior::{Feasibility, Intention, Params as UtilityParams, Ranking, UtilityOption};
 use rpg_domain::action::{Action, ActionProposal, ProposalSource, QuestPredicate};
+use rpg_domain::deal::DealState;
 use rpg_domain::ids::*;
+use rpg_domain::needs::{NeedKind, NeedsConfig};
 use rpg_domain::ports::{
     InferenceEngine, InferenceError, InferenceRequest, InferenceResponse, InferenceRole,
     MemoryRetriever, RetrievedMemory,
 };
 use rpg_domain::social::CommitmentState;
-use rpg_domain::world::{Actor, ActorKind, Fact, Sensitivity, World};
+use rpg_domain::world::{evaluate_predicate, Actor, ActorKind, Fact, Sensitivity, World};
 use rpg_narrative::{Decision, NarrativeChange};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -865,6 +868,7 @@ fn parse_decision(
             target: target?,
             fact: FactId::new(d.fact?),
             assertive: d.assertive.unwrap_or(true),
+            deceptive: false,
         }),
         "offer" => {
             let condition = d
@@ -986,6 +990,7 @@ pub fn heuristic_decision(
                 target: speaker.clone(),
                 fact: FactId::new("f_grocer_ledger"),
                 assertive: true,
+                deceptive: false,
             };
         }
         return Action::MakeOffer {
@@ -1019,6 +1024,7 @@ pub fn heuristic_decision(
                 target: speaker.clone(),
                 fact,
                 assertive: true,
+                deceptive: false,
             };
         }
     }
@@ -1236,24 +1242,21 @@ impl NpcPolicy {
         // Canonical agenda: an NPC with an unmet item need should not give up
         // a private fact for free. If the model did not initiate the designed
         // bargain, the policy does.
-        if let Some((fact, item)) =
+        if let Some((fact, condition)) =
             canonical_bargain(ctx.world, ctx.npc, ctx.speaker, ctx.utterance)
         {
             match &mut action {
                 Action::MakeOffer {
-                    condition,
+                    condition: offer_condition,
                     disclose,
                     ..
                 } => {
-                    *condition = Some(QuestPredicate::HasItem {
-                        actor: ctx.npc.clone(),
-                        item: item.clone(),
-                        qty: 1,
-                    });
+                    *offer_condition = Some(condition.clone());
                     *disclose = Some(fact.clone());
                 }
                 Action::ShareClaim { .. } => {}
                 _ => {
+                    let want = describe_condition(&condition);
                     return NpcDecision {
                         proposal: ActionProposal {
                             actor: ctx.npc.clone(),
@@ -1261,19 +1264,15 @@ impl NpcPolicy {
                                 target: ctx.speaker.clone(),
                                 give: vec![],
                                 want: vec![],
-                                condition: Some(QuestPredicate::HasItem {
-                                    actor: ctx.npc.clone(),
-                                    item: item.clone(),
-                                    qty: 1,
-                                }),
+                                condition: Some(condition.clone()),
                                 disclose: Some(fact.clone()),
-                                note: format!("Bring me {item} and I will tell you what I know."),
+                                note: bargain_note(&condition),
                             },
                             source: ProposalSource::NpcPolicy,
-                            rationale: format!("designed bargain ({item} for {fact})"),
+                            rationale: format!("designed bargain ({want} for {fact})"),
                         },
                         source: DecisionSource::CanonicalAgenda {
-                            reason: format!("needs {item} before sharing {fact}"),
+                            reason: format!("needs {want} before sharing {fact}"),
                         },
                         prompt: req.prompt,
                         raw: Some(resp),
@@ -1293,6 +1292,7 @@ impl NpcPolicy {
                             target: ctx.speaker.clone(),
                             fact: fact.clone(),
                             assertive: true,
+                            deceptive: false,
                         },
                         source: ProposalSource::NpcPolicy,
                         rationale: format!("honouring a satisfied deal ({fact})"),
@@ -1359,15 +1359,77 @@ fn push_lore_field(out: &mut String, label: &str, text: &str) {
     }
 }
 
+/// A compact, actor-agnostic description of a bargain condition, used in
+/// provenance records and trace lines (never authoritative).
+fn describe_condition(condition: &QuestPredicate) -> String {
+    match condition {
+        QuestPredicate::HasItem { item, qty, .. } => {
+            if *qty > 1 {
+                format!("{qty}x{}", item.as_str())
+            } else {
+                item.as_str().to_string()
+            }
+        }
+        QuestPredicate::HasMoney { amount, .. } => format!("{amount} coins"),
+        QuestPredicate::Flag(flag) => flag.clone(),
+        _ => "its condition".into(),
+    }
+}
+
+/// The words a bargain offer is spoken as, derived from the authored
+/// condition (deterministic paraphrase of the committed action's own fields,
+/// like `spoken_line_in`; never invented dialogue).
+fn bargain_note(condition: &QuestPredicate) -> String {
+    let want = describe_condition(condition);
+    match condition {
+        QuestPredicate::HasItem { .. } => {
+            format!("Bring me {want} and I will tell you what I know.")
+        }
+        _ => format!("Help me with {want} and I will tell you what I know."),
+    }
+}
+
 /// A designed bargain the NPC should drive: it withholds a private fact the
-/// player is asking about until it receives a needed item it lacks.
+/// player is asking about until its condition is met.
+///
+/// The primary source is the **content-declared** bargain
+/// ([`rpg_domain::world::Actor::bargain`]): authored typed predicates and
+/// fact ids, so no engine module carries actor or fact literals. Actors
+/// without an authored bargain fall back to a generic heuristic over their
+/// own beliefs (item ids mentioned in believed-fact statements the actor
+/// lacks) — still id-free. The legacy `heuristic_decision` fallback is a
+/// separate, documented path (plan Phase 2; ids there are exempt until I-11).
 fn canonical_bargain(
     world: &World,
     npc: &ActorId,
     speaker: &ActorId,
     utterance: &str,
-) -> Option<(FactId, ItemId)> {
+) -> Option<(FactId, QuestPredicate)> {
     let a = world.actor(npc)?;
+    // Content-declared bargain first: the authored typed condition. It fires
+    // when the player is actually asking about the promised fact (the shared
+    // generic relevance check — no id special cases, no omniscience).
+    if let Some(b) = &a.bargain {
+        let fact = &b.disclose;
+        if relevant_believed_fact(world, npc, utterance).as_ref() != Some(fact) {
+            return None;
+        }
+        let f = world.fact(fact)?;
+        // Not while the player already knows it, and only if the actor
+        // actually believes what it promises to disclose.
+        if f.sensitivity == Sensitivity::Public || world.believes(speaker, fact) {
+            return None;
+        }
+        if !world.believes(npc, fact) {
+            return None;
+        }
+        // A satisfied condition is an owed disclosure, not a new offer.
+        if evaluate_predicate(world, &b.condition) {
+            return None;
+        }
+        return Some((fact.clone(), b.condition.clone()));
+    }
+    // Generic fallback over the actor's own beliefs (id-free).
     let fact = relevant_believed_fact(world, npc, utterance)?;
     let f = world.fact(&fact)?;
     if f.sensitivity == Sensitivity::Public || world.believes(speaker, &fact) {
@@ -1386,7 +1448,14 @@ fn canonical_bargain(
                 continue;
             }
             if stmt.contains(item.as_str()) {
-                return Some((fact.clone(), item.clone()));
+                return Some((
+                    fact.clone(),
+                    QuestPredicate::HasItem {
+                        actor: npc.clone(),
+                        item: item.clone(),
+                        qty: 1,
+                    },
+                ));
             }
         }
     }
@@ -1397,25 +1466,224 @@ fn canonical_bargain(
 /// now disclose: the promised fact, else the fact the player is asking about.
 /// The obligation is fulfilled once the fact has been *heard* (delivered) —
 /// whether or not the recipient came to believe it.
+///
+/// Both the legacy commitment pathway and the new typed-deal pathway feed
+/// this: a due deal (`PerformanceDue`) whose promised benefit is a disclosure
+/// must be honoured exactly like a satisfied legacy commitment. A satisfied
+/// commitment that owes no un-heard fact (no `promised_fact`, nothing
+/// relevant left un-heard) falls through to the due-deal pathway rather than
+/// suppressing it.
 fn owed_disclosure(
     world: &World,
     npc: &ActorId,
     speaker: &ActorId,
     utterance: &str,
 ) -> Option<FactId> {
-    let debt = world.commitments.values().find(|c| {
+    if let Some(debt) = world.commitments.values().find(|c| {
         c.debtor == *npc && c.creditor == *speaker && c.state == CommitmentState::Satisfied
-    })?;
-    if let Some(fact) = &debt.promised_fact {
-        if !world.has_heard(speaker, fact) {
-            return Some(fact.clone());
+    }) {
+        if let Some(fact) = &debt.promised_fact {
+            if !world.has_heard(speaker, fact) {
+                return Some(fact.clone());
+            }
+        }
+        // A satisfied commitment without an un-heard promised fact owes
+        // nothing more *from the commitment* — but it must not suppress the
+        // typed-deal pathway below (an early `?`/`return None` here used to
+        // short-circuit a due deal owed to the same speaker).
+        if let Some(fact) = relevant_believed_fact(world, npc, utterance) {
+            if !world.has_heard(speaker, &fact) {
+                return Some(fact);
+            }
         }
     }
-    let fact = relevant_believed_fact(world, npc, utterance)?;
-    if world.has_heard(speaker, &fact) {
-        return None;
+    // New pathway: a due typed deal the NPC owes the speaker must be
+    // honoured. A fulfillment *claim* never settles it — only the delivered
+    // disclosure (the speaker actually hearing the fact) does.
+    if let Some(deal) = world.deals.values().find(|d| {
+        d.debtor == *npc && d.creditor == *speaker && d.state == DealState::PerformanceDue
+    }) {
+        if let QuestPredicate::HeardFact { fact, .. } = &deal.performance {
+            if !world.has_heard(speaker, fact) {
+                return Some(fact.clone());
+            }
+        }
     }
-    Some(fact)
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Deal-response ranking (behavior-engine Phase 2; plan I-3 + I-3b seam)
+// ---------------------------------------------------------------------------
+
+/// A due deal plus the actor's available responses, ranked by the
+/// behavior-engine utility kernel (design §4.2; plan I-3b).
+///
+/// Expectations are computed **only from the actor's own custody and
+/// knowledge** (beliefs-only): honouring a disclosure is possible exactly
+/// when the actor knows the fact and is authorised to disclose it; settling a
+/// delivery is possible exactly when the actor currently holds the contracted
+/// quantity (custody is checked at settlement time; there is no v1 lock).
+/// Unilaterally walking away from a due obligation is a lexicographic
+/// constraint, not a weighted trade-off: the ranking excludes it while any
+/// acceptable option exists (§4.4 maps a *mechanic-level* unilateral debtor
+/// cancellation onto the Violated path; the policy never proposes one).
+pub struct DealResponseOptions {
+    pub deal: DealId,
+    pub ranking: Ranking,
+}
+
+/// Rank the due obligation's responses for `npc`. `intention` is the actor's
+/// standing intention, if one is tracked: an option that differs from it pays
+/// the switch penalty (η_i·switch_i deters oscillation). `talk_radius`, when
+/// given, makes proximity to the creditor part of physical feasibility — a
+/// transfer cannot be delivered from across town. `needs_config` supplies
+/// the actor's need tuning for the α_i·Δneeds_i utility term (plan I-3b +
+/// I-4a): the same option set ranks differently for actors with different
+/// need profiles (T3.9).
+pub fn deal_response_options(
+    world: &World,
+    npc: &ActorId,
+    intention: Option<&Intention>,
+    talk_radius: Option<f32>,
+    needs_config: &NeedsConfig,
+) -> Option<DealResponseOptions> {
+    let deal = world
+        .deals
+        .values()
+        .filter(|d| d.debtor == *npc && d.state == DealState::PerformanceDue)
+        .min_by_key(|d| d.id.raw())?
+        .clone();
+    let near_creditor =
+        talk_radius.is_none_or(
+            |radius| match (world.actor(&deal.creditor), world.actor(npc)) {
+                (Some(c), Some(m)) => c.location == m.location && c.pos.distance(m.pos) <= radius,
+                _ => false,
+            },
+        );
+    let params = UtilityParams {
+        switch_penalty: 2.0,
+        tau: 0.2,
+        needs_alpha: 1.0,
+    };
+    let current = intention.map(|i| i.option.as_str());
+    let mut options: Vec<UtilityOption> = Vec::new();
+    let authorised_disclosure =
+        |fact: &FactId| -> bool {
+            let Some(f) = world.fact(fact) else {
+                return false;
+            };
+            let holder = f.eligible_holders.is_empty() || f.eligible_holders.contains(npc);
+            match f.sensitivity {
+                rpg_domain::world::Sensitivity::Public
+                | rpg_domain::world::Sensitivity::Restricted => true,
+                rpg_domain::world::Sensitivity::Private
+                | rpg_domain::world::Sensitivity::Secret => holder,
+                rpg_domain::world::Sensitivity::InnerCircle => {
+                    world.actor(npc).is_some_and(|a| a.has_flag("inner_circle")) && holder
+                }
+            }
+        };
+    // Honour the due disclosure (validated knowledge + authorisation).
+    if let QuestPredicate::HeardFact { fact, .. } = &deal.performance {
+        let feasible = rpg_behavior::knows_of(world, npc, fact)
+            && authorised_disclosure(fact)
+            && near_creditor;
+        options.push(UtilityOption {
+            id: "honour_disclosure".into(),
+            goal_delta: 3.0,
+            cost: 0.0,
+            feasibility: if feasible {
+                Feasibility::Possible
+            } else {
+                Feasibility::PhysicallyImpossible
+            },
+            // Keeping one's word preserves standing (status).
+            needs_gain: vec![(NeedKind::Status, 0.4)],
+        });
+    }
+    // Settle a material delivery (custody at settlement time, §4.2).
+    if let Some((_, item, qty)) = rpg_domain::deal::predicate_delivery(&deal.performance) {
+        let held = world
+            .actor(npc)
+            .map(|a| a.inventory.quantity(&item))
+            .unwrap_or(0);
+        options.push(UtilityOption {
+            id: "settle_delivery".into(),
+            goal_delta: 3.0,
+            cost: 0.0,
+            feasibility: if held >= qty && near_creditor {
+                Feasibility::Possible
+            } else {
+                Feasibility::PhysicallyImpossible
+            },
+            // Handing goods over costs wealth; discharging the obligation
+            // removes the sanction risk (safety).
+            needs_gain: vec![
+                (NeedKind::Wealth, -0.5f32.min(qty.max(1) as f32 * 0.25)),
+                (NeedKind::Safety, 0.3),
+            ],
+        });
+    }
+    // Keep the obligation due: waiting is allowed while the deadline holds.
+    options.push(UtilityOption {
+        id: "stall".into(),
+        goal_delta: 0.0,
+        cost: 0.0,
+        feasibility: Feasibility::Possible,
+        // An overdue obligation accumulates sanction/exposure risk.
+        needs_gain: vec![(NeedKind::Safety, -0.4)],
+    });
+    // Unilateral walk-away: possible for the *mechanic* (§4.4), never ranked
+    // as acceptable for the *policy* — a lexicographic hard constraint.
+    options.push(UtilityOption {
+        id: "renege".into(),
+        goal_delta: 0.0,
+        cost: 0.0,
+        feasibility: Feasibility::PersonallyUnacceptable,
+        needs_gain: Vec::new(),
+    });
+    let needs = world
+        .actor(npc)
+        .map(|a| a.needs.clone())
+        .unwrap_or_default();
+    Some(DealResponseOptions {
+        deal: deal.id,
+        ranking: rpg_behavior::rank_with_needs(&options, current, params, &needs, needs_config),
+    })
+}
+
+/// Map a ranked choice onto its typed action (the sim validates everything).
+pub fn deal_response_action(
+    world: &World,
+    options: &DealResponseOptions,
+    chosen: &str,
+) -> Option<Action> {
+    let deal = world.deals.get(&options.deal)?;
+    match chosen {
+        "honour_disclosure" => {
+            let QuestPredicate::HeardFact { fact, .. } = &deal.performance else {
+                return None;
+            };
+            Some(Action::ShareClaim {
+                target: deal.creditor.clone(),
+                fact: fact.clone(),
+                assertive: true,
+                deceptive: false,
+            })
+        }
+        "settle_delivery" => {
+            let (_, item, qty) = rpg_domain::deal::predicate_delivery(&deal.performance)?;
+            Some(Action::SettleDeal {
+                deal: deal.id,
+                deliver: vec![rpg_domain::world::ItemStack { item, qty }],
+                money: 0,
+            })
+        }
+        "stall" => Some(Action::Idle),
+        "renege" => Some(Action::CancelDeal { deal: deal.id }),
+        _ => None,
+    }
 }
 
 /// The believed fact whose id or statement best matches the utterance. Used as
@@ -1599,6 +1867,10 @@ mod tests {
             flags: BTreeSet::new(),
             secret_allegiance: None,
             in_private_conversation_with: None,
+            bargain: None,
+            needs: Default::default(),
+            emotions: Default::default(),
+            rel_memory: BTreeMap::new(),
         };
         grocer.beliefs.insert(
             FactId::new("f_grocer_ledger"),
@@ -1646,8 +1918,11 @@ mod tests {
             ledger: BTreeMap::new(),
             next_commitment_id: 1,
             next_offer_id: 1,
+            deals: BTreeMap::new(),
+            next_deal_id: 1,
             next_rumor_id: 1,
             next_goal_id: 1,
+            epistemics: Default::default(),
             lore: WorldLore::default(),
         };
         w.locations.insert(
@@ -1688,6 +1963,10 @@ mod tests {
                 flags: BTreeSet::new(),
                 secret_allegiance: None,
                 in_private_conversation_with: None,
+                bargain: None,
+                needs: Default::default(),
+                emotions: Default::default(),
+                rel_memory: BTreeMap::new(),
             },
         );
         w.facts.insert(
@@ -1941,6 +2220,10 @@ mod tests {
             flags: BTreeSet::new(),
             secret_allegiance: None,
             in_private_conversation_with: None,
+            bargain: None,
+            needs: Default::default(),
+            emotions: Default::default(),
+            rel_memory: BTreeMap::new(),
         }
     }
 

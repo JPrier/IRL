@@ -5318,10 +5318,21 @@ dependencies = [
 name = "rpg_agents"
 version = "0.1.0"
 dependencies = [
+ "rpg_behavior",
  "rpg_content",
  "rpg_domain",
  "rpg_narrative",
  "rpg_social",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "rpg_behavior"
+version = "0.1.0"
+dependencies = [
+ "rpg_domain",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -5353,6 +5364,7 @@ name = "rpg_eval"
 version = "0.1.0"
 dependencies = [
  "rpg_agents",
+ "rpg_behavior",
  "rpg_content",
  "rpg_domain",
  "rpg_narrative",
@@ -5421,6 +5433,7 @@ dependencies = [
  "rpg_content",
  "rpg_domain",
  "rpg_sim",
+ "rpg_social",
  "rusqlite",
  "serde",
  "serde_json",
@@ -5445,9 +5458,12 @@ dependencies = [
 name = "rpg_sim"
 version = "0.1.0"
 dependencies = [
+ "rpg_agents",
+ "rpg_behavior",
  "rpg_domain",
  "rpg_narrative",
  "rpg_perception",
+ "rpg_persistence",
  "rpg_social",
  "serde",
  "serde_json",
@@ -5458,6 +5474,7 @@ dependencies = [
 name = "rpg_social"
 version = "0.1.0"
 dependencies = [
+ "rpg_behavior",
  "rpg_domain",
  "serde",
  "serde_json",

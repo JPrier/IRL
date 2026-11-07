@@ -925,8 +925,11 @@ fn blackmail_has_consequences(seed: u64) -> ScenarioResult {
     check(
         &mut checks,
         "trust_fell",
-        after.trust < before.trust,
-        format!("{} -> {}", before.trust, after.trust),
+        after.trust_benevolence < before.trust_benevolence,
+        format!(
+            "benevolence {} -> {} (contextual dimension, design §3.2)",
+            before.trust_benevolence, after.trust_benevolence
+        ),
     );
     finish("blackmail_has_consequences", seed, &s, checks)
 }
@@ -1051,6 +1054,7 @@ fn knowledge_boundaries(seed: u64) -> ScenarioResult {
         target: ActorId::new("grocer"),
         fact: FactId::new("f_shipments_diverted"),
         assertive: true,
+        deceptive: false,
     });
     check(
         &mut checks,
@@ -1069,6 +1073,7 @@ fn knowledge_boundaries(seed: u64) -> ScenarioResult {
         target: ActorId::new(PLAYER),
         fact: FactId::new("f_leader_identity"),
         assertive: true,
+        deceptive: false,
     });
     check(
         &mut checks,
@@ -1190,6 +1195,7 @@ mod tests {
             target: ActorId::new(PLAYER),
             fact: FactId::new("f_grocer_ledger"),
             assertive: true,
+            deceptive: false,
         };
         let line = spoken_line_in(&session.sim.world, &claim).expect("statement");
         assert!(line.contains("ledger"), "unexpected line: {line}");

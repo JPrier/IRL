@@ -56,6 +56,10 @@ fn actor(id: &str, kind: ActorKind, location: &str, pos: Vec2) -> Actor {
         flags: BTreeSet::new(),
         secret_allegiance: None,
         in_private_conversation_with: None,
+        bargain: None,
+        needs: Default::default(),
+        emotions: Default::default(),
+        rel_memory: BTreeMap::new(),
     }
 }
 
@@ -90,8 +94,11 @@ pub fn test_world() -> World {
         ledger: BTreeMap::new(),
         next_commitment_id: 1,
         next_offer_id: 1,
+        deals: BTreeMap::new(),
+        next_deal_id: 1,
         next_rumor_id: 1,
         next_goal_id: 1,
+        epistemics: Default::default(),
         lore: WorldLore::default(),
     };
     w.locations.insert(
@@ -353,6 +360,7 @@ fn cannot_disclose_fact_you_do_not_believe() {
                 target: ActorId::new("grocer"),
                 fact: FactId::new("shipment"),
                 assertive: true,
+                deceptive: false,
             }
         )),
         ValidationOutcome::Rejected(RejectReason::LacksKnowledge(_))
@@ -717,6 +725,7 @@ fn outsider_cannot_disclose_secret_fact() {
             target: ActorId::new(PLAYER),
             fact: FactId::new("shipment"),
             assertive: true,
+            deceptive: false,
         },
     ));
     assert!(
@@ -740,6 +749,7 @@ fn canonical_holder_can_disclose_secret_fact() {
             target: ActorId::new(PLAYER),
             fact: FactId::new("shipment"),
             assertive: true,
+            deceptive: false,
         },
     ));
     assert_eq!(
@@ -778,6 +788,7 @@ fn inner_circle_fact_requires_flag_and_holder() {
             target: ActorId::new(PLAYER),
             fact: FactId::new("f_leader"),
             assertive: true,
+            deceptive: false,
         },
     ));
     assert!(
@@ -800,6 +811,7 @@ fn inner_circle_fact_requires_flag_and_holder() {
             target: ActorId::new(PLAYER),
             fact: FactId::new("f_leader"),
             assertive: true,
+            deceptive: false,
         },
     ));
     assert_eq!(allowed, ValidationOutcome::Accepted);

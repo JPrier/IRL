@@ -423,6 +423,10 @@ mod tests {
             flags: BTreeSet::new(),
             secret_allegiance: None,
             in_private_conversation_with: None,
+            bargain: None,
+            needs: Default::default(),
+            emotions: Default::default(),
+            rel_memory: BTreeMap::new(),
         }
     }
 
@@ -457,8 +461,11 @@ mod tests {
             ledger: BTreeMap::new(),
             next_commitment_id: 1,
             next_offer_id: 1,
+            deals: BTreeMap::new(),
+            next_deal_id: 1,
             next_rumor_id: 1,
             next_goal_id: 1,
+            epistemics: Default::default(),
             lore: WorldLore::default(),
         };
         w.locations.insert(
