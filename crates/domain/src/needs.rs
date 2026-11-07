@@ -174,6 +174,15 @@ impl Needs {
         gained_below + gained_above
     }
 
+    /// Truthful depletion (validated world causes: paying money, giving a
+    /// gift, being fined). Clamped at 0; the caller event-sources the change
+    /// as a typed `NeedChanged` event — this method never records anything.
+    pub fn deplete(&mut self, kind: NeedKind, amount: f32) {
+        let amount = amount.max(0.0);
+        let v = &mut self.values[kind.index()];
+        *v = (*v - amount).max(0.0);
+    }
+
     /// One tick of regular decay. Returns the threshold crossings detected
     /// this tick (hysteresis: a crossing fires exactly once per excursion).
     /// The decay itself is the classified non-evented mutation; the caller

@@ -13,6 +13,8 @@
 //!
 //! Agents never mutate world state; they only propose.
 
+pub mod planner_candidates;
+
 use rpg_behavior::{Feasibility, Intention, Params as UtilityParams, Ranking, UtilityOption};
 use rpg_domain::action::{Action, ActionProposal, ProposalSource, QuestPredicate};
 use rpg_domain::deal::DealState;

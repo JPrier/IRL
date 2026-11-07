@@ -473,6 +473,29 @@ pub struct CausalTrace {
     pub costs: Vec<String>,
     /// The primitive effects the action actually produced.
     pub effects: Vec<Effect>,
+    /// The recorded production decision (design §4.2: "include the RNG seed
+    /// and sample in the replay record"): which option the seeded utility
+    /// selection chose, from which scores, with which recorded sample. This
+    /// is how sampling is wired into the *recorded* decision stream rather
+    /// than remaining a kernel-only demo. `None` for non-sampled paths.
+    #[allow(dead_code)]
+    pub decision: Option<DecisionRecord>,
+}
+
+/// The recorded seeded-utility selection behind one decision (design §4.2):
+/// the candidate scores, the softmax temperature, and the actual sample
+/// drawn. Recorded per sampled decision; replay reproduces it from the same
+/// RNG stream.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DecisionRecord {
+    /// The chosen option id.
+    pub option: String,
+    /// The ranking the sample walked (option id → utility), best first.
+    pub utilities: Vec<(String, f32)>,
+    /// The uniform sample drawn (`None` = unsampled argmax).
+    pub sample: Option<f32>,
+    /// Softmax temperature τ_i used.
+    pub tau: f32,
 }
 
 impl CausalTrace {
@@ -678,6 +701,7 @@ mod tests {
                 asserted_polarity: true,
                 believed: Some(true),
             }],
+            decision: None,
         };
         let rendered = trace.render();
         assert!(rendered.contains("grocer did share_claim"));
@@ -702,6 +726,7 @@ mod tests {
                 because_observations: vec![],
                 costs: vec![],
                 effects: vec![],
+                decision: None,
             },
         );
         assert!(matches!(out.validation, ValidationOutcome::Rejected(_)));

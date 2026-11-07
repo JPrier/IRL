@@ -368,6 +368,20 @@ pub enum EventKind {
         kind: String,
         evidence: Vec<FactId>,
     },
+    /// A validated world action *really* moved one of an actor's needs
+    /// (design §3 `N`; plan I-6a): the signed delta and the truthful cause
+    /// (e.g. "received payment", "paid a fine", "was comforted"). Positive
+    /// deltas satisfy with diminishing returns above the satiation point;
+    /// negative ones deplete. Recorded per change, citing its origin event —
+    /// in-world need satisfaction happens through real validated actions,
+    /// never through silent direct writes.
+    NeedChanged {
+        actor: ActorId,
+        need: crate::needs::NeedKind,
+        delta: f32,
+        cause: String,
+        origin: Option<EventId>,
+    },
     /// A mind-local appraisal was recorded (design §3.2: ΔR_ij depends on
     /// the observer's values, beliefs, goals, prior relation and context —
     /// never a universal delta). Provenance for relationship deltas (T3.6)
@@ -590,6 +604,13 @@ impl EventKind {
                     need.name()
                 )
             }
+            EventKind::NeedChanged {
+                actor,
+                need,
+                delta,
+                cause,
+                ..
+            } => format!("{actor}'s {} need {delta:+.3} ({cause})", need.name()),
             EventKind::AppraisalRecorded {
                 subject,
                 regarding,

@@ -25,6 +25,7 @@ pub mod appraisal;
 pub mod epistemics;
 pub mod intentions;
 pub mod mechanics;
+pub mod planner;
 pub mod utility;
 
 pub use adapters::{draft_from_provenance, record_provenance_evidence};
@@ -42,6 +43,10 @@ pub use mechanics::{
     answer_query, assert_proposition, inspect, make_request, record_refusal,
     skeptic_seeks_evidence, QueryAnswer,
 };
+pub use planner::{
+    adopt_plan, ActivationReason, ActivationState, Plan, PlannerState, ReplanSignal, ReplanTrigger,
+};
+pub use rpg_domain::behavior_types::DecisionRecord;
 pub use utility::{
     needs_term, rank, rank_with_needs, sample, Feasibility, Params, Ranking, Sampled, UtilityOption,
 };

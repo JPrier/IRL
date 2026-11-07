@@ -33,7 +33,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::autonomy::GoalAutonomy;
 
-use rpg_behavior::{AppraisedEvent, DecayRates};
+use rpg_behavior::{AppraisedEvent, DecayRates, DecisionRecord, ReplanSignal, ReplanTrigger};
 use rpg_domain::emotions::{EmotionResponse, EmotionsConfig};
 use rpg_domain::needs::{NeedCrossing, NeedKind, NeedsConfig, ThresholdDirection};
 
@@ -88,6 +88,61 @@ pub struct SimConfig {
     pub relationship_decay: DecayRates,
     /// Salience lost per tick by an appraisal memory (0 keeps memories).
     pub rel_memory_salience_decay: f32,
+    /// Bounded event-driven planning/activation (design §4.3, §8; plan I-6
+    /// I6a): fair deterministic activation with explicit work caps.
+    pub activation: ActivationConfig,
+    /// Seeded softmax sampling of utility-ranked decisions (design §4.2,
+    /// T2.9b): wired into the recorded production decision stream. The sim's
+    /// persistent RNG stream makes choices replayable; save/load preserves
+    /// the stream.
+    pub utility_sampling: UtilitySamplingConfig,
+}
+
+/// Configuration for bounded event-driven planning/activation (plan I-6,
+/// I6a; design §8 budgeted processing, §9.2.4 budget boundedness).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ActivationConfig {
+    /// Master switch for the planner pass.
+    pub enabled: bool,
+    /// Maximum NPCs activated per step (the budget; hard cap, M6/T4.4).
+    pub max_activations_per_tick: usize,
+    /// Maximum planner candidates considered per activation (per-activation
+    /// work cap; hard cap).
+    pub max_candidates_per_activation: usize,
+    /// Maximum queued reconsideration signals per actor (bounded memory).
+    pub max_signals_per_actor: usize,
+    /// Ticks after an abandonment during which the same option is not
+    /// re-adopted (hysteresis against abandonment loops).
+    pub abandon_cooldown_ticks: u64,
+}
+
+impl Default for ActivationConfig {
+    fn default() -> Self {
+        ActivationConfig {
+            enabled: true,
+            max_activations_per_tick: 1,
+            max_candidates_per_activation: 8,
+            max_signals_per_actor: 8,
+            abandon_cooldown_ticks: 20,
+        }
+    }
+}
+
+/// Seeded softmax sampling configuration (design §4.2, T2.9b).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct UtilitySamplingConfig {
+    pub enabled: bool,
+    /// Softmax temperature τ_i for sampled choices.
+    pub tau: f32,
+}
+
+impl Default for UtilitySamplingConfig {
+    fn default() -> Self {
+        UtilitySamplingConfig {
+            enabled: true,
+            tau: 0.2,
+        }
+    }
 }
 
 impl Default for SimConfig {
@@ -107,6 +162,8 @@ impl Default for SimConfig {
             emotions: EmotionsConfig::default(),
             relationship_decay: DecayRates::default(),
             rel_memory_salience_decay: 0.002,
+            activation: ActivationConfig::default(),
+            utility_sampling: UtilitySamplingConfig::default(),
         }
     }
 }
@@ -126,6 +183,27 @@ pub struct StepReport {
     /// (design §11 Phase 3: flee/retaliate/comfort/reconcile are *gated*,
     /// not hardcoded; the I-6 planner consumes these).
     pub gated_responses: Vec<(ActorId, EmotionResponse)>,
+}
+
+/// One planner activation of the most recent pass (observability for the
+/// budget/work caps; rebuilt identically by replay, never persisted).
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlannerActivation {
+    pub actor: ActorId,
+    /// Pending signals consumed by this activation.
+    pub signals: usize,
+    /// Work spent: candidates generated and considered (≤ the configured
+    /// per-activation cap).
+    pub work: usize,
+    /// Whether this activation re-deliberated (vs. the cheap fast path).
+    pub replanned: bool,
+}
+
+/// One step's planner-pass record (the activation list, in activation
+/// order). Cleared at the start of each pass.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PlannerPassRecord {
+    pub activations: Vec<PlannerActivation>,
 }
 
 /// A pending private conversation: both actors are walking to `location`.
@@ -151,6 +229,11 @@ pub struct SimTransient {
     /// save/load like the rest of the step pipeline state).
     #[serde(default)]
     pub deal_intentions: BTreeMap<ActorId, rpg_behavior::Intention>,
+    /// Bounded event-driven planner state (design §4.3, §8; plan I-6 I6a):
+    /// persistent plans, bounded signals and the fair-activation rotation,
+    /// persisted for exact continuation (old saves load with the default).
+    #[serde(default)]
+    pub planner: rpg_behavior::PlannerState,
 }
 
 /// A recorded public entry point, used for input/proposal replay.
@@ -187,6 +270,10 @@ pub struct Simulation {
     pub autonomy: GoalAutonomy,
     /// Adopted deal-response intentions (design §3 `J`).
     pub deal_intentions: BTreeMap<ActorId, rpg_behavior::Intention>,
+    /// Bounded event-driven planner state (design §4.3, §8; plan I-6 I6a):
+    /// persistent plans, bounded reconsideration signals and the fair
+    /// activation rotation. Mind-local; persisted for exact continuation.
+    pub planner: rpg_behavior::PlannerState,
     /// When false, `apply`/`step` do not append to `ops` (used during replay).
     pub recording: bool,
     /// Typed `ActionOutcome` records for every validated proposal
@@ -198,6 +285,13 @@ pub struct Simulation {
     /// Scratch buffer for the primitive effects produced by the dispatch
     /// handler currently running. Drained into the `ActionOutcome`.
     effects_buf: Vec<Effect>,
+    /// Decision records awaiting their trace (set when a production decision
+    /// is sampled; popped by `build_trace` for that actor's proposal).
+    /// Rebuilt identically by replay, never persisted.
+    pending_decisions: BTreeMap<ActorId, DecisionRecord>,
+    /// The most recent planner pass (observability of the budget/work caps;
+    /// rebuilt identically by replay, never persisted).
+    last_planner_pass: PlannerPassRecord,
 }
 
 impl Simulation {
@@ -217,10 +311,13 @@ impl Simulation {
             pending_private: Vec::new(),
             autonomy: GoalAutonomy::default(),
             deal_intentions: BTreeMap::new(),
+            planner: rpg_behavior::PlannerState::default(),
             recording: true,
             outcomes: Vec::new(),
             causal_traces: Vec::new(),
             effects_buf: Vec::new(),
+            pending_decisions: BTreeMap::new(),
+            last_planner_pass: PlannerPassRecord::default(),
         }
     }
 
@@ -260,10 +357,13 @@ impl Simulation {
             pending_private: transient.pending_private,
             autonomy: transient.autonomy,
             deal_intentions: transient.deal_intentions,
+            planner: transient.planner,
             recording: true,
             outcomes: Vec::new(),
             causal_traces: Vec::new(),
             effects_buf: Vec::new(),
+            pending_decisions: BTreeMap::new(),
+            last_planner_pass: PlannerPassRecord::default(),
         }
     }
 
@@ -275,7 +375,14 @@ impl Simulation {
             last_incident_minute: self.last_incident_minute,
             autonomy: self.autonomy.clone(),
             deal_intentions: self.deal_intentions.clone(),
+            planner: self.planner.clone(),
         }
+    }
+
+    /// The most recent planner pass (budget/work observability; rebuilt
+    /// identically by replay, never persisted).
+    pub fn last_planner_pass(&self) -> &PlannerPassRecord {
+        &self.last_planner_pass
     }
 
     /// Re-run a recorded entry-point log from the initial world. This is an
@@ -882,7 +989,7 @@ impl Simulation {
     /// the actor. When there is no genuine cause to cite for a field, the
     /// field stays empty — empty is preferable to false causality.
     fn build_trace(
-        &self,
+        &mut self,
         proposal: &ActionProposal,
         effects: &[Effect],
         rejected: Option<&RejectReason>,
@@ -960,6 +1067,11 @@ impl Simulation {
             because_goals.clear();
         }
 
+        // The recorded production decision (seeded utility selection), when
+        // this proposal came from a sampled decision path. Popped by its
+        // actor so exactly one trace carries it.
+        let decision = self.pending_decisions.remove(&proposal.actor);
+
         CausalTrace {
             actor: proposal.actor.clone(),
             action_kind,
@@ -968,6 +1080,7 @@ impl Simulation {
             because_observations,
             costs,
             effects: effects.to_vec(),
+            decision,
         }
     }
 
@@ -1009,6 +1122,17 @@ impl Simulation {
             if attempted {
                 if let Some(intent) = self.deal_intentions.get_mut(&proposal.actor) {
                     intent.record_failure();
+                }
+            }
+        }
+        // Planner-plan abandonment accounting (same discipline): a rejected
+        // dispatch of the adopted plan's own step feeds its failure count
+        // exactly once; the configured threshold then abandons the plan and
+        // the cooldown suppresses immediate re-adoption (no loop).
+        if let Some(plan) = self.planner.plans.get(&proposal.actor).cloned() {
+            if plan.action == proposal.action {
+                if let Some(plan) = self.planner.plans.get_mut(&proposal.actor) {
+                    plan.intention.record_failure();
                 }
             }
         }
@@ -1468,7 +1592,7 @@ impl Simulation {
             EventKind::OfferCreated {
                 offer: id,
                 from: proposal.actor.clone(),
-                to: target,
+                to: target.clone(),
                 give,
                 want,
                 note,
@@ -1476,6 +1600,9 @@ impl Simulation {
             Vec::new(),
             Vec::new(),
         );
+        // A relevant event for the recipient's planner: a pending offer is
+        // a decision it owes (bounded signal, plan I-6 I6a item 1).
+        self.signal(&target, ReplanTrigger::OfferReceived, None);
         ValidationOutcome::Pending {
             offer: Some(id),
             commitment: None,
@@ -2299,6 +2426,25 @@ impl Simulation {
             }
             _ => {}
         }
+        // A relevant event for both parties' planners: their contract
+        // changed state (bounded signals, plan I-6 I6a item 1).
+        let parties: Option<(ActorId, ActorId, String)> = self.world.deals.get(&deal_id).map(|d| {
+            (
+                d.debtor.clone(),
+                d.creditor.clone(),
+                d.state.name().to_string(),
+            )
+        });
+        if let Some((debtor, creditor, state)) = parties {
+            self.signal(
+                &debtor,
+                ReplanTrigger::DealChanged {
+                    state: state.clone(),
+                },
+                None,
+            );
+            self.signal(&creditor, ReplanTrigger::DealChanged { state }, None);
+        }
         Some(next)
     }
 
@@ -2340,7 +2486,7 @@ impl Simulation {
             qty: amount.max(0) as u32,
         });
         let (tick, minute) = (self.world.tick, self.world.minute_of_day);
-        self.events.push(
+        let paid = self.events.push(
             tick,
             minute,
             Some(from.clone()),
@@ -2352,6 +2498,13 @@ impl Simulation {
             Vec::new(),
             Vec::new(),
         );
+        // Real wealth-need movement from a real validated transfer (plan I-6
+        // I6a item 3): the payer loses what it gave, the recipient gains what
+        // it received — truthful deltas scaled like the appraisal severities,
+        // event-sourced as typed `NeedChanged` events.
+        let norm = (amount as f32 / 100.0).clamp(0.05, 1.0);
+        self.apply_need_change(from, NeedKind::Wealth, -norm, "paid money", Some(paid));
+        self.apply_need_change(to, NeedKind::Wealth, norm, "received money", Some(paid));
     }
 
     /// Move up to `qty` of `item`; returns how many actually moved (the
@@ -2405,13 +2558,30 @@ impl Simulation {
             vec![to.clone()],
         );
         // The recipient's APPRAISE of the gift: gratitude or bribery, per
-        // its own values (design §3.2 separation; plan I-4).
+        // its own values (design §3.2 separation; plan I-4). Real wealth-need
+        // movement from the validated custody change (plan I-6 I6a item 3):
+        // the giver gave up value, the recipient gained it — truthful,
+        // event-sourced.
         if removed > 0 {
             self.effects_buf.push(Effect::Appraise {
                 subject: to.clone(),
                 regarding: from.clone(),
                 summary: "received a gift".into(),
             });
+            self.apply_need_change(
+                from,
+                NeedKind::Wealth,
+                -value_norm,
+                "gave goods",
+                Some(transfer_event),
+            );
+            self.apply_need_change(
+                to,
+                NeedKind::Wealth,
+                value_norm,
+                "received goods",
+                Some(transfer_event),
+            );
             self.record_appraisal(
                 to,
                 from,
@@ -2480,6 +2650,22 @@ impl Simulation {
             regarding: from.clone(),
             summary: "received a payment".into(),
         });
+        // Real wealth-need movement from the validated payment (plan I-6
+        // I6a item 3): truthful deltas, event-sourced.
+        self.apply_need_change(
+            &from,
+            NeedKind::Wealth,
+            -norm,
+            "paid money",
+            Some(payment_event),
+        );
+        self.apply_need_change(
+            &target,
+            NeedKind::Wealth,
+            norm,
+            "received money",
+            Some(payment_event),
+        );
         self.record_appraisal(
             &target,
             &from,
@@ -2541,6 +2727,11 @@ impl Simulation {
             to: proposal.actor.clone(),
             summary: "was told a claim (familiarity)".into(),
         });
+        // A relevant event for the recipient's planner: it just received new
+        // evidence that may change what it should do (bounded signal, plan
+        // I-6 I6a item 1). Receiving a claim is not believing it — the
+        // signal only schedules reconsideration.
+        self.signal(&target, ReplanTrigger::ClaimReceived { fact }, None);
         ValidationOutcome::Accepted
     }
 
@@ -2681,6 +2872,13 @@ impl Simulation {
             },
             vec![question_event],
             vec![proposal.actor.clone()],
+        );
+        // A relevant event for the asker's planner: the answer (any of it —
+        // including "unknown" and a refusal) may change what it should do.
+        self.signal(
+            &proposal.actor,
+            ReplanTrigger::QueryAnswered,
+            Some(question_event),
         );
         ValidationOutcome::Accepted
     }
@@ -3381,6 +3579,16 @@ impl Simulation {
             AppraisedEvent::ComfortReceived { sincerity: 0.8 },
             comfort_event,
         );
+        // Real belonging-need movement from the validated comfort (plan I-6
+        // I6a item 3): the comforted actor is less deprived of company —
+        // truthful, event-sourced.
+        self.apply_need_change(
+            &target,
+            NeedKind::Belonging,
+            0.4 * 0.8,
+            "was comforted",
+            Some(comfort_event),
+        );
         self.effects_buf.push(Effect::ChangeTie {
             from: target.clone(),
             to: proposal.actor.clone(),
@@ -3395,6 +3603,66 @@ impl Simulation {
     /// deltas (no universal deltas); the same call writes the observer's
     /// emotion state (separate mind-local state, T3.12) and records the
     /// appraisal provenance. Event-sourced as typed `AppraisalRecorded`.
+    /// A validated world action *really* moved one of the actor's needs
+    /// (design §3 `N`; plan I-6 I6a item 3): in-world need satisfaction
+    /// happens through real validated actions with truthful typed effects —
+    /// this helper is the only site needs change outside classified regular
+    /// decay, it applies the diminishing-returns `satisfy` (gains) or the
+    /// clamped `deplete` (losses), and it event-sources the change as a typed
+    /// `NeedChanged` event citing its real origin. Replay reproduces it
+    /// exactly (deterministic call sites in the validated lowering paths).
+    fn apply_need_change(
+        &mut self,
+        actor: &ActorId,
+        need: NeedKind,
+        delta: f32,
+        cause: &str,
+        origin: Option<EventId>,
+    ) {
+        let (tick, minute) = (self.world.tick, self.world.minute_of_day);
+        if let Some(a) = self.world.actor_mut(actor) {
+            if delta >= 0.0 {
+                a.needs.satisfy(need, delta, &self.config.needs);
+            } else {
+                a.needs.deplete(need, -delta);
+            }
+        }
+        self.events.push(
+            tick,
+            minute,
+            Some(actor.clone()),
+            EventKind::NeedChanged {
+                actor: actor.clone(),
+                need,
+                delta,
+                cause: cause.to_string(),
+                origin,
+            },
+            Vec::new(),
+            Vec::new(),
+        );
+    }
+
+    /// Schedule a bounded reconsideration signal for an actor (design §8:
+    /// `schedule_reconsideration(npc, priority_for(observed_events))`; plan
+    /// I-6 I6a item 1). Only genuinely relevant events produce signals —
+    /// every call site here is an event *about* the actor (its appraisal,
+    /// its question, its contracts, its needs or its emotion gates); an
+    /// unrelated event elsewhere never reaches this helper, so unrelated
+    /// events cannot trigger unbounded replanning.
+    fn signal(&mut self, actor: &ActorId, trigger: ReplanTrigger, event: Option<EventId>) {
+        let max = self.config.activation.max_signals_per_actor;
+        self.planner.record_signal(
+            actor,
+            ReplanSignal {
+                tick: self.world.tick,
+                trigger,
+                event,
+            },
+            max,
+        );
+    }
+
     fn record_appraisal(
         &mut self,
         subject: &ActorId,
@@ -3429,6 +3697,15 @@ impl Simulation {
                 "appraise: {} {} {}",
                 subject, outcome.interpretation, regarding
             ));
+            // A relevant event for the subject's planner: its own appraisal
+            // may change what it should do (bounded signal, plan I-6 I6a).
+            self.signal(
+                subject,
+                ReplanTrigger::Appraisal {
+                    interpretation: outcome.interpretation.clone(),
+                },
+                Some(origin),
+            );
         }
     }
 
@@ -3505,6 +3782,7 @@ impl Simulation {
         }
 
         let mut routine = self.routine_proposals(&acted);
+        let mut claimed: BTreeSet<ActorId> = BTreeSet::new();
         // At-post gate: autonomy may replace a routine proposal only when the
         // actor is at its scheduled post (routine idles) or has no schedule
         // entry; it never hijacks schedule-driven moves. Pursuing actors are
@@ -3520,6 +3798,7 @@ impl Simulation {
             if !at_post {
                 continue;
             }
+            claimed.insert(p.proposal.actor.clone());
             if let Some(pursuit) = p.pursuit {
                 self.commit_pursuit(p.proposal.actor.clone(), pursuit);
             }
@@ -3533,6 +3812,26 @@ impl Simulation {
         // obligation answers it through the ranked options. The same at-post
         // gate applies: a due deal never hijacks a schedule move.
         for p in self.deal_response_proposals(&acted) {
+            let at_post = match routine.iter().find(|r| r.actor == p.actor) {
+                Some(r) => matches!(r.action, Action::Idle),
+                None => true,
+            };
+            if !at_post {
+                continue;
+            }
+            claimed.insert(p.actor.clone());
+            if let Some(pos) = routine.iter().position(|r| r.actor == p.actor) {
+                routine[pos] = p;
+            } else {
+                routine.push(p);
+            }
+        }
+        // Bounded event-driven planning (design §4.3, §8; plan I-6 I6a):
+        // the fair activation pass consumes reconsideration signals, urgent
+        // needs, gated emotion responses and existing plans — continuing
+        // plans on the fast path and replanning under explicit per-activation
+        // work caps. Same at-post gate: a plan never hijacks a schedule move.
+        for p in self.planner_proposals(&acted, &claimed) {
             let at_post = match routine.iter().find(|r| r.actor == p.actor) {
                 Some(r) => matches!(r.action, Action::Idle),
                 None => true,
@@ -3580,6 +3879,7 @@ impl Simulation {
         // Pass 1 — decay (classified non-evented) + crossing detection, in
         // deterministic actor-id order.
         let mut crossings: Vec<(ActorId, Vec<NeedCrossing>)> = Vec::new();
+        let mut gates: Vec<(ActorId, EmotionResponse)> = Vec::new();
         for (id, actor) in self.world.actors.iter_mut() {
             if !actor.is_alive() {
                 continue;
@@ -3590,11 +3890,17 @@ impl Simulation {
             }
             actor.emotions.decay(&self.config.emotions);
             // Threshold-gated response classes (design §11 Phase 3): the
-            // gated classes are reported, not hardcoded reactions — the
-            // I-6 planner (Phase 4) consumes them.
+            // gated classes are *consumed in production action selection*
+            // (plan I-6 I6a item 3): the planner pass generates grounded,
+            // validated response candidates from them (flee/retaliate/
+            // comfort/reconcile). They are still reported.
             for r in actor.emotions.responses(&self.config.emotions) {
                 report.gated_responses.push((id.clone(), r));
+                gates.push((id.clone(), r));
             }
+        }
+        for (id, r) in gates {
+            self.signal(&id, ReplanTrigger::EmotionGate { response: r }, None);
         }
         social::decay_relationships(
             &mut self.world,
@@ -3620,6 +3926,10 @@ impl Simulation {
                 );
                 match c.direction {
                     ThresholdDirection::FellBelow => {
+                        // A relevant event for the actor's planner: the
+                        // latched need gives it a claim on an activation
+                        // (bounded signal, plan I-6 I6a item 1).
+                        self.signal(&actor_id, ReplanTrigger::NeedUrgent { need: c.kind }, None);
                         // Raise the mapped active goals' urgency by the
                         // bounded mapped amount (T3.8); recorded so the
                         // release can subtract exactly what was added.
@@ -3818,7 +4128,12 @@ impl Simulation {
                     }
                 }
             }
-            // Re-plan: rank and adopt the best acceptable option.
+            // Re-plan: rank and adopt through seeded, recorded utility
+            // selection (design §4.2, T2.9b): the ranking is a pure function
+            // of the actor's needs and the option expectations; the sample is
+            // drawn from the sim's persistent RNG stream and recorded into
+            // the decision stream (rationale + causal trace). Replay
+            // reproduces the choice; save/load preserves the stream.
             let previous = self.deal_intentions.get(&npc).cloned();
             let Some(options) = rpg_agents::deal_response_options(
                 &self.world,
@@ -3829,9 +4144,49 @@ impl Simulation {
             ) else {
                 continue;
             };
-            let Some(best) = options.ranking.ranked.first() else {
+            let sample_params = rpg_behavior::Params {
+                switch_penalty: 2.0,
+                tau: self.config.utility_sampling.tau,
+                needs_alpha: 1.0,
+            };
+            let sampled = if self.config.utility_sampling.enabled {
+                rpg_behavior::sample(&options.ranking, sample_params, &mut self.rng)
+            } else {
+                options
+                    .ranking
+                    .ranked
+                    .first()
+                    .map(|s| rpg_behavior::Sampled {
+                        id: s.id.clone(),
+                        index: 0,
+                        sample: 0.0,
+                    })
+            };
+            let Some(sampled) = sampled else {
                 continue;
             };
+            let best = match options.ranking.ranked.iter().find(|s| s.id == sampled.id) {
+                Some(s) => s.clone(),
+                None => continue,
+            };
+            self.pending_decisions.insert(
+                npc.clone(),
+                DecisionRecord {
+                    option: best.id.clone(),
+                    utilities: options
+                        .ranking
+                        .ranked
+                        .iter()
+                        .map(|s| (s.id.clone(), s.utility))
+                        .collect(),
+                    sample: if self.config.utility_sampling.enabled {
+                        Some(sampled.sample)
+                    } else {
+                        None
+                    },
+                    tau: sample_params.tau,
+                },
+            );
             let Some(action) = rpg_agents::deal_response_action(&self.world, &options, &best.id)
             else {
                 continue;
@@ -3857,7 +4212,17 @@ impl Simulation {
                 actor: npc,
                 action,
                 source: ProposalSource::NpcPolicy,
-                rationale: format!("deal #{}: {}", options.deal.raw(), best.id),
+                rationale: if self.config.utility_sampling.enabled {
+                    format!(
+                        "deal #{}: {} (sample={:.4}, tau={:.2})",
+                        options.deal.raw(),
+                        best.id,
+                        sampled.sample,
+                        sample_params.tau
+                    )
+                } else {
+                    format!("deal #{}: {}", options.deal.raw(), best.id)
+                },
             });
         }
         out
@@ -3869,6 +4234,314 @@ impl Simulation {
         if let Some(intent) = self.deal_intentions.get_mut(actor) {
             intent.record_failure();
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Bounded event-driven planning (design §4.3, §8; plan I-6 I6a item 1)
+    // -----------------------------------------------------------------
+
+    /// The fair, bounded, event-driven activation pass.
+    ///
+    /// * **Event-driven**: only actors with a *relevant* pending trigger are
+    ///   considered — bounded reconsideration signals (their own appraisal,
+    ///   their own question, their own contracts, their latched needs, their
+    ///   gated emotion responses, an offer made to them), a persistent plan
+    ///   to continue, a latched-urgent need, or a gated emotion class. An
+    ///   unrelated event elsewhere never produces a trigger, so it can never
+    ///   cause an activation or a replan (adversarial regression).
+    /// * **Deterministically fair**: round-robin rotation over the eligible
+    ///   set with a stable order — over a window of ticks every eligible NPC
+    ///   is activated (design §8 `pick_active_agents_with_budget`); actors
+    ///   with pending relevant signals go first within the same budget.
+    /// * **Bounded**: at most `max_activations_per_tick` activations per
+    ///   step and at most `max_candidates_per_activation` candidate options
+    ///   considered per activation (hard caps; design §9.2.4, M6). The fast
+    ///   path continues an adopted plan without re-deliberation (§4.3) and
+    ///   consumes no randomness; only a fresh adoption draws a recorded
+    ///   softmax sample from the sim's persistent RNG stream.
+    /// * **Persistent**: adopted plans (design §3 `J`) survive ticks and
+    ///   save/load in the transient state; abandonment suppresses the same
+    ///   option for a cooldown window instead of looping.
+    ///
+    /// Determinism: eligibility collection and activation run in actor-id
+    /// order; the activation budget, candidate cap and RNG draws are all
+    /// pure functions of canonical state plus the seeded RNG stream.
+    pub fn planner_proposals(
+        &mut self,
+        already_acted: &BTreeSet<ActorId>,
+        claimed: &BTreeSet<ActorId>,
+    ) -> Vec<ActionProposal> {
+        let mut out = Vec::new();
+        self.last_planner_pass = PlannerPassRecord::default();
+        if !self.config.activation.enabled {
+            return out;
+        }
+        let tick = self.world.tick;
+        let budget = self.config.activation.max_activations_per_tick;
+        let candidate_cap = self.config.activation.max_candidates_per_activation.max(1);
+
+        // 1. Eligibility + triggers, deterministic actor-id order.
+        let mut eligible: BTreeSet<ActorId> = BTreeSet::new();
+        for actor in self.world.actors.values() {
+            let id = &actor.id;
+            if !actor.is_alive()
+                || actor.kind == ActorKind::Player
+                || already_acted.contains(id)
+                || claimed.contains(id)
+                || self.paths.contains_key(id)
+                || actor.in_private_conversation_with.is_some()
+                || self
+                    .pending_private
+                    .iter()
+                    .any(|p| p.a == *id || p.b == *id)
+            {
+                continue;
+            }
+            // Conversation preservation (same rule the autonomy layer
+            // applies): never redirect an actor standing next to the player.
+            if self
+                .world
+                .actor(&ActorId::new(PLAYER))
+                .is_some_and(|p| p.pos.distance(actor.pos) <= self.config.talk_radius)
+            {
+                continue;
+            }
+            let triggered = !self.planner.signals.get(id).is_none_or(|s| s.is_empty())
+                || self.planner.plans.contains_key(id)
+                || rpg_domain::needs::NEED_KINDS
+                    .iter()
+                    .any(|k| actor.needs.is_urgent(*k))
+                || !actor.emotions.responses(&self.config.emotions).is_empty();
+            if triggered {
+                eligible.insert(id.clone());
+            }
+        }
+        if eligible.is_empty() {
+            return out;
+        }
+
+        // 2. Fair deterministic activation (signals first, round-robin fill).
+        let priority: Vec<ActorId> = eligible
+            .iter()
+            .filter(|id| self.planner.signals.get(*id).is_some_and(|s| !s.is_empty()))
+            .cloned()
+            .collect();
+        self.planner
+            .activation
+            .ensure_order(&eligible.iter().cloned().collect::<Vec<_>>());
+        self.planner.prune_abandoned(tick);
+        let activated = self.planner.activation.pick(&eligible, &priority, budget);
+
+        // 3. Per-activation work, under explicit caps.
+        for actor in activated {
+            // Consume this actor's pending signals exactly once (bounded).
+            let signal_count = self.planner.take_signals(&actor).len();
+            let mut work = 0usize;
+            let mut replanned = false;
+
+            // Fast path: the persistent plan continues without
+            // re-deliberation while it stays valid (design §4.3, T2.1).
+            if let Some(plan) = self.planner.plans.get(&actor).cloned() {
+                match rpg_behavior::consider_replan(&plan.intention, &self.world) {
+                    rpg_behavior::Replan::Continue => {
+                        // One-shot plans retire once their validated outcome
+                        // event exists (a question asked, a sanction issued,
+                        // an excuse granted, an apology given).
+                        let done = rpg_agents::planner_candidates::is_one_shot_option(
+                            &plan.intention.option,
+                        ) && rpg_agents::planner_candidates::one_shot_completed(
+                            &plan.action,
+                            &actor,
+                            &self.events,
+                            plan.adopted_tick,
+                        );
+                        if done {
+                            self.planner.plans.remove(&actor);
+                            self.last_planner_pass.activations.push(PlannerActivation {
+                                actor,
+                                signals: signal_count,
+                                work,
+                                replanned,
+                            });
+                            continue;
+                        }
+                        out.push(ActionProposal {
+                            actor: actor.clone(),
+                            action: plan.action.clone(),
+                            source: ProposalSource::NpcPolicy,
+                            rationale: format!("plan: {} (fast path)", plan.intention.option),
+                        });
+                        self.last_planner_pass.activations.push(PlannerActivation {
+                            actor,
+                            signals: signal_count,
+                            work,
+                            replanned,
+                        });
+                        continue;
+                    }
+                    rpg_behavior::Replan::Replan(rpg_behavior::ReplanReason::GoalSatisfied) => {
+                        // The plan reached its predicate: retire it and
+                        // re-deliberate below (the same activation may adopt
+                        // the next grounded plan).
+                        self.planner.plans.remove(&actor);
+                    }
+                    rpg_behavior::Replan::Replan(rpg_behavior::ReplanReason::Abandoned) => {
+                        // Explicitly given up; suppress re-adoption of the
+                        // same option for the cooldown window (no loop).
+                        let option = plan.intention.option.clone();
+                        self.planner.record_abandoned(
+                            &actor,
+                            &option,
+                            tick + self.config.activation.abandon_cooldown_ticks,
+                        );
+                        self.planner.plans.remove(&actor);
+                        self.last_planner_pass.activations.push(PlannerActivation {
+                            actor,
+                            signals: signal_count,
+                            work,
+                            replanned,
+                        });
+                        continue;
+                    }
+                }
+            }
+
+            // Re-plan/deliberate: generate the actor's local candidates,
+            // bounded by the per-activation work cap (enforced inside
+            // generation).
+            replanned = true;
+            let generated = rpg_agents::planner_candidates::planner_candidates(
+                &self.world,
+                &actor,
+                &self.events,
+                &self.config.needs,
+                &self.config.emotions,
+                self.config.talk_radius,
+                candidate_cap,
+            );
+            work += generated.len();
+            let candidates: Vec<&rpg_agents::planner_candidates::PlannerCandidate> = generated
+                .iter()
+                .filter(|c| !self.planner.recently_abandoned(&actor, &c.option.id, tick))
+                .take(candidate_cap)
+                .collect();
+            if candidates.is_empty() {
+                // Nothing grounded to do — an activation with no work spent
+                // is honest no-op (bounded deliberation, §4.3).
+                self.last_planner_pass.activations.push(PlannerActivation {
+                    actor,
+                    signals: signal_count,
+                    work,
+                    replanned,
+                });
+                continue;
+            }
+            let params = rpg_behavior::Params {
+                switch_penalty: 2.0,
+                tau: self.config.utility_sampling.tau,
+                needs_alpha: 1.0,
+            };
+            let needs = self
+                .world
+                .actor(&actor)
+                .map(|a| a.needs.clone())
+                .unwrap_or_default();
+            let ranking = rpg_behavior::rank_with_needs(
+                &candidates
+                    .iter()
+                    .map(|c| c.option.clone())
+                    .collect::<Vec<_>>(),
+                None,
+                params,
+                &needs,
+                &self.config.needs,
+            );
+            // Seeded, recorded utility selection (design §4.2, T2.9b): the
+            // sample is drawn from the sim's persistent RNG stream (replay
+            // reproduces it; save/load preserves it) and recorded into the
+            // decision stream (rationale + causal trace).
+            let chosen = if self.config.utility_sampling.enabled {
+                rpg_behavior::sample(&ranking, params, &mut self.rng)
+            } else {
+                ranking.ranked.first().map(|s| rpg_behavior::Sampled {
+                    id: s.id.clone(),
+                    index: 0,
+                    sample: 0.0,
+                })
+            };
+            let Some(sampled) = chosen else {
+                self.last_planner_pass.activations.push(PlannerActivation {
+                    actor,
+                    signals: signal_count,
+                    work,
+                    replanned,
+                });
+                continue;
+            };
+            let Some(candidate) = candidates
+                .iter()
+                .find(|c| c.option.id == sampled.id)
+                .cloned()
+                .cloned()
+            else {
+                self.last_planner_pass.activations.push(PlannerActivation {
+                    actor,
+                    signals: signal_count,
+                    work,
+                    replanned,
+                });
+                continue;
+            };
+            self.pending_decisions.insert(
+                actor.clone(),
+                DecisionRecord {
+                    option: sampled.id.clone(),
+                    utilities: ranking
+                        .ranked
+                        .iter()
+                        .map(|s| (s.id.clone(), s.utility))
+                        .collect(),
+                    sample: if self.config.utility_sampling.enabled {
+                        Some(sampled.sample)
+                    } else {
+                        None
+                    },
+                    tau: params.tau,
+                },
+            );
+            let plan = rpg_behavior::planner::adopt_plan(
+                &candidate.summary,
+                candidate.option.id.clone(),
+                candidate.action.clone(),
+                candidate.satisfaction.clone(),
+                rpg_domain::behavior_types::AbandonmentCriteria {
+                    after_failed_attempts: Some(3),
+                    predicate: None,
+                },
+                tick,
+            );
+            self.planner.plans.insert(actor.clone(), plan);
+            out.push(ActionProposal {
+                actor: actor.clone(),
+                action: candidate.action,
+                source: ProposalSource::NpcPolicy,
+                rationale: if self.config.utility_sampling.enabled {
+                    format!(
+                        "plan: {} (sample={:.4}, tau={:.2})",
+                        sampled.id, sampled.sample, params.tau
+                    )
+                } else {
+                    format!("plan: {0}", sampled.id)
+                },
+            });
+            self.last_planner_pass.activations.push(PlannerActivation {
+                actor,
+                signals: signal_count,
+                work,
+                replanned,
+            });
+        }
+        out
     }
 
     fn advance_clock(&mut self) {
