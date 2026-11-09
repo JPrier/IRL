@@ -40,7 +40,6 @@ jobs:
           - i8_t68_corroboration_p3_p4
           - i8_t68_acceptance_numeric_p1_p2_p5
           - i8_t68_acceptance_p1_nonempty_ledger
-    name: proof-${{ matrix.harness }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
