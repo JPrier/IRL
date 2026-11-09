@@ -116,7 +116,11 @@ jobs:
   # smoke suite against the built static site (OpenRouter mocked; no paid
   # calls, no secrets).
   web:
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest moved to 26.04, which Playwright 1.56 has no
+    # chromium build for ("does not support chromium on ubuntu26.04-x64").
+    # 24.04 is the image the suite verifiably runs on; unpin when Playwright
+    # ships 26.04 support.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
