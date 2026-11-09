@@ -6,8 +6,11 @@
 //! keeps scenarios reproducible and lets the evaluation harness spin up the
 //! same town with different seeds.
 
+use rpg_domain::action::QuestPredicate;
+use rpg_domain::emotions::Emotions;
 use rpg_domain::geom::{GridPos, Rect, Vec2};
 use rpg_domain::ids::*;
+use rpg_domain::needs::Needs;
 use rpg_domain::world::{
     Actor, ActorKind, ActorStatus, Belief, Capabilities, Checkpoint, CheckpointState,
     ContainerKind, Fact, FactCategory, Faction, FactionKind, FactionPriority, Goal, GoalKind,
@@ -69,6 +72,10 @@ fn npc(
         flags: flags.iter().map(|f| f.to_string()).collect(),
         secret_allegiance: secret.map(FactionId::new),
         in_private_conversation_with: None,
+        bargain: None,
+        needs: Needs::default(),
+        emotions: Emotions::default(),
+        rel_memory: BTreeMap::new(),
     }
 }
 
@@ -82,6 +89,7 @@ fn populate_npc_lore(actors: &mut BTreeMap<ActorId, Actor>) {
         description: description.into(),
         kind,
         priority,
+        need_boost: 0.0,
         status: GoalStatus::Active,
         predicate: None,
         target_location: None,
@@ -100,6 +108,7 @@ fn populate_npc_lore(actors: &mut BTreeMap<ActorId, Actor>) {
         description: description.into(),
         kind,
         priority,
+        need_boost: 0.0,
         status: GoalStatus::Active,
         predicate: None,
         target_location: target_location.map(LocationId::new),
@@ -110,6 +119,19 @@ fn populate_npc_lore(actors: &mut BTreeMap<ActorId, Actor>) {
         a.biography = "Marta Voss runs Voss & Daughter's, a modest grocer in the Market Plaza. A widow, she is fiercely protective of her sick daughter, Lena.".into();
         a.private_biography =
             "People with influence have been pressuring you lately. Keep that to yourself: deflect questions about it rather than complain openly.".into();
+        // The designed conditional bargain, declared here as *content*: the
+        // typed world condition Marta needs satisfied (fever medicine for
+        // Lena) and the fact she promises to disclose once it is. The
+        // generic bargaining pathway reads this structure; no engine module
+        // hardcodes the grocer or the ledger fact.
+        a.bargain = Some(rpg_domain::world::Bargain {
+            condition: QuestPredicate::HasItem {
+                actor: ActorId::new("grocer"),
+                item: ItemId::new("medicine"),
+                qty: 1,
+            },
+            disclose: FactId::new("f_grocer_ledger"),
+        });
         a.goals = vec![
             goal_t(
                 1,
@@ -1263,13 +1285,17 @@ pub fn build_town() -> World {
         offers: BTreeMap::new(),
         rumors: Vec::new(),
         damage: BTreeMap::new(),
+            damage_facts: BTreeMap::new(),
         location_items,
         flags: BTreeSet::new(),
         ledger: BTreeMap::new(),
         next_commitment_id: 1,
         next_offer_id: 1,
+        deals: BTreeMap::new(),
+        next_deal_id: 1,
         next_rumor_id: 1,
         next_goal_id: 1,
+        epistemics: Default::default(),
         lore: WorldLore {
             settlement_name: "Ashwick".into(),
             geography: "A modest river town at the edge of the Northern Marches. The river bends around a rocky promontory, providing a natural harbor for small boats.".into(),

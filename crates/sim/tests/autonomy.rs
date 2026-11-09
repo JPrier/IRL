@@ -59,6 +59,10 @@ fn npc(
         flags: BTreeSet::new(),
         secret_allegiance: None,
         in_private_conversation_with: None,
+        bargain: None,
+        needs: Default::default(),
+        emotions: Default::default(),
+        rel_memory: BTreeMap::new(),
     }
 }
 
@@ -85,6 +89,8 @@ fn goal_t(
         description: description.into(),
         kind,
         priority,
+        need_boost: 0.0,
+
         status: GoalStatus::Active,
         predicate: None,
         target_location: target_location.map(LocationId::new),
@@ -121,13 +127,17 @@ fn autonomy_world() -> World {
         offers: BTreeMap::new(),
         rumors: Vec::new(),
         damage: BTreeMap::new(),
+        damage_facts: BTreeMap::new(),
         location_items: BTreeMap::new(),
         flags: BTreeSet::new(),
         ledger: BTreeMap::new(),
         next_commitment_id: 1,
         next_offer_id: 1,
+        deals: BTreeMap::new(),
+        next_deal_id: 1,
         next_rumor_id: 1,
         next_goal_id: 1,
+        epistemics: Default::default(),
         lore: Default::default(),
     };
     w.locations.insert(

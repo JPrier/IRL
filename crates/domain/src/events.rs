@@ -5,6 +5,7 @@
 //! reproduce the exact same canonical state without re-running inference.
 
 use crate::action::{Loudness, RejectReason};
+use crate::behavior_types::{AcquisitionChannel, SourceChainId};
 use crate::geom::Vec2;
 use crate::ids::*;
 use crate::world::{Belief, ContainerKind, ItemStack, Provenance};
@@ -58,6 +59,13 @@ pub enum EventKind {
         item: ItemId,
         qty: u32,
     },
+    /// Evidence left an actor's custody into concealment (behavior-engine
+    /// Phase 0: the previously event-less hide path is now typed and logged).
+    EvidenceHidden {
+        actor: ActorId,
+        item: ItemId,
+        location: LocationId,
+    },
     /// An actor recovered an item from a searched location.
     ItemFound {
         actor: ActorId,
@@ -68,6 +76,33 @@ pub enum EventKind {
     MoneyPaid {
         from: ActorId,
         to: ActorId,
+        amount: i64,
+    },
+    /// An institutional wage disbursement (plan I-6 I6b, §5.4): a faction
+    /// paid a worker from its budget for real performed labor. This is the
+    /// recorded institutional source of actor money — conservation modulo
+    /// sources/sinks (design §9.1.1) is checked against exactly this event.
+    WagePaid {
+        faction: FactionId,
+        worker: ActorId,
+        amount: i64,
+    },
+    /// Damage at a location worsened while unattended (the environmental
+    /// wear tick). Event-sourced so the otherwise-silent background damage
+    /// accumulation is a causal record (M1); emitted for each 0.01 wear
+    /// increment, carrying the 0.1-granular damage level reached.
+    WearProgressed {
+        location: LocationId,
+        level: u8,
+    },
+    /// A faction funded a repair initiative from *member reports* (design
+    /// §5.5: group decisions derive from communicated member reports, never
+    /// the world's truth). `believed_damage` is the member-report aggregate
+    /// the decision was based on; the world's true damage may differ.
+    FactionRepairInitiated {
+        faction: FactionId,
+        location: LocationId,
+        believed_damage: f32,
         amount: i64,
     },
     OfferCreated {
@@ -98,19 +133,112 @@ pub enum EventKind {
         commitment: CommitmentId,
         by: ActorId,
     },
+    // --- Deal FSM lifecycle (behavior-engine Phase 2, plan §4) -----------
+    /// A typed conditional contract was proposed (DealState::Proposed).
+    DealProposed {
+        deal: DealId,
+        debtor: ActorId,
+        creditor: ActorId,
+        terms: String,
+    },
+    /// The creditor accepted; give-on-acceptance consideration moved
+    /// atomically and the deal is awaiting activation.
+    DealAccepted {
+        deal: DealId,
+        by: ActorId,
+    },
+    /// The creditor declined the proposal (terminal).
+    DealRejected {
+        deal: DealId,
+        by: ActorId,
+    },
+    /// The accepted deal entered Active (the obligation is now binding).
+    DealActivated {
+        deal: DealId,
+    },
+    /// The trigger predicate holds. *Not* the benefit: ConditionMet ≠
+    /// benefit delivered (plan §4.1).
+    DealConditionMet {
+        deal: DealId,
+    },
+    /// The promised benefit is due (settlement happens from here).
+    DealPerformanceDue {
+        deal: DealId,
+    },
+    /// The contracted benefit was delivered and validated (terminal).
+    DealPerformed {
+        deal: DealId,
+        by: ActorId,
+    },
+    /// The deal failed: deadline lapsed or debtor reneged (terminal).
+    DealViolated {
+        deal: DealId,
+        reason: crate::deal::ViolationReason,
+    },
+    /// Released by authority/institution evidence (terminal).
+    DealExcused {
+        deal: DealId,
+        evidence: Vec<FactId>,
+    },
+    /// Cancelled per the §4.4 authorization matrix (terminal).
+    DealCanceled {
+        deal: DealId,
+        by: ActorId,
+    },
+    /// The creditor consented to the single renegotiation cycle.
+    DealRenegotiated {
+        deal: DealId,
+        by: ActorId,
+    },
+    /// A deadline was crossed: exactly one idempotent event, then the grace
+    /// policy runs (plan §4.5).
+    ObligationDue {
+        deal: DealId,
+    },
+    /// An un-split obligation was delivered short: the deal stays
+    /// `PerformanceDue`, nothing contractual mutates (plan §4.3).
+    DealPartialDelivery {
+        deal: DealId,
+        got: u32,
+        expected: u32,
+    },
+    /// One installment of a split obligation settled exactly-once.
+    DealInstallmentSettled {
+        deal: DealId,
+        index: usize,
+        performed: usize,
+        total: usize,
+    },
     /// A fact was told to an actor (may or may not be believed).
+    /// `deceptive` marks an intentional lie (design §3.1: the asserted
+    /// polarity is the speaker's choice and never a truth mutation); the M2
+    /// provenance audit reads it. `#[serde(default)]` keeps older saves
+    /// loading.
     ClaimShared {
         from: ActorId,
         to: ActorId,
         fact: FactId,
         assertive: bool,
         believed: bool,
+        #[serde(default)]
+        deceptive: bool,
     },
     /// An actor came to believe a fact they did not before.
     FactBelieved {
         actor: ActorId,
         fact: FactId,
         source: Provenance,
+    },
+    /// A provenance-bound evidence item was recorded in an actor's ledger
+    /// (behavior-engine Phase 1: every epistemic write is event-sourced).
+    EvidenceRecorded {
+        observer: ActorId,
+        fact: FactId,
+        asserted_polarity: bool,
+        channel: AcquisitionChannel,
+        source_actor: Option<ActorId>,
+        chain: SourceChainId,
+        origin_event: Option<EventId>,
     },
     /// A physical clue container was placed for a fact.
     CluePlaced {
@@ -136,6 +264,12 @@ pub enum EventKind {
         cost: i64,
     },
     ThreatMade {
+        from: ActorId,
+        to: ActorId,
+        demand: String,
+    },
+    /// A request for behaviour was made (request ≠ compliance).
+    RequestMade {
         from: ActorId,
         to: ActorId,
         demand: String,
@@ -197,6 +331,94 @@ pub enum EventKind {
         role: String,
         raw: String,
     },
+    // --- Needs / emotions maintenance (behavior-engine Phase 3, plan
+    // I-4a/I-4b) ---------------------------------------------------------
+    /// A need crossed an urgency threshold (event-sourced; the regular
+    /// decay itself is a classified non-evented background mutation).
+    NeedThresholdCrossed {
+        actor: ActorId,
+        need: crate::needs::NeedKind,
+        direction: crate::needs::ThresholdDirection,
+        value: f32,
+    },
+    /// The crossed need raised a mapped goal's urgency (bounded by the
+    /// tuning's urgency cap; cleared again by [`EventKind::GoalUrgencyReleased`]).
+    GoalUrgencyRaised {
+        actor: ActorId,
+        goal: u64,
+        need: crate::needs::NeedKind,
+        urgency: f32,
+    },
+    /// The need recovered above the release threshold (hysteresis); the
+    /// previously applied goal urgency boost is removed.
+    GoalUrgencyReleased {
+        actor: ActorId,
+        goal: u64,
+        need: crate::needs::NeedKind,
+    },
+    /// An authoritative question was asked (QUERY lowering, design §1.1:
+    /// no omniscient answer). The typed answer follows as
+    /// [`EventKind::QueryAnswered`] plus, when the answerer has evidence,
+    /// the delivery (`ClaimShared`/`EvidenceRecorded`) it causes.
+    QuestionAsked {
+        from: ActorId,
+        to: ActorId,
+        about: FactId,
+    },
+    /// The answer an actor gave to an authoritative question: exactly what
+    /// their own evidence ledger supports (polarities, confidence, whether
+    /// their reports conflict), `unknown` when they cannot answer — never
+    /// the world's truth — or `refused` when they decline to disclose
+    /// (design §3.1: knowledge is not permission). A refusal is a distinct,
+    /// truthful answer of its own: it carries no polarities, confidence or
+    /// evidence and is never conflated with ignorance.
+    /// `#[serde(default)]` keeps older saves loading.
+    QueryAnswered {
+        answerer: ActorId,
+        asker: ActorId,
+        about: FactId,
+        polarities: Vec<bool>,
+        confidence: f32,
+        contradicted: bool,
+        unknown: bool,
+        #[serde(default)]
+        refused: bool,
+        origin: EventId,
+    },
+    /// An institutional/social consequence was imposed (SANCTION lowering,
+    /// design §1.1: authority, process, cost and evidence). The typed record
+    /// of the process step; the consequences (payment, custody, appraisal)
+    /// are the sanction's own effects.
+    SanctionIssued {
+        authority: ActorId,
+        subject: ActorId,
+        kind: String,
+        evidence: Vec<FactId>,
+    },
+    /// A validated world action *really* moved one of an actor's needs
+    /// (design §3 `N`; plan I-6a): the signed delta and the truthful cause
+    /// (e.g. "received payment", "paid a fine", "was comforted"). Positive
+    /// deltas satisfy with diminishing returns above the satiation point;
+    /// negative ones deplete. Recorded per change, citing its origin event —
+    /// in-world need satisfaction happens through real validated actions,
+    /// never through silent direct writes.
+    NeedChanged {
+        actor: ActorId,
+        need: crate::needs::NeedKind,
+        delta: f32,
+        cause: String,
+        origin: Option<EventId>,
+    },
+    /// A mind-local appraisal was recorded (design §3.2: ΔR_ij depends on
+    /// the observer's values, beliefs, goals, prior relation and context —
+    /// never a universal delta). Provenance for relationship deltas (T3.6)
+    /// and for emotion writes (T3.12).
+    AppraisalRecorded {
+        subject: ActorId,
+        regarding: ActorId,
+        event: Option<EventId>,
+        interpretation: String,
+    },
 }
 
 impl EventKind {
@@ -223,6 +445,11 @@ impl EventKind {
                 item,
                 qty,
             } => format!("{from} gave {qty}x{item} to {to}"),
+            EventKind::EvidenceHidden {
+                actor,
+                item,
+                location,
+            } => format!("{actor} hid {item} at {location}"),
             EventKind::ItemFound {
                 actor,
                 item,
@@ -231,6 +458,26 @@ impl EventKind {
             } => format!("{actor} found {qty}x{item} in {location}"),
             EventKind::MoneyPaid { from, to, amount } => {
                 format!("{from} paid {amount} to {to}")
+            }
+            EventKind::WagePaid {
+                faction,
+                worker,
+                amount,
+            } => {
+                format!("{faction} paid wage {amount} to {worker}")
+            }
+            EventKind::WearProgressed { location, level } => {
+                format!("wear at {location} reached level {level}")
+            }
+            EventKind::FactionRepairInitiated {
+                faction,
+                location,
+                believed_damage,
+                amount,
+            } => {
+                format!(
+                    "{faction} funded repair of {location} on member reports (believed {believed_damage:.2}, {amount})"
+                )
             }
             EventKind::OfferCreated {
                 offer, from, to, ..
@@ -250,14 +497,69 @@ impl EventKind {
             EventKind::CommitmentBroken { commitment, by } => {
                 format!("commitment #{commitment} broken by {by}")
             }
+            EventKind::DealProposed {
+                deal,
+                debtor,
+                creditor,
+                terms,
+            } => format!("deal #{deal} proposed: {debtor} -> {creditor} ({terms})"),
+            EventKind::DealAccepted { deal, by } => format!("deal #{deal} accepted by {by}"),
+            EventKind::DealRejected { deal, by } => format!("deal #{deal} rejected by {by}"),
+            EventKind::DealActivated { deal } => format!("deal #{deal} active"),
+            EventKind::DealConditionMet { deal } => {
+                format!("deal #{deal} condition met (benefit not yet delivered)")
+            }
+            EventKind::DealPerformanceDue { deal } => format!("deal #{deal} performance due"),
+            EventKind::DealPerformed { deal, by } => {
+                format!("deal #{deal} performed (settled by {by})")
+            }
+            EventKind::DealViolated { deal, reason } => {
+                format!("deal #{deal} violated ({})", reason.name())
+            }
+            EventKind::DealExcused { deal, .. } => format!("deal #{deal} excused"),
+            EventKind::DealCanceled { deal, by } => format!("deal #{deal} canceled by {by}"),
+            EventKind::DealRenegotiated { deal, by } => {
+                format!("deal #{deal} renegotiated by {by}")
+            }
+            EventKind::ObligationDue { deal } => format!("deal #{deal} obligation due"),
+            EventKind::DealPartialDelivery {
+                deal,
+                got,
+                expected,
+            } => format!("deal #{deal} partial delivery: {got}/{expected}"),
+            EventKind::DealInstallmentSettled {
+                deal,
+                index,
+                performed,
+                total,
+            } => format!("deal #{deal} installment {index} settled ({performed}/{total})"),
             EventKind::ClaimShared {
                 from,
                 to,
                 fact,
                 believed,
+                deceptive,
                 ..
-            } => format!("{from} told {to} about {fact} (believed={believed})"),
+            } => {
+                if *deceptive {
+                    format!("{from} told {to} about {fact} (believed={believed}, INTENTIONAL LIE)")
+                } else {
+                    format!("{from} told {to} about {fact} (believed={believed})")
+                }
+            }
             EventKind::FactBelieved { actor, fact, .. } => format!("{actor} believes {fact}"),
+            EventKind::EvidenceRecorded {
+                observer,
+                fact,
+                channel,
+                chain,
+                ..
+            } => {
+                format!(
+                    "{observer} recorded {channel:?} evidence for {fact} (chain #{})",
+                    chain.raw()
+                )
+            }
             EventKind::CluePlaced {
                 fact,
                 kind,
@@ -278,6 +580,9 @@ impl EventKind {
             }
             EventKind::ThreatMade { from, to, demand } => {
                 format!("{from} threatened {to}: {demand}")
+            }
+            EventKind::RequestMade { from, to, demand } => {
+                format!("{from} asked {to}: {demand}")
             }
             EventKind::Comforted { from, to } => format!("{from} comforted {to}"),
             EventKind::Recruited { recruiter, recruit } => {
@@ -312,6 +617,89 @@ impl EventKind {
             EventKind::ModelProposal { actor, role, .. } => {
                 format!("{actor} model proposal ({role})")
             }
+            EventKind::NeedThresholdCrossed {
+                actor,
+                need,
+                direction,
+                value,
+            } => match direction {
+                crate::needs::ThresholdDirection::FellBelow => {
+                    format!(
+                        "{actor}'s {} fell below the urgency threshold ({value:.2})",
+                        need.name()
+                    )
+                }
+                crate::needs::ThresholdDirection::Recovered => {
+                    format!(
+                        "{actor}'s {} recovered above the release threshold ({value:.2})",
+                        need.name()
+                    )
+                }
+            },
+            EventKind::GoalUrgencyRaised {
+                actor,
+                goal,
+                need,
+                urgency,
+            } => format!(
+                "{actor}'s goal #{goal} urgency raised to {urgency:.2} ({} need)",
+                need.name()
+            ),
+            EventKind::GoalUrgencyReleased { actor, goal, need } => {
+                format!(
+                    "{actor}'s goal #{goal} urgency released ({} need recovered)",
+                    need.name()
+                )
+            }
+            EventKind::NeedChanged {
+                actor,
+                need,
+                delta,
+                cause,
+                ..
+            } => format!("{actor}'s {} need {delta:+.3} ({cause})", need.name()),
+            EventKind::AppraisalRecorded {
+                subject,
+                regarding,
+                event,
+                interpretation,
+            } => match event {
+                Some(id) => {
+                    format!("{subject} appraised {regarding} (event #{id}): {interpretation}")
+                }
+                None => format!("{subject} appraised {regarding}: {interpretation}"),
+            },
+            EventKind::QuestionAsked { from, to, about } => {
+                format!("{from} asked {to} about {about}")
+            }
+            EventKind::QueryAnswered {
+                answerer,
+                asker,
+                about,
+                polarities,
+                confidence,
+                contradicted,
+                unknown,
+                refused,
+                ..
+            } => {
+                if *refused {
+                    format!("{answerer} declined to answer {asker}'s question about {about}")
+                } else if *unknown {
+                    format!("{answerer} could not answer {asker}'s question about {about}")
+                } else {
+                    format!(
+                        "{answerer} answered {asker} about {about}: polarities {polarities:?} \
+                         (confidence {confidence:.2}, contradicted={contradicted})"
+                    )
+                }
+            }
+            EventKind::SanctionIssued {
+                authority,
+                subject,
+                kind,
+                ..
+            } => format!("{authority} sanctioned {subject} ({kind})"),
         }
     }
 }

@@ -16,13 +16,28 @@ use std::path::Path;
 use thiserror::Error;
 
 /// The current save format version.
-pub const SAVE_VERSION: u32 = 2;
+///
+/// Version ladder:
+/// * 1 — pre-repurposing authored content (see [`LEGACY_SAVE_VERSION`]).
+/// * 2 — private_biography as stance prose; one-off privacy migration.
+/// * 3 — behavior-engine Phase 0/1: canonical epistemic state
+///   (`World::epistemics`) added with `serde(default)`, plus typed
+///   `EvidenceRecorded` events going forward. A v2 save migrates by
+///   re-labeling to 3; the missing epistemics default to empty, so legacy
+///   saves load unchanged and the ledger accumulates from the migration
+///   point on.
+pub const SAVE_VERSION: u32 = 3;
 
 /// The save format version used before private_biography was repurposed to
 /// stance prose. Saves with this version may carry raw secrets in
 /// `Actor::private_biography` and organization-revealing goals/lore; the
 /// load path sanitizes all of them (`sanitize_legacy_privacy`).
 pub const LEGACY_SAVE_VERSION: u32 = 1;
+
+/// The save format version immediately before the epistemic-ledger schema
+/// (behavior-engine Phase 0/1). Loads via forward migration: the missing
+/// canonical epistemic state defaults to empty.
+pub const PRE_EPISTEMICS_SAVE_VERSION: u32 = 2;
 
 #[derive(Debug, Error)]
 pub enum PersistenceError {
@@ -96,6 +111,13 @@ pub fn from_json_str(text: &str) -> Result<SaveFile> {
     let mut probe: serde_json::Value = serde_json::from_str(text)?;
     match probe.get("version").and_then(serde_json::Value::as_u64) {
         Some(v) if v == SAVE_VERSION as u64 => {}
+        Some(v) if v == PRE_EPISTEMICS_SAVE_VERSION as u64 => {
+            // Forward migration v2 → v3 (behavior-engine Phase 0/1): the only
+            // schema delta is the canonical epistemic state, which is
+            // `serde(default)`. Re-label here so the version check below and
+            // any future migration steps see a consistent ladder.
+            probe["version"] = serde_json::json!(SAVE_VERSION);
+        }
         Some(v) if v == LEGACY_SAVE_VERSION as u64 => {
             // A legacy (v1) save still carries the pre-repurposing authored
             // content: literal secrets in `Actor::private_biography` and
@@ -572,6 +594,61 @@ mod tests {
         );
     }
 
+    /// A v2 save (pre-epistemics) loads via forward migration to v3: the
+    /// canonical epistemic state defaults to empty, all legacy content is
+    /// preserved, and the event checksum is untouched (test-spec T1.8).
+    #[test]
+    fn test_v2_save_migrates_to_v3_with_empty_epistemics() {
+        use rpg_domain::ids::{ActorId, PLAYER};
+
+        let mut sim = sim();
+        // Give the world some in-flight epistemic state.
+        let (tick, minute) = (sim.world.tick, sim.world.minute_of_day);
+        rpg_social::record_belief(
+            &mut sim.world,
+            &mut sim.events,
+            tick,
+            minute,
+            &ActorId::new(PLAYER),
+            &rpg_domain::ids::FactId::new("f_mafia_exists"),
+            true,
+            0.9,
+            rpg_domain::world::Provenance::Assumed,
+        );
+        assert!(!sim.world.epistemics.evidence.is_empty());
+
+        // Write a v2 save: strip the epistemics and re-label the version.
+        let json = to_json_string(&SaveFile::from_sim(&sim)).unwrap();
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        if let Some(world) = v.get_mut("world").and_then(|w| w.as_object_mut()) {
+            world.remove("epistemics");
+        }
+        if let Some(initial) = v.get_mut("initial_world").and_then(|w| w.as_object_mut()) {
+            initial.remove("epistemics");
+        }
+        v["version"] = serde_json::json!(PRE_EPISTEMICS_SAVE_VERSION);
+        let v2_json = v.to_string();
+
+        let loaded = from_json_str(&v2_json).expect("a v2 save must load");
+        assert_eq!(
+            loaded.version, SAVE_VERSION,
+            "v2 migrates to the current version"
+        );
+        assert!(
+            loaded.world.epistemics.evidence.is_empty(),
+            "migrated epistemics start empty and accumulate forward"
+        );
+        assert_eq!(
+            loaded.events.checksum(),
+            sim.events.checksum(),
+            "migration must not alter the canonical event log"
+        );
+        assert_eq!(loaded.world.actors.len(), sim.world.actors.len());
+        // The migrated save restores and continues deterministically.
+        let restored = restore(loaded, SimConfig::default());
+        assert_eq!(restored.events.checksum(), sim.events.checksum());
+    }
+
     /// A v1 save also carried the old authored content: goals and shared lore
     /// that name the concealed organization. The migration must scrub those
     /// where they would be told to someone without canonical access (goals of
@@ -606,6 +683,8 @@ mod tests {
             description: text.to_string(),
             kind: GoalKind::Safety,
             priority: 6.0,
+            need_boost: 0.0,
+
             status: GoalStatus::Active,
             predicate: None,
             target_location: None,
@@ -731,6 +810,8 @@ mod tests {
             description: "Avoid trouble from the mafia".into(),
             kind: GoalKind::Safety,
             priority: 6.0,
+            need_boost: 0.0,
+
             status: GoalStatus::Active,
             predicate: None,
             target_location: None,

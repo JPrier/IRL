@@ -8,6 +8,7 @@ description = "Agentic RPG: social layer."
 
 [dependencies]
 rpg_domain.workspace = true
+rpg_behavior.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

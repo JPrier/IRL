@@ -19,6 +19,12 @@ use rpg_domain::ports::InferenceEngine;
 use rpg_sim::{SimConfig, Simulation, StepReport};
 use std::collections::VecDeque;
 
+/// Property-based safety/replay checks (T6.5/T6.5b, plan I-8). Runtime
+/// evidence at generated scale - deliberately labeled evidence, never
+/// formal proof; the [PROOF] layer lives in `crates/proof-kernels`.
+#[cfg(test)]
+mod properties;
+
 /// How many conversation turns (player and NPC lines together) the session
 /// keeps for follow-up context. Mirrors the runtime's
 /// `rpg_runtime::MAX_CONVERSATION_TURNS` so eval exercises the same window
@@ -631,6 +637,11 @@ pub fn scenarios() -> Vec<Scenario> {
             description: "Attention on the grocer does not retroactively make them the leader.",
             run: innocent_grocer_stays_innocent,
         },
+        Scenario {
+            name: "emergent_quest_surface",
+            description: "An emergent quest is recognized from real goals, surfaced by the constrained director, resolved by predicate satisfaction.",
+            run: emergent_quest_surface,
+        },
     ]
 }
 
@@ -925,8 +936,11 @@ fn blackmail_has_consequences(seed: u64) -> ScenarioResult {
     check(
         &mut checks,
         "trust_fell",
-        after.trust < before.trust,
-        format!("{} -> {}", before.trust, after.trust),
+        after.trust_benevolence < before.trust_benevolence,
+        format!(
+            "benevolence {} -> {} (contextual dimension, design §3.2)",
+            before.trust_benevolence, after.trust_benevolence
+        ),
     );
     finish("blackmail_has_consequences", seed, &s, checks)
 }
@@ -1051,6 +1065,8 @@ fn knowledge_boundaries(seed: u64) -> ScenarioResult {
         target: ActorId::new("grocer"),
         fact: FactId::new("f_shipments_diverted"),
         assertive: true,
+        deceptive: false,
+        retold_chain: None,
     });
     check(
         &mut checks,
@@ -1069,6 +1085,8 @@ fn knowledge_boundaries(seed: u64) -> ScenarioResult {
         target: ActorId::new(PLAYER),
         fact: FactId::new("f_leader_identity"),
         assertive: true,
+        deceptive: false,
+        retold_chain: None,
     });
     check(
         &mut checks,
@@ -1167,6 +1185,451 @@ fn innocent_grocer_stays_innocent(seed: u64) -> ScenarioResult {
     finish("innocent_grocer_stays_innocent", seed, &s, checks)
 }
 
+/// The I7 production pathway (plan Phase 5; design §6.2/§6.3): recognize the
+/// grocer's authored bargain as a quest opportunity, run the constrained
+/// director's negative space, surface through the validated proposal path,
+/// bind a real contract by accepting the bargain offer, then resolve the
+/// quest through real validated actions (substitute predicate satisfaction).
+/// Finishes with deterministic replay and save/load continuation.
+fn run_emergent_quest_script(seed: u64) -> Session {
+    use rpg_narrative::DirectorProposal;
+    let mut s = Session::new(seed);
+    // The player hears the quest surface directly (permitted channel):
+    // teleport to the grocer, then surface the recognized opportunity.
+    s.teleport_player_to("grocer");
+    let quests = rpg_narrative::recognize_quests(&s.sim.world);
+    let opportunity = quests[0].clone();
+    let (tick, minute) = (s.sim.world.tick, s.sim.world.minute_of_day);
+    let _ = rpg_narrative::commit_director_proposal(
+        &s.sim.world,
+        &mut s.sim.events,
+        tick,
+        minute,
+        DirectorProposal::SurfaceQuest {
+            opportunity,
+            presented_to: ActorId::new(PLAYER),
+            claims: vec![],
+        },
+    );
+    // Bind the real contract: ask about the ledger, accept the authored
+    // bargain offer (production bargain pathway), keep the quest.
+    s.say(
+        "grocer",
+        "I need to see your ledger. The one with the dock payments.",
+    );
+    if let Some(o) = s
+        .sim
+        .world
+        .offers
+        .values()
+        .find(|o| o.from.as_str() == "grocer")
+        .cloned()
+    {
+        let _ = s.player_do(Action::AcceptOffer { offer: o.id });
+    }
+    // Obtain the medicine through a real validated route (investigate the
+    // alley, then hand it over in person) and satisfy the goal predicate.
+    s.goto("alley");
+    s.player_do(Action::Investigate {
+        target: InvestigateTarget::Location(LocationId::new("alley")),
+    });
+    s.teleport_player_to("grocer");
+    let _ = s.player_do(Action::TransferItem {
+        target: ActorId::new("grocer"),
+        item: ItemId::new("medicine"),
+        qty: 1,
+    });
+    s.ticks(2);
+    s
+}
+
+fn emergent_quest_surface(seed: u64) -> ScenarioResult {
+    use rpg_narrative::{
+        commit_director_proposal, quest_satisfied, recognize_quests, validate_director_proposal,
+        Decision, DirectorProposal, QuestClaim, QuestContract, QuestGoalSource, QuestPathway,
+    };
+    let mut s = Session::new(seed);
+    let mut checks = Vec::new();
+    // Mutating steps below mirror run_emergent_quest_script exactly; only
+    // read-only checks are interleaved between them.
+    s.teleport_player_to("grocer");
+
+    // --- T5.1: recognition from real content, no scripted giver ----------
+    let quests = recognize_quests(&s.sim.world);
+    check(
+        &mut checks,
+        "t5_1_exactly_one_opportunity",
+        quests.len() == 1,
+        format!("quests={}", quests.len()),
+    );
+    let opportunity = quests[0].clone();
+    check(
+        &mut checks,
+        "t5_1_beneficiary_and_goal_are_real",
+        opportunity.beneficiary == ActorId::new("grocer")
+            && opportunity.goal == QuestGoalSource::Bargain
+            && opportunity.goal_predicate
+                == QuestPredicate::HasItem {
+                    actor: ActorId::new("grocer"),
+                    item: ItemId::new("medicine"),
+                    qty: 1,
+                },
+        format!("{:?}", opportunity.goal),
+    );
+    check(
+        &mut checks,
+        "t5_1_pathways_cite_real_placement",
+        !opportunity.pathways.is_empty()
+            && opportunity.pathways.iter().all(|p| match p {
+                QuestPathway::ItemAvailableAt { item, location, .. } => s
+                    .sim
+                    .world
+                    .location_items
+                    .get(location)
+                    .map(|stacks| stacks.iter().any(|st| &st.item == item))
+                    .unwrap_or(false),
+                QuestPathway::HeldByActor { item, holder, .. } => s
+                    .sim
+                    .world
+                    .actor(holder)
+                    .map(|a| a.is_alive() && a.inventory.quantity(item) > 0)
+                    .unwrap_or(false),
+            }),
+        format!("{:?}", opportunity.pathways),
+    );
+    check(
+        &mut checks,
+        "t5_1_stake_is_the_promised_disclosure",
+        opportunity.stake.promised_fact == Some(FactId::new("f_grocer_ledger")),
+        format!("{:?}", opportunity.stake.promised_fact),
+    );
+
+    // Truth snapshot: everything the director must never touch. Compared as
+    // canonical debug text (domain state types are not PartialEq by design).
+    let truth_snapshot = |w: &rpg_domain::world::World| {
+        format!(
+            "{:?}|{:?}|{:?}|{:?}|{:?}",
+            w.facts,
+            w.deals,
+            w.commitments,
+            w.actors
+                .iter()
+                .map(|(k, a)| (k, &a.goals))
+                .collect::<Vec<_>>(),
+            w.flags,
+        )
+    };
+    let truth_before = truth_snapshot(&s.sim.world);
+    let events_before = s.sim.events.len();
+
+    // --- T5.3: the constrained director's negative space -----------------
+    // (a) Teleporting resources: a pathway pointing somewhere the item is not.
+    let mut tampered = opportunity.clone();
+    tampered.pathways = vec![QuestPathway::ItemAvailableAt {
+        item: ItemId::new("medicine"),
+        location: LocationId::new("castle"),
+        qty: 1,
+    }];
+    check(
+        &mut checks,
+        "t5_3a_teleport_rejected",
+        matches!(
+            validate_director_proposal(
+                &s.sim.world,
+                &DirectorProposal::SurfaceQuest {
+                    opportunity: tampered,
+                    presented_to: ActorId::new(PLAYER),
+                    claims: vec![],
+                }
+            ),
+            Decision::Rejected(_)
+        ),
+        "tampered pathway must not validate",
+    );
+    // (b) Inventing a quest for an actor with no blocked goal/bargain.
+    let fake = rpg_narrative::QuestOpportunity {
+        beneficiary: ActorId::new("priest"),
+        goal: QuestGoalSource::Bargain,
+        description: "priest needs medicine".into(),
+        goal_predicate: QuestPredicate::HasItem {
+            actor: ActorId::new("priest"),
+            item: ItemId::new("medicine"),
+            qty: 1,
+        },
+        blockers: vec![],
+        pathways: vec![],
+        stake: rpg_narrative::QuestStake {
+            goal_kind: None,
+            goal_priority: None,
+            promised_fact: None,
+        },
+        contract: None,
+    };
+    check(
+        &mut checks,
+        "t5_3b_invented_quest_rejected",
+        matches!(
+            validate_director_proposal(
+                &s.sim.world,
+                &DirectorProposal::SurfaceQuest {
+                    opportunity: fake,
+                    presented_to: ActorId::new(PLAYER),
+                    claims: vec![],
+                }
+            ),
+            Decision::Rejected(_)
+        ),
+        "invented beneficiary must not validate",
+    );
+    // (c) Inventing witnessed events: claim on an unknown fact.
+    check(
+        &mut checks,
+        "t5_3c_invented_claim_rejected",
+        matches!(
+            validate_director_proposal(
+                &s.sim.world,
+                &DirectorProposal::SurfaceQuest {
+                    opportunity: opportunity.clone(),
+                    presented_to: ActorId::new(PLAYER),
+                    claims: vec![QuestClaim {
+                        fact: FactId::new("f_nonexistent"),
+                        polarity: true,
+                    }],
+                }
+            ),
+            Decision::Rejected(_)
+        ),
+        "unknown-fact claim must not validate",
+    );
+    // (d) Treating a proposed quest as an established contract.
+    let mut fake_contract = opportunity.clone();
+    fake_contract.contract = Some(QuestContract::Deal(DealId(9999)));
+    check(
+        &mut checks,
+        "t5_3d_fake_contract_rejected",
+        matches!(
+            validate_director_proposal(
+                &s.sim.world,
+                &DirectorProposal::SurfaceQuest {
+                    opportunity: fake_contract,
+                    presented_to: ActorId::new(PLAYER),
+                    claims: vec![],
+                }
+            ),
+            Decision::Rejected(_)
+        ),
+        "fabricated contract must not validate",
+    );
+    check(
+        &mut checks,
+        "t5_3_rejections_write_nothing",
+        s.sim.events.len() == events_before && truth_before == truth_snapshot(&s.sim.world),
+        "no events, no truth movement",
+    );
+
+    // --- Surface through the validated production path --------------------
+    let (tick, minute) = (s.sim.world.tick, s.sim.world.minute_of_day);
+    let surface_decision = commit_director_proposal(
+        &s.sim.world,
+        &mut s.sim.events,
+        tick,
+        minute,
+        DirectorProposal::SurfaceQuest {
+            opportunity: opportunity.clone(),
+            presented_to: ActorId::new(PLAYER),
+            claims: vec![],
+        },
+    );
+    check(
+        &mut checks,
+        "surface_accepted",
+        surface_decision.is_accepted(),
+        format!("{surface_decision:?}"),
+    );
+    check(
+        &mut checks,
+        "surface_records_provenance_only",
+        s.sim.events.len() == events_before + 1
+            && matches!(
+                s.sim.events.all().last().map(|e| &e.kind),
+                Some(rpg_domain::events::EventKind::DirectorProposed { accepted: true, .. })
+            ),
+        "one DirectorProposed event, nothing else",
+    );
+    check(
+        &mut checks,
+        "surface_commits_no_world_truth",
+        truth_before == truth_snapshot(&s.sim.world),
+        "facts/deals/commitments/goals/flags unchanged",
+    );
+    // The permitted actor-facing surface: existence only, no privileged
+    // pathway locations.
+    let surface = rpg_narrative::QuestSurface::of(&s.sim.world, &opportunity);
+    check(
+        &mut checks,
+        "t5_4_surface_is_permitted_information_only",
+        surface.has_known_pathway
+            && !surface.has_contract
+            && surface.promised_fact == Some(FactId::new("f_grocer_ledger"))
+            && !surface.description.contains("warehouse")
+            && !surface.description.contains("alley"),
+        format!("surface={surface:?}"),
+    );
+
+    // --- Bind a real contract (production bargain offer → commitment) ----
+    s.say(
+        "grocer",
+        "I need to see your ledger. The one with the dock payments.",
+    );
+    let offer = s
+        .sim
+        .world
+        .offers
+        .values()
+        .find(|o| o.from.as_str() == "grocer" && o.condition.is_some())
+        .cloned();
+    // The say() above already created the authored bargain offer.
+    let accepted = offer
+        .map(|o| s.player_do(Action::AcceptOffer { offer: o.id }))
+        .unwrap_or(ValidationOutcome::Rejected(
+            rpg_domain::action::RejectReason::Invalid("no bargain offer".into()),
+        ));
+    check(
+        &mut checks,
+        "bargain_offer_accepted",
+        matches!(accepted, ValidationOutcome::Accepted),
+        format!("{accepted:?}"),
+    );
+    let quests = recognize_quests(&s.sim.world);
+    let opportunity2 = quests
+        .iter()
+        .find(|q| q.beneficiary == ActorId::new("grocer"))
+        .cloned();
+    check(
+        &mut checks,
+        "t5_4_contract_recognized_from_accepted_commitment",
+        match &opportunity2 {
+            Some(q) => match q.contract {
+                Some(QuestContract::Commitment(cid)) => s
+                    .sim
+                    .world
+                    .commitments
+                    .get(&cid)
+                    .map(|cm| {
+                        cm.state == rpg_domain::social::CommitmentState::Pending
+                            && cm.predicate == q.goal_predicate
+                            && cm.promised_fact == Some(FactId::new("f_grocer_ledger"))
+                    })
+                    .unwrap_or(false),
+                _ => false,
+            },
+            None => false,
+        },
+        format!(
+            "contract={:?}",
+            opportunity2.as_ref().and_then(|q| q.contract)
+        ),
+    );
+
+    // --- Save/load continuation ------------------------------------------
+    let save = rpg_persistence::SaveFile::from_sim(&s.sim);
+    let json = serde_json::to_string(&save).unwrap();
+    let loaded: rpg_persistence::SaveFile = serde_json::from_str(&json).unwrap();
+    let restored = rpg_persistence::restore(loaded, SimConfig::default());
+    check(
+        &mut checks,
+        "save_load_checksum_equal",
+        restored.events.checksum() == s.checksum(),
+        format!("{:x} vs {:x}", restored.events.checksum(), s.checksum()),
+    );
+    let restored_quests = recognize_quests(&restored.world);
+    check(
+        &mut checks,
+        "save_load_recognition_equal",
+        restored_quests == quests,
+        format!(
+            "restored={}",
+            restored_quests
+                .iter()
+                .map(|q| format!("{:?}", q.goal))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+    );
+    check(
+        &mut checks,
+        "save_load_surface_event_persists",
+        restored.events.all().iter().any(|e| {
+            matches!(
+                &e.kind,
+                rpg_domain::events::EventKind::DirectorProposed { accepted: true, .. }
+            )
+        }),
+        "DirectorProposed provenance survives the round-trip",
+    );
+
+    // --- T5.2: substitute predicate satisfaction through real actions -----
+    let opportunity2 = opportunity2.expect("quest still recognized");
+    check(
+        &mut checks,
+        "t5_2_not_satisfied_before",
+        !quest_satisfied(&s.sim.world, &opportunity2),
+        "grocer lacks medicine",
+    );
+    s.goto("alley");
+    s.player_do(Action::Investigate {
+        target: InvestigateTarget::Location(LocationId::new("alley")),
+    });
+    let found = s
+        .sim
+        .world
+        .actor(&ActorId::new(PLAYER))
+        .map(|a| a.inventory.quantity(&ItemId::new("medicine")))
+        .unwrap_or(0);
+    check(
+        &mut checks,
+        "t5_2_medicine_found_by_search",
+        found >= 1,
+        format!("player medicine={found}"),
+    );
+    s.teleport_player_to("grocer");
+    let given = s.player_do(Action::TransferItem {
+        target: ActorId::new("grocer"),
+        item: ItemId::new("medicine"),
+        qty: 1,
+    });
+    check(
+        &mut checks,
+        "t5_2_medicine_delivered",
+        matches!(given, ValidationOutcome::Accepted),
+        format!("{given:?}"),
+    );
+    check(
+        &mut checks,
+        "t5_2_predicate_satisfied_by_delivered_substitute",
+        quest_satisfied(&s.sim.world, &opportunity2),
+        "resolution follows the predicate, not a single authored route",
+    );
+    s.ticks(2);
+    check(
+        &mut checks,
+        "t5_2_satisfied_quest_no_longer_surfaced",
+        recognize_quests(&s.sim.world).is_empty(),
+        "a satisfied goal is not an opportunity",
+    );
+
+    // --- Deterministic replay ---------------------------------------------
+    let replay = run_emergent_quest_script(seed);
+    check(
+        &mut checks,
+        "deterministic_replay",
+        replay.checksum() == s.checksum(),
+        format!("{:x} vs {:x}", replay.checksum(), s.checksum()),
+    );
+
+    finish("emergent_quest_surface", seed, &s, checks)
+}
+
 /// Aggregate a human-readable leaderboard of scenario results.
 pub fn leaderboard(results: &[ScenarioResult]) -> String {
     let mut out = String::new();
@@ -1190,6 +1653,8 @@ mod tests {
             target: ActorId::new(PLAYER),
             fact: FactId::new("f_grocer_ledger"),
             assertive: true,
+            deceptive: false,
+            retold_chain: None,
         };
         let line = spoken_line_in(&session.sim.world, &claim).expect("statement");
         assert!(line.contains("ledger"), "unexpected line: {line}");

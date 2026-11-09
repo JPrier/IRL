@@ -8,6 +8,7 @@ description = "Agentic RPG: simulated-player scenarios, replay and quality metri
 
 [dependencies]
 rpg_domain.workspace = true
+rpg_behavior.workspace = true
 rpg_sim.workspace = true
 rpg_agents.workspace = true
 rpg_content.workspace = true
@@ -18,3 +19,6 @@ rpg_persistence.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

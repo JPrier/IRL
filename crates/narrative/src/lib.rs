@@ -8,11 +8,14 @@
 //! consistent with already-observed facts and, if so, commits it. It is the
 //! story equivalent of the action validator.
 
+use rpg_domain::action::QuestPredicate;
 use rpg_domain::events::{EventKind, EventLog};
 use rpg_domain::ids::*;
 use rpg_domain::rng::DeterministicRng;
+use rpg_domain::social::CommitmentState;
 use rpg_domain::world::{
-    evaluate_predicate, Actor, ActorKind, CheckpointState, ContainerCommit, ContainerKind, World,
+    evaluate_predicate, Actor, ActorKind, CheckpointState, ContainerCommit, ContainerKind,
+    GoalKind, GoalStatus, Sensitivity, World,
 };
 
 /// A proposed narrative change. Never applied directly.
@@ -389,6 +392,516 @@ pub fn independent_route_count(world: &World, fact: &FactId) -> usize {
         .count()
 }
 
+// ---------------------------------------------------------------------------
+// Emergent quests (design §6.2/§6.3, plan Phase 5 / I-7)
+//
+// A quest is *recognized*, never authored: Q = (beneficiary, goal, blocking
+// predicates, achievable pathways, stake, contract?). Every field is read
+// from world truth — existing goals, content-authored bargains, physical
+// item placement and accepted commitments/deals. The recognizer invents
+// nothing: if a needed resource exists nowhere in the world, no pathway
+// exists and no opportunity is surfaced. The director is constrained: it
+// may only surface *currently recognized* opportunities, it commits no
+// world truth, and it cannot treat a proposed quest as an established
+// contract (a contract is reported only when an accepted commitment or a
+// non-terminal deal actually matches the goal predicate).
+//
+// Ordering is fully deterministic (BTreeMap iteration, no RNG) so quests
+// participate in replay; surfacing appends a `DirectorProposed` provenance
+// event and mutates nothing else, keeping save/load and checksum behavior.
+// ---------------------------------------------------------------------------
+
+/// Bounded work: at most this many pathways are reported per opportunity
+/// (truncated in deterministic scan order).
+pub const MAX_QUEST_PATHWAYS: usize = 8;
+/// Bounded work: at most this many opportunities per recognition pass
+/// (truncated in deterministic actor/goal order).
+pub const MAX_QUEST_OPPORTUNITIES: usize = 16;
+
+/// Where a recognized quest's goal came from. Both are real, persisted
+/// actor state — the recognizer never fabricates a goal.
+#[derive(Clone, Debug, PartialEq)]
+pub enum QuestGoalSource {
+    /// A persistent actor goal carrying a stable satisfaction predicate
+    /// (`Goal::predicate`) that is currently unmet.
+    Goal { id: u64 },
+    /// The content-authored conditional bargain (`Actor::bargain`): the
+    /// typed world condition the actor needs satisfied in exchange for a
+    /// promised disclosure.
+    Bargain,
+}
+
+/// An achievable pathway *observed in the world*. Both variants cite where
+/// the needed resource physically already is; the director may not teleport
+/// resources, so surfacing can only ever reference real placement. Ordered
+/// for deterministic canonical sort (placement before held, then by ids).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum QuestPathway {
+    /// The needed item is physically present at a location.
+    ItemAvailableAt {
+        item: ItemId,
+        location: LocationId,
+        qty: u32,
+    },
+    /// A living actor other than the beneficiary holds the needed item.
+    HeldByActor {
+        item: ItemId,
+        holder: ActorId,
+        qty: u32,
+    },
+}
+
+/// What is at stake for the beneficiary. Read from the goal/bargain and any
+/// matching accepted contract — never invented.
+#[derive(Clone, Debug, PartialEq)]
+pub struct QuestStake {
+    /// The beneficiary's goal class, when the quest derives from a `Goal`.
+    pub goal_kind: Option<GoalKind>,
+    /// The beneficiary's goal priority, when the quest derives from a `Goal`.
+    pub goal_priority: Option<f32>,
+    /// The fact the beneficiary promises to disclose once the goal state
+    /// holds (the bargain's stake, or a matching commitment's promise).
+    pub promised_fact: Option<FactId>,
+}
+
+/// An established contract that already binds this quest's goal state.
+/// Only ever populated from a real accepted commitment or a non-terminal
+/// deal; a *proposed* quest is never reported as contracted (T5.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuestContract {
+    /// An accepted, still-standing commitment whose predicate matches.
+    Commitment(CommitmentId),
+    /// A non-terminal deal whose condition matches.
+    Deal(DealId),
+}
+
+/// A recognized quest opportunity: design §6.2
+/// `Q = (beneficiary, goal, blocking predicates, achievable pathways,
+/// stake, contract?)`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct QuestOpportunity {
+    pub beneficiary: ActorId,
+    pub goal: QuestGoalSource,
+    /// Human-readable goal description taken from the actor's own goal, or
+    /// composed mechanically from the bargain's typed condition.
+    pub description: String,
+    /// The intended state. Quest resolution is *this predicate's
+    /// satisfaction* — never one authored solution (T5.2 substitute
+    /// satisfaction).
+    pub goal_predicate: QuestPredicate,
+    /// The currently-unsatisfied blocking conditions (sub-predicates that
+    /// do not yet hold in the world).
+    pub blockers: Vec<QuestPredicate>,
+    /// Achievable pathways observed in world truth (bounded, deterministic
+    /// order). Privileged observation — never presented to an actor as a
+    /// witnessed event.
+    pub pathways: Vec<QuestPathway>,
+    pub stake: QuestStake,
+    pub contract: Option<QuestContract>,
+}
+
+/// A typed factual assertion a director surface makes. Claims are the
+/// anchor-validation surface (T5.4): each must reference an *existing,
+/// committed* fact and assert its true polarity. Anything else is rejected
+/// as invented witnessed evidence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuestClaim {
+    pub fact: FactId,
+    pub polarity: bool,
+}
+
+/// A director proposal (design §6.3/§8). Surfacing is presentation only.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DirectorProposal {
+    /// Surface a recognized quest opportunity to an actor (e.g. through
+    /// dialogue). Commits no world truth: no facts, goals, deals, flags or
+    /// story state change — only the `DirectorProposed` provenance event.
+    SurfaceQuest {
+        opportunity: QuestOpportunity,
+        presented_to: ActorId,
+        claims: Vec<QuestClaim>,
+    },
+}
+
+/// The epistemically *permitted* actor-facing projection of a surfaced
+/// quest: who needs what, what they promise, whether a real contract
+/// exists, and whether a pathway is known to exist at all. It deliberately
+/// carries **no** pathway locations and no world-truth details — those are
+/// privileged recognizer output, not things an actor was shown
+/// ([`QuestOpportunity`] is the privileged form; keep it out of dialogue).
+#[derive(Clone, Debug, PartialEq)]
+pub struct QuestSurface {
+    pub beneficiary: ActorId,
+    pub beneficiary_name: String,
+    pub description: String,
+    pub promised_fact: Option<FactId>,
+    /// True only when an accepted commitment or non-terminal deal actually
+    /// binds this goal state (never for a merely proposed quest).
+    pub has_contract: bool,
+    /// Whether any genuine pathway exists — existence only, no locations.
+    pub has_known_pathway: bool,
+}
+
+impl QuestSurface {
+    /// The permitted projection of a recognized opportunity.
+    pub fn of(world: &World, opportunity: &QuestOpportunity) -> QuestSurface {
+        QuestSurface {
+            beneficiary: opportunity.beneficiary.clone(),
+            beneficiary_name: world
+                .actor(&opportunity.beneficiary)
+                .map(|a| a.name.clone())
+                .unwrap_or_default(),
+            description: opportunity.description.clone(),
+            promised_fact: opportunity.stake.promised_fact.clone(),
+            has_contract: opportunity.contract.is_some(),
+            has_known_pathway: !opportunity.pathways.is_empty(),
+        }
+    }
+}
+
+/// Blocking conditions: the leaves of `predicate` that do not currently
+/// hold. For `All`/`Any` children are walked individually; `Not(inner)` is
+/// reported as written (the negated condition itself is blocking). Every
+/// reported blocker is verifiably false right now — the recognizer cannot
+/// invent an obstacle.
+fn unsatisfied_leaves(world: &World, predicate: &QuestPredicate, out: &mut Vec<QuestPredicate>) {
+    if evaluate_predicate(world, predicate) {
+        return;
+    }
+    match predicate {
+        QuestPredicate::All(children) | QuestPredicate::Any(children) => {
+            for c in children {
+                unsatisfied_leaves(world, c, out);
+            }
+        }
+        _ => out.push(predicate.clone()),
+    }
+}
+
+/// Mechanically describe a bargain condition from world data (item names,
+/// quantities) — no authored prose, no actor literals.
+fn describe_condition(world: &World, predicate: &QuestPredicate) -> String {
+    match predicate {
+        QuestPredicate::HasItem { actor, item, qty } => {
+            let who = world
+                .actor(actor)
+                .map(|a| a.name.as_str())
+                .unwrap_or(actor.as_str());
+            let what = world
+                .items
+                .get(item)
+                .map(|i| i.name.as_str())
+                .unwrap_or(item.as_str());
+            if *qty == 1 {
+                format!("{who} needs {what}")
+            } else {
+                format!("{who} needs {what} ×{qty}")
+            }
+        }
+        other => format!("{other:?}"),
+    }
+}
+
+/// Pathways for one unsatisfied `HasItem` blocker, derived from where the
+/// item physically is right now: static location placement first, then
+/// living actors' inventories (beneficiary excluded — their lack of the
+/// item is the blocker). Deterministic scan order; bounded by
+/// [`MAX_QUEST_PATHWAYS`].
+fn item_pathways(
+    world: &World,
+    beneficiary: &ActorId,
+    item: &ItemId,
+    qty: u32,
+) -> Vec<QuestPathway> {
+    let mut out = Vec::new();
+    for (loc, stacks) in &world.location_items {
+        for stack in stacks {
+            if &stack.item == item && stack.qty > 0 {
+                out.push(QuestPathway::ItemAvailableAt {
+                    item: item.clone(),
+                    location: loc.clone(),
+                    qty: stack.qty.min(qty),
+                });
+            }
+        }
+    }
+    for (id, actor) in &world.actors {
+        if id == beneficiary || !actor.is_alive() {
+            continue;
+        }
+        let held = actor.inventory.quantity(item);
+        if held > 0 {
+            out.push(QuestPathway::HeldByActor {
+                item: item.clone(),
+                holder: id.clone(),
+                qty: held.min(qty),
+            });
+        }
+    }
+    out.truncate(MAX_QUEST_PATHWAYS);
+    out
+}
+
+/// The established contract binding `predicate`, if any: an accepted
+/// (still pending) commitment or a non-terminal deal whose condition is
+/// exactly this predicate. Commitments are scanned before deals; both maps
+/// are ordered, so the earliest matching id wins deterministically.
+fn matching_contract(world: &World, predicate: &QuestPredicate) -> Option<QuestContract> {
+    for (id, cm) in &world.commitments {
+        if cm.state == CommitmentState::Pending && &cm.predicate == predicate {
+            return Some(QuestContract::Commitment(*id));
+        }
+    }
+    for (id, d) in &world.deals {
+        if !d.is_terminal() && &d.condition == predicate {
+            return Some(QuestContract::Deal(*id));
+        }
+    }
+    None
+}
+
+/// Build an opportunity from a blocked goal/bargain predicate, or `None`
+/// when no achievable pathway exists in the world (the recognizer never
+/// invents resources, so a quest with no real lead is not an opportunity).
+fn build_opportunity(
+    world: &World,
+    beneficiary: ActorId,
+    goal: QuestGoalSource,
+    description: String,
+    predicate: QuestPredicate,
+    stake: QuestStake,
+) -> Option<QuestOpportunity> {
+    let mut blockers = Vec::new();
+    unsatisfied_leaves(world, &predicate, &mut blockers);
+    let mut pathways = Vec::new();
+    for blocker in &blockers {
+        if let QuestPredicate::HasItem {
+            actor, item, qty, ..
+        } = blocker
+        {
+            if actor == &beneficiary {
+                pathways.extend(item_pathways(world, &beneficiary, item, *qty));
+            }
+        }
+    }
+    if pathways.is_empty() {
+        return None;
+    }
+    pathways.sort();
+    pathways.dedup();
+    pathways.truncate(MAX_QUEST_PATHWAYS);
+    let contract = matching_contract(world, &predicate);
+    Some(QuestOpportunity {
+        beneficiary,
+        goal,
+        description,
+        goal_predicate: predicate,
+        blockers,
+        pathways,
+        stake,
+        contract,
+    })
+}
+
+/// Recognize quest opportunities from real world state (design §6.2).
+///
+/// Deterministic: actors in map order, each actor's goals in list order,
+/// then the actor's content-authored bargain. The pass is bounded by
+/// [`MAX_QUEST_OPPORTUNITIES`]. Recognition reads only:
+///
+/// * active goals with unmet stable predicates ([`Goal::predicate`]),
+/// * content-authored bargains whose typed condition is unmet (with the
+///   same knowledge guards the bargain pathway uses: the actor must
+///   actually believe the promised fact, the fact must not be public, and
+///   the player must not already know it — no stake otherwise),
+/// * physical item placement and living inventories for pathways,
+/// * accepted commitments / non-terminal deals for `contract?`.
+///
+/// The recognizer is a reader: it never mutates the world, never marks a
+/// goal satisfied, never creates a contract, and its output contains no
+/// actor-id branches.
+pub fn recognize_quests(world: &World) -> Vec<QuestOpportunity> {
+    let mut out: Vec<QuestOpportunity> = Vec::new();
+    'actors: for (id, actor) in &world.actors {
+        if actor.kind != ActorKind::Npc || !actor.is_alive() {
+            continue;
+        }
+        for g in &actor.goals {
+            if g.status != GoalStatus::Active {
+                continue;
+            }
+            let Some(predicate) = &g.predicate else {
+                continue;
+            };
+            if evaluate_predicate(world, predicate) {
+                continue; // already satisfied: not a quest
+            }
+            let stake = QuestStake {
+                goal_kind: Some(g.kind),
+                goal_priority: Some(g.priority),
+                promised_fact: matching_commitment_promise(world, predicate),
+            };
+            if let Some(q) = build_opportunity(
+                world,
+                id.clone(),
+                QuestGoalSource::Goal { id: g.id },
+                g.description.clone(),
+                predicate.clone(),
+                stake,
+            ) {
+                out.push(q);
+                if out.len() >= MAX_QUEST_OPPORTUNITIES {
+                    break 'actors;
+                }
+            }
+        }
+        // Content-authored bargain: the typed world condition this actor
+        // needs satisfied in exchange for a promised disclosure.
+        if let Some(b) = &actor.bargain {
+            let disclosed = &b.disclose;
+            let f_ok = world
+                .fact(disclosed)
+                .map(|f| f.sensitivity != Sensitivity::Public)
+                .unwrap_or(false)
+                && world.believes(id, disclosed)
+                && !world
+                    .actors
+                    .values()
+                    .any(|a| a.kind == ActorKind::Player && world.believes(&a.id, disclosed));
+            if f_ok && !evaluate_predicate(world, &b.condition) {
+                let stake = QuestStake {
+                    goal_kind: None,
+                    goal_priority: None,
+                    promised_fact: Some(disclosed.clone()),
+                };
+                if let Some(q) = build_opportunity(
+                    world,
+                    id.clone(),
+                    QuestGoalSource::Bargain,
+                    describe_condition(world, &b.condition),
+                    b.condition.clone(),
+                    stake,
+                ) {
+                    out.push(q);
+                    if out.len() >= MAX_QUEST_OPPORTUNITIES {
+                        break 'actors;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The promised fact of an accepted commitment matching `predicate`, if any.
+fn matching_commitment_promise(world: &World, predicate: &QuestPredicate) -> Option<FactId> {
+    world
+        .commitments
+        .values()
+        .find(|cm| cm.state == CommitmentState::Pending && &cm.predicate == predicate)
+        .and_then(|cm| cm.promised_fact.clone())
+}
+
+/// Quest resolution = satisfaction of the goal predicate — nothing else.
+/// Any route that makes the intended state true resolves the quest
+/// (design §6.2 substitute satisfaction: never require one authored
+/// solution). This is the *recognition* of resolution only; the narrative
+/// layer has no authority to write goal status, deal state or world truth.
+pub fn quest_satisfied(world: &World, opportunity: &QuestOpportunity) -> bool {
+    evaluate_predicate(world, &opportunity.goal_predicate)
+}
+
+/// Validate a constrained director proposal (design §6.3/§8):
+///
+/// 1. **Recognition gate** — the proposal's opportunity must be
+///    *structurally identical* to a currently recognized opportunity. The
+///    director cannot invent a beneficiary, goal, predicate, stake,
+///    pathway or contract: any tampered field fails the match.
+/// 2. **Presentation target** — must exist and be alive.
+/// 3. **Claims (anchor validation, T5.4)** — every claim must reference an
+///    existing *committed* fact and assert its true polarity. Claims on
+///    unknown facts (invention) or uncommitted facts (invented witnessed
+///    evidence) and inverted polarities (retroactive contradiction of
+///    committed truth / authored anchors, design §9.1.7) are rejected.
+pub fn validate_director_proposal(world: &World, proposal: &DirectorProposal) -> Decision {
+    let DirectorProposal::SurfaceQuest {
+        opportunity,
+        presented_to,
+        claims,
+    } = proposal;
+    let Some(target) = world.actor(presented_to) else {
+        return Decision::Rejected(format!("unknown presentation target {presented_to}"));
+    };
+    if !target.is_alive() {
+        return Decision::Rejected(format!("presentation target {presented_to} is not alive"));
+    }
+    let recognized = recognize_quests(world);
+    if !recognized.iter().any(|q| q == opportunity) {
+        return Decision::Rejected(
+            "opportunity is not currently recognized — the director cannot invent \
+             beneficiaries, goals, pathways, stakes or contracts"
+                .into(),
+        );
+    }
+    for claim in claims {
+        let Some(f) = world.fact(&claim.fact) else {
+            return Decision::Rejected(format!(
+                "claim references unknown fact {} — the director cannot invent facts",
+                claim.fact
+            ));
+        };
+        if !f.committed {
+            return Decision::Rejected(format!(
+                "claim on uncommitted fact {} would invent witnessed evidence",
+                claim.fact
+            ));
+        }
+        if claim.polarity != f.truth {
+            return Decision::Rejected(format!(
+                "claim contradicts the committed truth of {} (no retroactive \
+                 narrative contradiction)",
+                claim.fact
+            ));
+        }
+    }
+    Decision::Accepted
+}
+
+/// Commit a validated director proposal. Surfacing appends only the
+/// `DirectorProposed` provenance event (a record that the presentation
+/// happened, like a speech event — not a mutation of world truth); it
+/// writes no facts, goals, deals, flags or story state. Rejections are
+/// no-ops.
+pub fn commit_director_proposal(
+    world: &World,
+    events: &mut EventLog,
+    tick: u64,
+    minute: u32,
+    proposal: DirectorProposal,
+) -> Decision {
+    let decision = validate_director_proposal(world, &proposal);
+    if let Decision::Rejected(reason) = &decision {
+        return Decision::Rejected(reason.clone());
+    }
+    let DirectorProposal::SurfaceQuest { opportunity, .. } = &proposal;
+    events.push(
+        tick,
+        minute,
+        None,
+        EventKind::DirectorProposed {
+            proposal: format!(
+                "surface_quest: {} — {}",
+                opportunity.beneficiary, opportunity.description
+            ),
+            accepted: true,
+            reason: String::new(),
+        },
+        Vec::new(),
+        Vec::new(),
+    );
+    Decision::Accepted
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -423,6 +936,10 @@ mod tests {
             flags: BTreeSet::new(),
             secret_allegiance: None,
             in_private_conversation_with: None,
+            bargain: None,
+            needs: Default::default(),
+            emotions: Default::default(),
+            rel_memory: BTreeMap::new(),
         }
     }
 
@@ -452,13 +969,17 @@ mod tests {
             offers: BTreeMap::new(),
             rumors: Vec::new(),
             damage: BTreeMap::new(),
+            damage_facts: BTreeMap::new(),
             location_items: BTreeMap::new(),
             flags: BTreeSet::new(),
             ledger: BTreeMap::new(),
             next_commitment_id: 1,
             next_offer_id: 1,
+            deals: BTreeMap::new(),
+            next_deal_id: 1,
             next_rumor_id: 1,
             next_goal_id: 1,
+            epistemics: Default::default(),
             lore: WorldLore::default(),
         };
         w.locations.insert(

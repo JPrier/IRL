@@ -1,0 +1,97 @@
+# Proof-limits artifact (plan I-8; test-spec T6.7). One table per Kani
+# harness in `crates/proof-kernels/src/harnesses.rs`; the CI proof job runs
+# every harness at its declared bounds and `scripts/check-proof-audit.sh`
+# fails on a missing bounds entry or an orphaned entry (no matching
+# harness). Update this file in the same PR as any harness change - it is
+# an ongoing gate, not a one-time document.
+schema_version = 1
+
+# T6.1a - full i64 input space; no numeric bounds (the proof is complete
+# for money). Unwind 1: no recursion, no loops in the kernel.
+[harness.i8_t61_money_transfer_conservation]
+description = "production money-transfer arithmetic conservation + overflow rejection"
+unwind = 1
+input_bounds = "i64 full range"
+
+# T6.1b - bounded inventory stacks. Bounds cover all branches of
+# Inventory::remove (exact, partial, empty) and keep add inside u32.
+[harness.i8_t61_item_transfer_conservation]
+description = "production Inventory remove/add conservation via the sim move_item path"
+unwind = 16
+max_from_stock = 4
+max_to_stock = 4
+max_remove_qty = 4
+max_stacks_per_inventory = 1
+
+# T6.2 - minimal two-actor concrete world; one concrete validated delivery
+# (told channel, positive polarity, neutral relationship profile). The
+# symbolic-input boundary harness is the disclosed residual (CBMC symex of
+# symbolic inputs through the acceptance heap path exceeds the budget);
+# input-space generality is carried by the numeric-core harnesses
+# (T6.8 P1/P2/P5, symbolic) and the property/unit layers.
+[harness.i8_t62_claim_acceptance_boundary]
+description = "assertion cannot write world truth; acceptance writes ledger + rolled outcome only"
+unwind = 30
+max_actors = 2
+delivery_profile = "concrete: Told channel, positive polarity, assertive, non-deceptive, neutral floats"
+nan_excluded = true
+nan_excluded = true
+
+# T6.3 - bounded deal/step space: 11 states x 13 concrete events x 2
+# consideration facts, plus a 2-event driven exactly-once sequence.
+[harness.i8_t63_deal_lifecycle_invariants]
+description = "exactly-once terminal settlement, no illegal transitions, ConditionMet != Performed"
+unwind = 16
+max_states = 11
+max_event_variants = 13
+max_driven_events = 2
+
+# T6.4 - bounded replay: exactly 2 recorded Apply ops (validated payments,
+# amounts 1..=3) over the minimal two-actor world; unrolled in the harness
+# (loops wrapping map operations multiply CBMC symex cost). Step/autonomy
+# replay is covered at scale by the T6.5b property tests (runtime
+# evidence, not CBMC).
+[harness.i8_t64_replay_determinism]
+description = "replay_ops reproduces full event log + epistemics JSON + canonical per-actor state (Apply ops)"
+unwind = 2000
+max_recorded_ops = 2
+max_actors = 2
+pay_amount_range = "1..=3"
+
+# T6.8 P2/P5 (+ P1 empty-ledger case) - the extracted pure production
+# numeric core (`acceptance_probability` + `aggregate_from_groups` +
+# `prior_strength`); pure float arithmetic, no map scaffold.
+[harness.i8_t68_acceptance_numeric_p1_p2_p5]
+description = "P1 (empty ledger) probability clamp, P2 empty-ledger legacy formula exact, P5 clamps/no-NaN"
+unwind = 16
+trust_suspicion_fear_range = "-1.0..=1.0"
+assertiveness_confidence_range = "0.0..=1.0"
+probability_range = "0.05..=0.97"
+reliability_clamp = "0.05..=0.98"
+nan_excluded = true
+
+# T6.8 P1 (non-empty ledger) - one symbolic correlation group through the
+# production fold; the bounded prior term 0.2 * strength is active inside
+# the clamped production formula. Pure float arithmetic, no map scaffold.
+[harness.i8_t68_acceptance_p1_nonempty_ledger]
+description = "P1 probability clamp with the bounded prior term active (symbolic single-group strength)"
+unwind = 16
+seeded_groups = 1
+seeded_reliability_range = "0.0..=1.0"
+trust_suspicion_fear_range = "-1.0..=1.0"
+assertiveness_confidence_range = "0.0..=1.0"
+probability_range = "0.05..=0.97"
+nan_excluded = true
+
+# T6.8 P3/P4 - k <= 5 retellings in one correlation group; per-item
+# reliability 0.05..=1.0; two-group contradiction check.
+# T6.8 P3/P4 - the numeric fold core (group_weight/aggregate_from_groups):
+# symbolic k in 1..=5 distinct chains restores "for any k"; pure float
+# arithmetic + a 1-2 element slice, no maps.
+[harness.i8_t68_corroboration_p3_p4]
+description = "P3 per-group weight cap max_reliability+0.24 for any k<=5 (symbolic) + one-group fold bound; P4 contradicted iff both polarities >= 0.25"
+unwind = 16
+distinct_chains_k = "1..=5 (symbolic)"
+reliability_range = "0.05..=1.0"
+scaffold = "pure production fold over group data (no ledger scaffold)"
+nan_excluded = true

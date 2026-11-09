@@ -12,15 +12,18 @@ pub mod pathfind;
 
 use rpg_domain::action::{
     Action, ActionProposal, InvestigateTarget, Loudness, ProposalSource, QuestPredicate,
-    RejectReason, ValidationOutcome,
+    RejectReason, SanctionKind, ValidationOutcome,
 };
+use rpg_domain::behavior_types::{ActionOutcome, CausalTrace, Effect, GoalChange};
+use rpg_domain::deal::{self as deal_fsm, Deal, DealEvent, Party, ViolationReason};
 use rpg_domain::events::{EventKind, EventLog};
 use rpg_domain::geom::Vec2;
 use rpg_domain::ids::*;
 use rpg_domain::rng::DeterministicRng;
 use rpg_domain::social::{CommitmentKind, Offer, OfferState};
 use rpg_domain::world::{
-    evaluate_predicate, Actor, ActorKind, ContainerKind, LocationKind, Sensitivity, World,
+    evaluate_predicate, Actor, ActorKind, ContainerKind, ItemStack as Stack, LocationKind,
+    Sensitivity, World,
 };
 use rpg_narrative::{self as narrative, Decision, NarrativeChange};
 use rpg_perception::PerceptionEngine;
@@ -29,6 +32,63 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::autonomy::GoalAutonomy;
+
+use rpg_behavior::{AppraisedEvent, DecayRates, DecisionRecord, ReplanSignal, ReplanTrigger};
+use rpg_domain::emotions::{EmotionResponse, EmotionsConfig};
+use rpg_domain::needs::{NeedCrossing, NeedKind, NeedsConfig, ThresholdDirection};
+
+/// The need a goal kind maps onto for urgency (design §3 `N` → goal
+/// urgency; T3.8). Goal kinds without a needs analog map to nothing.
+fn goal_kind_need(kind: rpg_domain::world::GoalKind) -> Option<NeedKind> {
+    use rpg_domain::needs::NeedKind as N;
+    use rpg_domain::world::GoalKind as G;
+    match kind {
+        G::Survival => Some(N::Health),
+        G::Wealth => Some(N::Wealth),
+        G::Safety | G::Protect => Some(N::Safety),
+        G::Affection => Some(N::Belonging),
+        G::Status => Some(N::Status),
+        G::Duty | G::Ideology | G::Ambition | G::Revenge | G::Investigate | G::Conceal => None,
+    }
+}
+
+/// Why the pure money-transfer arithmetic rejected a movement (I-8/T6.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoneyTransferOverflow {
+    /// The debit `from_money - amount` does not fit in `i64`.
+    Debit,
+    /// The credit `to_money + amount` does not fit in `i64`.
+    Credit,
+}
+
+/// The pure, total money-transfer arithmetic kernel: the single source of
+/// truth for every conserved money movement in the simulation. Production
+/// callers route through [`Simulation::transfer_money`] and
+/// [`Simulation::do_pay`] (the shared lowering behind payments, deal
+/// settlement and sanction fines), which call this function; the Kani
+/// harness `i8_t61_money_transfer_conservation` (`crates/proof-kernels`)
+/// proves conservation and overflow-rejection over the full `i64` input
+/// space directly against this symbol.
+///
+/// Overflow is *rejected*, not wrapped: every production caller validates
+/// custody before dispatch (`validate` checks `amount > 0` and
+/// `from.money >= amount`), so `Err` is unreachable in validated flows and
+/// behavior is preserved (previously the unchecked arithmetic would wrap in
+/// release / panic in debug on inputs no validated caller can produce; see
+/// `crates/proof-kernels/AUDIT.md` for the audited call sites).
+pub fn split_money_transfer(
+    from_money: i64,
+    to_money: i64,
+    amount: i64,
+) -> Result<(i64, i64), MoneyTransferOverflow> {
+    let debited = from_money
+        .checked_sub(amount)
+        .ok_or(MoneyTransferOverflow::Debit)?;
+    let credited = to_money
+        .checked_add(amount)
+        .ok_or(MoneyTransferOverflow::Credit)?;
+    Ok((debited, credited))
+}
 
 /// Tunable, scenario-fixed simulation parameters.
 #[derive(Clone, Debug)]
@@ -52,6 +112,75 @@ pub struct SimConfig {
     pub goal_cooldown_ticks: u32,
     /// Minimum minutes between ambient incident rolls.
     pub incident_interval_minutes: u32,
+    /// Grace window (simulated minutes) after a crossed deal deadline before
+    /// the deal is violated (plan §4.5 renegotiation window).
+    pub deal_grace_minutes: u64,
+    /// Needs state tuning (design §3 `N`, plan I-4a): per-need decay,
+    /// satiation thresholds, urgency thresholds with hysteresis.
+    pub needs: NeedsConfig,
+    /// Emotions state tuning (design §3 `E`, plan I-4b): per-emotion decay,
+    /// base sensitivities, response thresholds.
+    pub emotions: EmotionsConfig,
+    /// Directed contextual relationship decay rates + appraisal-memory
+    /// salience decay (design §3.2, plan I-4).
+    pub relationship_decay: DecayRates,
+    /// Salience lost per tick by an appraisal memory (0 keeps memories).
+    pub rel_memory_salience_decay: f32,
+    /// Bounded event-driven planning/activation (design §4.3, §8; plan I-6
+    /// I6a): fair deterministic activation with explicit work caps.
+    pub activation: ActivationConfig,
+    /// Seeded softmax sampling of utility-ranked decisions (design §4.2,
+    /// T2.9b): wired into the recorded production decision stream. The sim's
+    /// persistent RNG stream makes choices replayable; save/load preserves
+    /// the stream.
+    pub utility_sampling: UtilitySamplingConfig,
+}
+
+/// Configuration for bounded event-driven planning/activation (plan I-6,
+/// I6a; design §8 budgeted processing, §9.2.4 budget boundedness).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ActivationConfig {
+    /// Master switch for the planner pass.
+    pub enabled: bool,
+    /// Maximum NPCs activated per step (the budget; hard cap, M6/T4.4).
+    pub max_activations_per_tick: usize,
+    /// Maximum planner candidates considered per activation (per-activation
+    /// work cap; hard cap).
+    pub max_candidates_per_activation: usize,
+    /// Maximum queued reconsideration signals per actor (bounded memory).
+    pub max_signals_per_actor: usize,
+    /// Ticks after an abandonment during which the same option is not
+    /// re-adopted (hysteresis against abandonment loops).
+    pub abandon_cooldown_ticks: u64,
+}
+
+impl Default for ActivationConfig {
+    fn default() -> Self {
+        ActivationConfig {
+            enabled: true,
+            max_activations_per_tick: 1,
+            max_candidates_per_activation: 8,
+            max_signals_per_actor: 8,
+            abandon_cooldown_ticks: 20,
+        }
+    }
+}
+
+/// Seeded softmax sampling configuration (design §4.2, T2.9b).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct UtilitySamplingConfig {
+    pub enabled: bool,
+    /// Softmax temperature τ_i for sampled choices.
+    pub tau: f32,
+}
+
+impl Default for UtilitySamplingConfig {
+    fn default() -> Self {
+        UtilitySamplingConfig {
+            enabled: true,
+            tau: 0.2,
+        }
+    }
 }
 
 impl Default for SimConfig {
@@ -66,6 +195,13 @@ impl Default for SimConfig {
             goal_pursuit_margin_ticks: 10,
             goal_cooldown_ticks: 60,
             incident_interval_minutes: 60,
+            deal_grace_minutes: 30,
+            needs: NeedsConfig::default(),
+            emotions: EmotionsConfig::default(),
+            relationship_decay: DecayRates::default(),
+            rel_memory_salience_decay: 0.002,
+            activation: ActivationConfig::default(),
+            utility_sampling: UtilitySamplingConfig::default(),
         }
     }
 }
@@ -81,6 +217,56 @@ pub struct StepReport {
     pub placed_clues: Vec<FactId>,
     pub background_incidents: Vec<String>,
     pub director_notes: Vec<String>,
+    /// Emotion response classes currently gated by threshold crossings
+    /// (design §11 Phase 3: flee/retaliate/comfort/reconcile are *gated*,
+    /// not hardcoded; the I-6 planner consumes these).
+    pub gated_responses: Vec<(ActorId, EmotionResponse)>,
+}
+
+/// Hard per-call bound of [`Simulation::catch_up`] (documented, T4.6): a
+/// longer offscreen skip is truncated and continued with further calls, so
+/// no single call can exceed this many ticks of world time.
+pub const CATCH_UP_MAX_TICKS: u32 = 720;
+
+/// Summary of one bounded offscreen catch-up (plan I-6 I6b item 2). The
+/// counts are the aggregate of the real production steps the catch-up ran —
+/// never derived separately.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CatchUpReport {
+    /// Simulation ticks actually advanced.
+    pub ticks: u32,
+    /// True when the requested skip exceeded [`CATCH_UP_MAX_TICKS`] and was
+    /// truncated (continue with further calls).
+    pub truncated: bool,
+    pub accepted: u64,
+    pub pending: u64,
+    pub rejected: u64,
+    /// Commitments satisfied while offscreen (the deal/commitment deadline
+    /// pathway — debts are causally exact).
+    pub deals_due: u64,
+    /// Seeded background incidents that occurred while offscreen.
+    pub incidents: u64,
+}
+
+/// One planner activation of the most recent pass (observability for the
+/// budget/work caps; rebuilt identically by replay, never persisted).
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlannerActivation {
+    pub actor: ActorId,
+    /// Pending signals consumed by this activation.
+    pub signals: usize,
+    /// Work spent: candidates generated and considered (≤ the configured
+    /// per-activation cap).
+    pub work: usize,
+    /// Whether this activation re-deliberated (vs. the cheap fast path).
+    pub replanned: bool,
+}
+
+/// One step's planner-pass record (the activation list, in activation
+/// order). Cleared at the start of each pass.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PlannerPassRecord {
+    pub activations: Vec<PlannerActivation>,
 }
 
 /// A pending private conversation: both actors are walking to `location`.
@@ -101,6 +287,32 @@ pub struct SimTransient {
     /// Transient autonomy state, persisted for exact continuation.
     #[serde(default)]
     pub autonomy: GoalAutonomy,
+    /// Adopted deal-response intentions (design §3 `J`): mind-local,
+    /// persisted for exact continuation (an adopted intention survives
+    /// save/load like the rest of the step pipeline state).
+    #[serde(default)]
+    pub deal_intentions: BTreeMap<ActorId, rpg_behavior::Intention>,
+    /// Bounded event-driven planner state (design §4.3, §8; plan I-6 I6a):
+    /// persistent plans, bounded signals and the fair-activation rotation,
+    /// persisted for exact continuation (old saves load with the default).
+    #[serde(default)]
+    pub planner: rpg_behavior::PlannerState,
+    /// Formal punitive-sanction identity ledger (plan I-6 I6a): the
+    /// (evidence fact × subject) incidents already punished. One incident is
+    /// punishable exactly once — retold evidence about the same incident
+    /// never permits repeat punishment, while a genuinely new incident (a
+    /// new fact) is a new identity and stays actionable. Persisted so a
+    /// save/load cycle cannot forget who was already punished (old saves
+    /// load with an empty ledger).
+    #[serde(default)]
+    pub sanctions: BTreeSet<(FactId, ActorId)>,
+    /// Bounded institutional attention (design §6.4): the tick until which a
+    /// (faction, location) pair may not spawn another member-report repair
+    /// initiative. Keys are "faction|location" (JSON-safe, like the world
+    /// ledger). Persisted so a save/load cycle cannot re-open a cooling
+    /// initiative (old saves load with an empty map).
+    #[serde(default)]
+    pub faction_repair_cooldown: BTreeMap<String, u64>,
 }
 
 /// A recorded public entry point, used for input/proposal replay.
@@ -135,8 +347,34 @@ pub struct Simulation {
     pub pending_private: Vec<PendingPrivate>,
     /// Transient goal-autonomy state.
     pub autonomy: GoalAutonomy,
+    /// Adopted deal-response intentions (design §3 `J`).
+    pub deal_intentions: BTreeMap<ActorId, rpg_behavior::Intention>,
+    /// Bounded event-driven planner state (design §4.3, §8; plan I-6 I6a):
+    /// persistent plans, bounded reconsideration signals and the fair
+    /// activation rotation. Mind-local; persisted for exact continuation.
+    pub planner: rpg_behavior::PlannerState,
     /// When false, `apply`/`step` do not append to `ops` (used during replay).
     pub recording: bool,
+    /// Typed `ActionOutcome` records for every validated proposal
+    /// (instrumentation; rebuilt identically by replay, not persisted).
+    pub outcomes: Vec<ActionOutcome>,
+    /// Inspectable causal traces ("did X because of goal Y, belief Z,
+    /// observed event E, cost C") — one per validated proposal.
+    pub causal_traces: Vec<CausalTrace>,
+    /// Scratch buffer for the primitive effects produced by the dispatch
+    /// handler currently running. Drained into the `ActionOutcome`.
+    effects_buf: Vec<Effect>,
+    /// Decision records awaiting their trace (set when a production decision
+    /// is sampled; popped by `build_trace` for that actor's proposal).
+    /// Rebuilt identically by replay, never persisted.
+    pending_decisions: BTreeMap<ActorId, DecisionRecord>,
+    /// The most recent planner pass (observability of the budget/work caps;
+    /// rebuilt identically by replay, never persisted).
+    last_planner_pass: PlannerPassRecord,
+    /// Formal punitive-sanction identity ledger (see `SimTransient::sanctions`).
+    pub sanctions: BTreeSet<(FactId, ActorId)>,
+    /// Faction repair-initiative cooldowns (see `SimTransient::faction_repair_cooldown`).
+    faction_repair_cooldown: BTreeMap<String, u64>,
 }
 
 impl Simulation {
@@ -155,7 +393,16 @@ impl Simulation {
             ops: Vec::new(),
             pending_private: Vec::new(),
             autonomy: GoalAutonomy::default(),
+            deal_intentions: BTreeMap::new(),
+            planner: rpg_behavior::PlannerState::default(),
+            sanctions: BTreeSet::new(),
+            faction_repair_cooldown: BTreeMap::new(),
             recording: true,
+            outcomes: Vec::new(),
+            causal_traces: Vec::new(),
+            effects_buf: Vec::new(),
+            pending_decisions: BTreeMap::new(),
+            last_planner_pass: PlannerPassRecord::default(),
         }
     }
 
@@ -194,7 +441,16 @@ impl Simulation {
             ops,
             pending_private: transient.pending_private,
             autonomy: transient.autonomy,
+            deal_intentions: transient.deal_intentions,
+            planner: transient.planner,
+            sanctions: transient.sanctions,
+            faction_repair_cooldown: transient.faction_repair_cooldown,
             recording: true,
+            outcomes: Vec::new(),
+            causal_traces: Vec::new(),
+            effects_buf: Vec::new(),
+            pending_decisions: BTreeMap::new(),
+            last_planner_pass: PlannerPassRecord::default(),
         }
     }
 
@@ -205,7 +461,17 @@ impl Simulation {
             pending_private: self.pending_private.clone(),
             last_incident_minute: self.last_incident_minute,
             autonomy: self.autonomy.clone(),
+            deal_intentions: self.deal_intentions.clone(),
+            planner: self.planner.clone(),
+            sanctions: self.sanctions.clone(),
+            faction_repair_cooldown: self.faction_repair_cooldown.clone(),
         }
+    }
+
+    /// The most recent planner pass (budget/work observability; rebuilt
+    /// identically by replay, never persisted).
+    pub fn last_planner_pass(&self) -> &PlannerPassRecord {
+        &self.last_planner_pass
     }
 
     /// Re-run a recorded entry-point log from the initial world. This is an
@@ -327,6 +593,175 @@ impl Simulation {
                     return Err(RejectReason::Invalid("not your commitment".into()));
                 }
             }
+            Action::ProposeDeal {
+                target,
+                condition,
+                performance,
+                give,
+                money,
+                ..
+            } => {
+                in_range(target)?;
+                // A contract is an agreement between two distinct parties
+                // (design §5.2: proposal, acceptance, consideration between
+                // debtor and creditor). A self-deal has no counterparty and
+                // no real exchange — reject it outright.
+                if *target == proposal.actor {
+                    return Err(RejectReason::Invalid(
+                        "a deal requires two distinct parties".into(),
+                    ));
+                }
+                self.validate_predicate_refs(condition)?;
+                self.validate_predicate_refs(performance)?;
+                for stack in give {
+                    if !self.world.items.contains_key(&stack.item) {
+                        return Err(RejectReason::UnknownItem(stack.item.clone()));
+                    }
+                }
+                // Consideration custody is validated at acceptance/settlement
+                // time (plan §4.2: the debtor commits only resources it
+                // controls; there is no v1 lock), but negative money would
+                // *mint* value, so it is structurally rejected now.
+                if *money < 0 {
+                    return Err(RejectReason::Invalid(
+                        "deal consideration cannot be negative".into(),
+                    ));
+                }
+            }
+            Action::AcceptDeal { deal } => {
+                let Some(d) = self.world.deals.get(deal) else {
+                    return Err(RejectReason::UnknownDeal(*deal));
+                };
+                if d.state != rpg_domain::deal::DealState::Proposed {
+                    return Err(RejectReason::Invalid("deal is not proposed".into()));
+                }
+                if d.creditor != proposal.actor {
+                    return Err(RejectReason::Invalid(
+                        "only the creditor may accept a deal".into(),
+                    ));
+                }
+                // Escrow (§4.2): validate the *whole* consideration bundle
+                // before anything mutates — every component or nothing.
+                // Quantities aggregate per item across duplicate stacks with
+                // checked arithmetic, so a bundle like [{X,10},{X,10}] held
+                // against 10 is rejected here instead of silently
+                // under-delivering at dispatch.
+                let Some(debtor) = self.world.actor(&d.debtor) else {
+                    return Err(RejectReason::UnknownActor(d.debtor.clone()));
+                };
+                let mut need: BTreeMap<&ItemId, u32> = BTreeMap::new();
+                for stack in &d.give {
+                    if !self.world.items.contains_key(&stack.item) {
+                        return Err(RejectReason::UnknownItem(stack.item.clone()));
+                    }
+                    let total = need.entry(&stack.item).or_insert(0);
+                    *total = total.checked_add(stack.qty).ok_or_else(|| {
+                        RejectReason::Invalid(format!(
+                            "consideration bundle overflows for item {}",
+                            stack.item.as_str()
+                        ))
+                    })?;
+                }
+                for (item, qty) in &need {
+                    if debtor.inventory.quantity(item) < *qty {
+                        return Err(RejectReason::InsufficientItems((*item).clone()));
+                    }
+                }
+                if d.money > 0 && debtor.inventory.money < d.money {
+                    return Err(RejectReason::InsufficientFunds);
+                }
+            }
+            Action::RejectDeal { deal } => {
+                let Some(d) = self.world.deals.get(deal) else {
+                    return Err(RejectReason::UnknownDeal(*deal));
+                };
+                if d.state != rpg_domain::deal::DealState::Proposed {
+                    return Err(RejectReason::Invalid("deal is not proposed".into()));
+                }
+                if d.creditor != proposal.actor {
+                    return Err(RejectReason::Invalid(
+                        "only the creditor may reject a deal".into(),
+                    ));
+                }
+            }
+            Action::CancelDeal { deal } => {
+                let Some(d) = self.world.deals.get(deal) else {
+                    return Err(RejectReason::UnknownDeal(*deal));
+                };
+                if proposal.actor != d.debtor && proposal.actor != d.creditor {
+                    return Err(RejectReason::Invalid(
+                        "only a deal party may cancel it".into(),
+                    ));
+                }
+            }
+            Action::SettleDeal {
+                deal,
+                deliver,
+                money,
+            } => {
+                let Some(d) = self.world.deals.get(deal) else {
+                    return Err(RejectReason::UnknownDeal(*deal));
+                };
+                if d.state != rpg_domain::deal::DealState::PerformanceDue {
+                    return Err(RejectReason::Invalid(
+                        "deal is not due for performance".into(),
+                    ));
+                }
+                if d.debtor != proposal.actor {
+                    return Err(RejectReason::Invalid("only the debtor may settle".into()));
+                }
+                if *money < 0 {
+                    return Err(RejectReason::Invalid(
+                        "settlement cannot be negative".into(),
+                    ));
+                }
+                // Escrow (§4.2): the settlement bundle is one validated
+                // proposal. Custody for every component is checked here —
+                // aggregated per item across duplicate stacks with checked
+                // arithmetic — so dispatch either performs every transfer or
+                // — on any validation failure — mutates nothing.
+                let mut need: BTreeMap<&ItemId, u32> = BTreeMap::new();
+                for stack in deliver {
+                    if !self.world.items.contains_key(&stack.item) {
+                        return Err(RejectReason::UnknownItem(stack.item.clone()));
+                    }
+                    let total = need.entry(&stack.item).or_insert(0);
+                    *total = total.checked_add(stack.qty).ok_or_else(|| {
+                        RejectReason::Invalid(format!(
+                            "settlement bundle overflows for item {}",
+                            stack.item.as_str()
+                        ))
+                    })?;
+                }
+                for (item, qty) in &need {
+                    if actor.inventory.quantity(item) < *qty {
+                        return Err(RejectReason::InsufficientItems((*item).clone()));
+                    }
+                }
+                if actor.inventory.money < *money {
+                    return Err(RejectReason::InsufficientFunds);
+                }
+            }
+            Action::RenegotiateDeal { deal, .. } => {
+                let Some(d) = self.world.deals.get(deal) else {
+                    return Err(RejectReason::UnknownDeal(*deal));
+                };
+                if d.state != rpg_domain::deal::DealState::PerformanceDue {
+                    return Err(RejectReason::Invalid(
+                        "only a due deal can be renegotiated".into(),
+                    ));
+                }
+                if d.creditor != proposal.actor {
+                    return Err(RejectReason::Invalid(
+                        "renegotiation requires creditor consent".into(),
+                    ));
+                }
+                if !d.can_renegotiate() {
+                    return Err(RejectReason::Invalid(
+                        "the single renegotiation cycle is spent".into(),
+                    ));
+                }
+            }
             Action::TransferItem { target, item, qty } => {
                 in_range(target)?;
                 if actor.inventory.quantity(item) < *qty {
@@ -335,17 +770,139 @@ impl Simulation {
             }
             Action::Pay { target, amount } => {
                 in_range(target)?;
+                // Paying oneself is not an action: money would not move and
+                // the "transfer" must not fake a wealth-need gain — reject
+                // the nonsensical act neutrally before any state can change.
+                if *target == proposal.actor {
+                    return Err(RejectReason::Invalid(
+                        "paying oneself is not a transfer".into(),
+                    ));
+                }
+                // Payment must be a real transfer: zero or negative amounts
+                // would move nothing (or mint money) — reject before any
+                // mutation.
+                if *amount <= 0 {
+                    return Err(RejectReason::Invalid("pay amount must be positive".into()));
+                }
                 if actor.inventory.money < *amount {
                     return Err(RejectReason::InsufficientFunds);
                 }
             }
-            Action::ShareClaim { target, fact, .. } => {
+            Action::ShareClaim {
+                target,
+                fact,
+                deceptive,
+                ..
+            } => {
                 in_range(target)?;
-                self.validate_disclosure(actor, fact)?;
+                self.validate_disclosure_knowledge(actor, fact, *deceptive)?;
+                self.validate_disclosure_permission(actor, fact)?;
             }
             Action::WarnContact { target, fact } => {
                 in_range(target)?;
-                self.validate_disclosure(actor, fact)?;
+                self.validate_disclosure_knowledge(actor, fact, false)?;
+                self.validate_disclosure_permission(actor, fact)?;
+            }
+            Action::Query { target, about } => {
+                in_range(target)?;
+                if !self.world.facts.contains_key(about) {
+                    return Err(RejectReason::UnknownFact(about.clone()));
+                }
+            }
+            Action::Sanction {
+                target,
+                kind,
+                evidence,
+            } => {
+                in_range(target)?;
+                // A sanction is never self-directed: punishing (or
+                // commending) oneself moves nothing and means nothing —
+                // reject the nonsensical act neutrally before any state
+                // can change.
+                if *target == proposal.actor {
+                    return Err(RejectReason::Invalid(
+                        "a sanction cannot target its own authority".into(),
+                    ));
+                }
+                // AUTHORITY: a sanction is an institutional act; the proposer
+                // must actually hold institutional authority (capability or
+                // the canonical authority flag). Without it the act is
+                // *not permitted* — distinct from not possible.
+                if !actor.capabilities.can_arrest && !actor.has_flag("authority") {
+                    return Err(RejectReason::NoCapability("impose sanctions".into()));
+                }
+                // EVIDENCE: the authority must itself hold (know of) every
+                // cited fact — provenance-bound grounds, not bare assertion.
+                if evidence.is_empty() {
+                    return Err(RejectReason::Invalid(
+                        "a sanction requires cited evidence".into(),
+                    ));
+                }
+                for fact in evidence {
+                    if !self.world.facts.contains_key(fact) {
+                        return Err(RejectReason::UnknownFact(fact.clone()));
+                    }
+                    if !rpg_behavior::knows_of(&self.world, &actor.id, fact) {
+                        return Err(RejectReason::LacksKnowledge(fact.clone()));
+                    }
+                }
+                // COST: a fine is a real transfer; it must be payable (a
+                // fine the subject cannot pay would mint or clamp money).
+                if let SanctionKind::Fine { amount } = kind {
+                    if *amount <= 0 {
+                        return Err(RejectReason::Invalid("fine amount must be positive".into()));
+                    }
+                    let target_actor = self.world.actor(target).expect("checked in_range");
+                    if target_actor.inventory.money < *amount {
+                        return Err(RejectReason::InsufficientFunds);
+                    }
+                }
+                // IDENTITY (plan I-6 I6a): one incident — (evidence fact ×
+                // subject) — is formally punishable exactly once, by any
+                // authority, no matter how often the evidence is retold.
+                // Repeat punishment is rejected neutrally (no fine, no
+                // appraisal); a genuinely distinct incident cites a
+                // different fact and remains actionable. Praise is
+                // commendation, not punishment, and sits outside the
+                // identity ledger.
+                if !matches!(kind, SanctionKind::Praise) {
+                    for fact in evidence {
+                        if self.sanctions.contains(&(fact.clone(), target.clone())) {
+                            return Err(RejectReason::Invalid(format!(
+                                "{target} has already been formally sanctioned over {fact}"
+                            )));
+                        }
+                    }
+                }
+            }
+            Action::ExcuseDeal { deal, evidence } => {
+                let Some(d) = self.world.deals.get(deal) else {
+                    return Err(RejectReason::UnknownDeal(*deal));
+                };
+                // Authority/institution evidence excuses a due deal (plan
+                // §4.4); every other state is an illegal FSM arrow.
+                if d.state != rpg_domain::deal::DealState::PerformanceDue {
+                    return Err(RejectReason::Invalid(format!(
+                        "only a due deal can be excused (state: {})",
+                        d.state.name()
+                    )));
+                }
+                if !actor.capabilities.can_arrest && !actor.has_flag("authority") {
+                    return Err(RejectReason::NoCapability("excuse contracts".into()));
+                }
+                if evidence.is_empty() {
+                    return Err(RejectReason::Invalid(
+                        "an excuse requires cited authority evidence".into(),
+                    ));
+                }
+                for fact in evidence {
+                    if !self.world.facts.contains_key(fact) {
+                        return Err(RejectReason::UnknownFact(fact.clone()));
+                    }
+                    if !rpg_behavior::knows_of(&self.world, &actor.id, fact) {
+                        return Err(RejectReason::LacksKnowledge(fact.clone()));
+                    }
+                }
             }
             Action::SpreadRumor { .. } => {}
             Action::Investigate { target } => match target {
@@ -438,26 +995,43 @@ impl Simulation {
         Ok(())
     }
 
-    /// A fact may only be disclosed if the actor believes it *and* is
-    /// canonically authorised to share it.
-    ///
-    /// Knowledge is not permission. A character who merely overheard a secret
-    /// must not be able to blab it in ordinary dialogue. The canonical
-    /// authorisation tiers are:
-    ///
-    /// * `Public` / `Restricted` — freely shareable by any believer.
-    /// * `Private` / `Secret` — only canonical holders (the actors named in
-    ///   `eligible_holders`) may disclose. An empty holder list places no
-    ///   canonical restriction on the fact.
-    /// * `InnerCircle` — holders must additionally carry the `inner_circle`
-    ///   flag, so an outsider who learned the secret cannot spread it.
-    fn validate_disclosure(&self, actor: &Actor, fact: &FactId) -> Result<(), RejectReason> {
+    /// The knowledge half of disclosure validation (plan I-5, G1): the
+    /// truthful path requires the speaker to *believe* the fact; a
+    /// `deceptive` (intentional lie) proposal instead requires the speaker to
+    /// *know of* the proposition — authored belief of either polarity or
+    /// ledger evidence — because a lie is exactly an assertion contrary to
+    /// the speaker's own belief. World truth is never consulted here.
+    fn validate_disclosure_knowledge(
+        &self,
+        actor: &Actor,
+        fact: &FactId,
+        deceptive: bool,
+    ) -> Result<(), RejectReason> {
+        if self.world.fact(fact).is_none() {
+            return Err(RejectReason::UnknownFact(fact.clone()));
+        }
+        let knows = if deceptive {
+            rpg_behavior::knows_of(&self.world, &actor.id, fact)
+        } else {
+            self.world.believes(&actor.id, fact)
+        };
+        if !knows {
+            return Err(RejectReason::LacksKnowledge(fact.clone()));
+        }
+        Ok(())
+    }
+
+    /// The permission half of disclosure validation: knowledge is not
+    /// permission (design §9.1.2), and a deceptive assertion does not relax
+    /// it — lying about a secret is still a disclosure of the secret.
+    fn validate_disclosure_permission(
+        &self,
+        actor: &Actor,
+        fact: &FactId,
+    ) -> Result<(), RejectReason> {
         let Some(f) = self.world.fact(fact) else {
             return Err(RejectReason::UnknownFact(fact.clone()));
         };
-        if !self.world.believes(&actor.id, fact) {
-            return Err(RejectReason::LacksKnowledge(fact.clone()));
-        }
         let holder = f.eligible_holders.is_empty() || f.eligible_holders.contains(&actor.id);
         let authorized = match f.sensitivity {
             Sensitivity::Public | Sensitivity::Restricted => true,
@@ -482,15 +1056,155 @@ impl Simulation {
     }
 
     fn apply_impl(&mut self, proposal: &ActionProposal) -> ValidationOutcome {
+        self.effects_buf.clear();
+        let action_kind = proposal.action.kind_name().to_string();
         if let Err(reason) = self.validate(proposal) {
+            // Rejection mutates nothing: no effects, no new world state.
+            let trace = self.build_trace(proposal, &[], Some(&reason), self.events.next_id().raw());
+            let outcome = rpg_domain::behavior_types::rejected_outcome(
+                proposal.actor.clone(),
+                &action_kind,
+                reason.clone(),
+                trace.clone(),
+            );
+            self.outcomes.push(outcome);
+            self.causal_traces.push(trace);
             self.reject(proposal, &reason);
             return ValidationOutcome::Rejected(reason);
         }
+        let first_event = self.events.next_id().raw();
         let outcome = self.dispatch(proposal);
         if let ValidationOutcome::Rejected(reason) = &outcome {
             self.reject(proposal, reason);
         }
+        // Event-sourced mutation record: every event the handler emitted,
+        // every primitive effect it produced, one causal trace. A rejection
+        // mutates nothing, so its outcome carries no effects by construction.
+        let last_event = self.events.next_id().raw();
+        let events: Vec<rpg_domain::ids::EventId> = (first_event..last_event)
+            .map(rpg_domain::ids::EventId)
+            .collect();
+        let effects = if matches!(outcome, ValidationOutcome::Rejected(_)) {
+            self.effects_buf.clear();
+            Vec::new()
+        } else {
+            std::mem::take(&mut self.effects_buf)
+        };
+        let trace = self.build_trace(proposal, &effects, None, first_event);
+        self.outcomes.push(ActionOutcome {
+            actor: proposal.actor.clone(),
+            action_kind: action_kind.clone(),
+            validation: outcome.clone(),
+            effects: effects.clone(),
+            events: events.clone(),
+            trace: trace.clone(),
+        });
+        self.causal_traces.push(trace);
         outcome
+    }
+
+    /// Build an inspectable causal trace for one validated proposal:
+    /// *NPC did X because of goal Y, belief Z, observed event E, and cost C.*
+    ///
+    /// The trace is instrumentation, so it may only cite real causes:
+    /// `up_to` bounds the event log to what existed *before* this proposal
+    /// was dispatched, and observations must have been directly perceived by
+    /// the actor. When there is no genuine cause to cite for a field, the
+    /// field stays empty — empty is preferable to false causality.
+    fn build_trace(
+        &mut self,
+        proposal: &ActionProposal,
+        effects: &[Effect],
+        rejected: Option<&RejectReason>,
+        up_to: u64,
+    ) -> CausalTrace {
+        let action_kind = proposal.action.kind_name().to_string();
+        let actor = self.world.actor(&proposal.actor);
+
+        // Goals: active goals of the actor, highest priority first.
+        let mut because_goals: Vec<String> = actor
+            .map(|a| {
+                let mut goals: Vec<&rpg_domain::world::Goal> = a
+                    .goals
+                    .iter()
+                    .filter(|g| g.status == rpg_domain::world::GoalStatus::Active)
+                    .collect();
+                goals.sort_by(|x, y| {
+                    y.priority
+                        .partial_cmp(&x.priority)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                goals
+                    .iter()
+                    .take(2)
+                    .map(|g| g.description.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Beliefs: only the facts this action is actually about, as held by
+        // the actor. An unrelated most-recent belief is never substituted.
+        let mut because_beliefs: Vec<FactId> = action_facts(&proposal.action)
+            .into_iter()
+            .filter(|f| actor.map(|a| a.beliefs.contains_key(f)).unwrap_or(false))
+            .collect();
+        because_beliefs.sort();
+        because_beliefs.dedup();
+
+        // Observations: recent events the actor *directly perceived* before
+        // this proposal was dispatched. Self-caused-but-unobserved events and
+        // the proposal's own events are not causes of the decision.
+        let because_observations: Vec<EventId> = self
+            .events
+            .all()
+            .iter()
+            .rev()
+            .filter(|e| e.id.raw() < up_to && e.observed_by.iter().any(|a| a == &proposal.actor))
+            .take(3)
+            .map(|e| e.id)
+            .collect();
+
+        // Costs: resource costs actually carried by the effects. Nothing is
+        // invented — when an action carried no resource cost, the list stays
+        // empty.
+        let mut costs: Vec<String> = Vec::new();
+        for e in effects {
+            match e {
+                Effect::Transfer {
+                    item: Some(item),
+                    qty,
+                    ..
+                } => costs.push(format!("{qty}x{}", item.as_str())),
+                Effect::Transfer {
+                    item: None, qty, ..
+                } => costs.push(format!("{qty} coins")),
+                Effect::Transform { consumed, .. } if *consumed > 0 => {
+                    costs.push(format!("{consumed} consumed"))
+                }
+                _ => {}
+            }
+        }
+        if let Some(reason) = rejected {
+            costs.clear();
+            costs.push(format!("rejected: {}", reason.message()));
+            because_goals.clear();
+        }
+
+        // The recorded production decision (seeded utility selection), when
+        // this proposal came from a sampled decision path. Popped by its
+        // actor so exactly one trace carries it.
+        let decision = self.pending_decisions.remove(&proposal.actor);
+
+        CausalTrace {
+            actor: proposal.actor.clone(),
+            action_kind,
+            because_goals,
+            because_beliefs,
+            because_observations,
+            costs,
+            effects: effects.to_vec(),
+            decision,
+        }
     }
 
     fn reject(&mut self, proposal: &ActionProposal, reason: &RejectReason) {
@@ -512,6 +1226,39 @@ impl Simulation {
             proposal.action.kind_name(),
             reason.message()
         ));
+        // T2.1 abandonment accounting (design §9.2.1): a *rejected attempt*
+        // of an adopted deal intention feeds its failure count exactly once
+        // per attempt. Proposal generation is not an attempt — only
+        // dispatches that actually reach this rejection hook count, and only
+        // when the rejected action is the adopted option's own action (so
+        // unrelated rejections never accumulate).
+        if let Some(intent) = self.deal_intentions.get(&proposal.actor).cloned() {
+            let attempted = rpg_agents::deal_response_options(
+                &self.world,
+                &proposal.actor,
+                None,
+                None,
+                &self.config.needs,
+            )
+            .and_then(|opts| rpg_agents::deal_response_action(&self.world, &opts, &intent.option))
+            .is_some_and(|action| action == proposal.action);
+            if attempted {
+                if let Some(intent) = self.deal_intentions.get_mut(&proposal.actor) {
+                    intent.record_failure();
+                }
+            }
+        }
+        // Planner-plan abandonment accounting (same discipline): a rejected
+        // dispatch of the adopted plan's own step feeds its failure count
+        // exactly once; the configured threshold then abandons the plan and
+        // the cooldown suppresses immediate re-adoption (no loop).
+        if let Some(plan) = self.planner.plans.get(&proposal.actor).cloned() {
+            if plan.action == proposal.action {
+                if let Some(plan) = self.planner.plans.get_mut(&proposal.actor) {
+                    plan.intention.record_failure();
+                }
+            }
+        }
     }
 
     fn dispatch(&mut self, proposal: &ActionProposal) -> ValidationOutcome {
@@ -541,6 +1288,51 @@ impl Simulation {
                 deadline,
             } => self.do_promise(proposal, target, terms, predicate, deadline),
             Action::BreakPromise { commitment } => self.do_break_promise(proposal, commitment),
+            Action::ProposeDeal {
+                target,
+                terms,
+                condition,
+                performance,
+                condition_deadline_minute,
+                performance_deadline_minute,
+                give,
+                money,
+                note,
+            } => self.do_propose_deal(
+                proposal,
+                target,
+                terms,
+                condition,
+                performance,
+                condition_deadline_minute,
+                performance_deadline_minute,
+                give,
+                money,
+                note,
+            ),
+            Action::AcceptDeal { deal } => self.do_accept_deal(proposal, deal),
+            Action::RejectDeal { deal } => self.do_reject_deal(proposal, deal),
+            Action::CancelDeal { deal } => self.do_cancel_deal(proposal, deal),
+            Action::SettleDeal {
+                deal,
+                deliver,
+                money,
+            } => self.do_settle_deal(proposal, deal, deliver, money),
+            Action::RenegotiateDeal {
+                deal,
+                new_condition,
+                new_performance,
+                new_condition_deadline_minute,
+                new_performance_deadline_minute,
+            } => self.do_renegotiate_deal(
+                proposal,
+                deal,
+                new_condition,
+                new_performance,
+                new_condition_deadline_minute,
+                new_performance_deadline_minute,
+            ),
+            Action::ExcuseDeal { deal, evidence } => self.do_excuse_deal(proposal, deal, evidence),
             Action::TransferItem { target, item, qty } => {
                 self.do_transfer(proposal, target, item, qty)
             }
@@ -549,7 +1341,15 @@ impl Simulation {
                 target,
                 fact,
                 assertive,
-            } => self.do_share_claim(proposal, target, fact, assertive),
+                deceptive,
+                retold_chain,
+            } => self.do_share_claim(proposal, target, fact, assertive, deceptive, retold_chain),
+            Action::Query { target, about } => self.do_query(proposal, target, about),
+            Action::Sanction {
+                target,
+                kind,
+                evidence,
+            } => self.do_sanction(proposal, target, kind, evidence),
             Action::SpreadRumor { text, about } => self.do_spread_rumor(proposal, text, about),
             Action::Investigate { target } => self.do_investigate(proposal, target),
             Action::ReportCrime {
@@ -560,7 +1360,7 @@ impl Simulation {
                 self.do_hide_evidence(proposal, item, location)
             }
             Action::WarnContact { target, fact } => {
-                self.do_share_claim(proposal, target, fact, true)
+                self.do_share_claim(proposal, target, fact, true, false, None)
             }
             Action::AllocateBudget {
                 faction,
@@ -616,6 +1416,15 @@ impl Simulation {
             observed.push(a.clone());
         }
         // Speaking builds familiarity with everyone who heard it.
+        //
+        // Exposure-maintenance classification (design §3.2 audit): this is
+        // NOT an appraisal of the utterance's social meaning — it is
+        // directed, single-dimension perceptual exposure bookkeeping caused
+        // by the real typed `SpeechEmitted` event (familiarity decays at
+        // rate 0.0: cumulative exposure, not a feeling). Valenced
+        // relationship change stays with the contextual appraisal pathway;
+        // this write is a classified background mutation pending the M1
+        // mutation-audit pass (plan I-6).
         let (tick, minute) = (self.world.tick, self.world.minute_of_day);
         self.events.push(
             tick,
@@ -639,7 +1448,25 @@ impl Simulation {
                 &actor.id,
                 &social::RelationshipDelta::new().familiarity(0.05),
             );
+            // The listener's tie toward the speaker moved — the social
+            // mutation is typed. (Routing never includes the speaker, so
+            // every entry here is a real relationship mutation.)
+            self.effects_buf.push(Effect::ChangeTie {
+                from: listener.clone(),
+                to: actor.id.clone(),
+                summary: "heard the utterance (familiarity)".into(),
+            });
+            // OBSERVE: the utterance was delivered to this listener.
+            self.effects_buf.push(Effect::Observe {
+                observer: listener.clone(),
+                observed: actor.id.as_str().to_string(),
+                channel: rpg_domain::behavior_types::AcquisitionChannel::Overheard,
+                origin_event: None,
+            });
         }
+        self.effects_buf.push(Effect::CreateEvent {
+            summary: format!("speech by {}", actor.id),
+        });
         ValidationOutcome::Accepted
     }
 
@@ -725,6 +1552,17 @@ impl Simulation {
             a: proposal.actor.clone(),
             b: target.clone(),
             location: loc.clone(),
+        });
+        // SCHEDULE the private meeting; the ask itself is a REQUEST.
+        self.effects_buf.push(Effect::Request {
+            from: proposal.actor.clone(),
+            to: target.clone(),
+            demand: "move somewhere private".into(),
+        });
+        self.effects_buf.push(Effect::Schedule {
+            by: proposal.actor.clone(),
+            with: target.clone(),
+            at_minute: self.world.minute_of_day,
         });
         let (tick, minute) = (self.world.tick, self.world.minute_of_day);
         self.events.push(
@@ -823,6 +1661,13 @@ impl Simulation {
         match pathfind::plan_world_path(&self.world.nav, from, dest) {
             Some(path) => {
                 self.paths.insert(actor.clone(), path);
+                // MOVE: the committed path (execution produces ActorMoved
+                // events over the following ticks).
+                self.effects_buf.push(Effect::Move {
+                    actor: actor.clone(),
+                    from,
+                    to: dest,
+                });
                 ValidationOutcome::Accepted
             }
             None => ValidationOutcome::Rejected(RejectReason::Unreachable),
@@ -859,6 +1704,11 @@ impl Simulation {
             },
         );
         let (tick, minute) = (self.world.tick, self.world.minute_of_day);
+        self.effects_buf.push(Effect::Offer {
+            from: proposal.actor.clone(),
+            to: target.clone(),
+            offer: id,
+        });
         self.events.push(
             tick,
             minute,
@@ -866,7 +1716,7 @@ impl Simulation {
             EventKind::OfferCreated {
                 offer: id,
                 from: proposal.actor.clone(),
-                to: target,
+                to: target.clone(),
                 give,
                 want,
                 note,
@@ -874,6 +1724,9 @@ impl Simulation {
             Vec::new(),
             Vec::new(),
         );
+        // A relevant event for the recipient's planner: a pending offer is
+        // a decision it owes (bounded signal, plan I-6 I6a item 1).
+        self.signal(&target, ReplanTrigger::OfferReceived, None);
         ValidationOutcome::Pending {
             offer: Some(id),
             commitment: None,
@@ -932,6 +1785,11 @@ impl Simulation {
             );
             // A conditional deal discloses only once its predicate is met; the
             // promised fact is stored so the NPC can honour it later.
+            self.effects_buf.push(Effect::Commit {
+                commitment: cid,
+                debtor: o.from.clone(),
+                creditor: o.to.clone(),
+            });
             if let Some(fact) = &o.disclose {
                 if let Some(cm) = self.world.commitments.get_mut(&cid) {
                     cm.promised_fact = Some(fact.clone());
@@ -950,10 +1808,19 @@ impl Simulation {
                 fact,
                 true,
             );
+            self.effects_buf.push(Effect::Assert {
+                speaker: o.from.clone(),
+                proposition: fact.clone(),
+                asserted_polarity: true,
+                believed: None,
+            });
         }
         if let Some(of) = self.world.offers.get_mut(&offer) {
             of.state = OfferState::Accepted;
         }
+        self.effects_buf.push(Effect::CreateEvent {
+            summary: format!("offer #{} accepted", offer.raw()),
+        });
         let (tick, minute) = (self.world.tick, self.world.minute_of_day);
         self.events.push(
             tick,
@@ -973,6 +1840,9 @@ impl Simulation {
         if let Some(of) = self.world.offers.get_mut(&offer) {
             of.state = OfferState::Rejected;
         }
+        self.effects_buf.push(Effect::CreateEvent {
+            summary: format!("offer #{} rejected", offer.raw()),
+        });
         let (tick, minute) = (self.world.tick, self.world.minute_of_day);
         self.events.push(
             tick,
@@ -1009,6 +1879,11 @@ impl Simulation {
             predicate,
             deadline.map(|d| d as u32),
         );
+        self.effects_buf.push(Effect::Commit {
+            commitment: id,
+            debtor: proposal.actor.clone(),
+            creditor: target,
+        });
         ValidationOutcome::Pending {
             offer: None,
             commitment: Some(id),
@@ -1021,7 +1896,7 @@ impl Simulation {
         commitment: CommitmentId,
     ) -> ValidationOutcome {
         let (tick, minute) = (self.world.tick, self.world.minute_of_day);
-        social::break_commitment(
+        let broken = social::break_commitment(
             &mut self.world,
             &mut self.events,
             tick,
@@ -1029,10 +1904,765 @@ impl Simulation {
             commitment,
             &proposal.actor,
         );
+        // The creditor's APPRAISE of the broken promise (design §3.2; plan
+        // I-4): a directed, contextual PromiseBroken appraisal exactly once,
+        // citing the typed `CommitmentBroken` event — never the legacy
+        // universal trust/anger/respect delta (review D1-b).
+        if let Some(broken_event) = broken {
+            let parties = self
+                .world
+                .commitments
+                .get(&commitment)
+                .map(|c| (c.creditor.clone(), c.debtor.clone()));
+            if let Some((creditor, debtor)) = parties {
+                if creditor != debtor {
+                    self.effects_buf.push(Effect::ChangeTie {
+                        from: creditor.clone(),
+                        to: debtor.clone(),
+                        summary: format!("commitment #{} broken", commitment.raw()),
+                    });
+                    self.effects_buf.push(Effect::Appraise {
+                        subject: creditor.clone(),
+                        regarding: debtor.clone(),
+                        summary: "saw the promise broken".into(),
+                    });
+                    self.record_appraisal(
+                        &creditor,
+                        &debtor,
+                        AppraisedEvent::PromiseBroken,
+                        broken_event,
+                    );
+                }
+            }
+        }
+        self.effects_buf.push(Effect::CreateEvent {
+            summary: format!("commitment #{} broken", commitment.raw()),
+        });
         ValidationOutcome::Accepted
     }
 
-    fn move_item(&mut self, from: &ActorId, to: &ActorId, item: &ItemId, qty: u32) {
+    // --- deal FSM handlers (behavior-engine Phase 2, plan §4) ----------
+
+    /// Validate that a predicate only references actors/items/facts/
+    /// locations/factions that exist. Grounding, not possibility: a
+    /// well-typed predicate about a dead actor still validates here (the
+    /// world predicate itself evaluates false).
+    fn validate_predicate_refs(&self, pred: &QuestPredicate) -> Result<(), RejectReason> {
+        use QuestPredicate as P;
+        match pred {
+            P::HasItem { actor, item, .. } => {
+                if !self.world.actors.contains_key(actor) {
+                    return Err(RejectReason::UnknownActor(actor.clone()));
+                }
+                if !self.world.items.contains_key(item) {
+                    return Err(RejectReason::UnknownItem(item.clone()));
+                }
+                Ok(())
+            }
+            P::HasMoney { actor, .. } => {
+                if !self.world.actors.contains_key(actor) {
+                    return Err(RejectReason::UnknownActor(actor.clone()));
+                }
+                Ok(())
+            }
+            P::ActorAlive { actor }
+            | P::ActorDead { actor }
+            | P::ActorAt { actor, .. }
+            | P::BelievesFact { actor, .. }
+            | P::HeardFact { actor, .. } => {
+                if !self.world.actors.contains_key(actor) {
+                    return Err(RejectReason::UnknownActor(actor.clone()));
+                }
+                match pred {
+                    QuestPredicate::ActorAt { location, .. } => {
+                        if !self.world.locations.contains_key(location) {
+                            return Err(RejectReason::UnknownLocation(location.clone()));
+                        }
+                    }
+                    QuestPredicate::BelievesFact { fact, .. }
+                    | QuestPredicate::HeardFact { fact, .. }
+                        if !self.world.facts.contains_key(fact) =>
+                    {
+                        return Err(RejectReason::UnknownFact(fact.clone()));
+                    }
+                    _ => {}
+                }
+                Ok(())
+            }
+            P::FactCommitted { fact } => {
+                if !self.world.facts.contains_key(fact) {
+                    return Err(RejectReason::UnknownFact(fact.clone()));
+                }
+                Ok(())
+            }
+            P::LocationRepaired { location } => {
+                if !self.world.locations.contains_key(location) {
+                    return Err(RejectReason::UnknownLocation(location.clone()));
+                }
+                Ok(())
+            }
+            P::FactionPaid { faction, .. } => {
+                if !self.world.factions.contains_key(faction) {
+                    return Err(RejectReason::UnknownFaction(faction.clone()));
+                }
+                Ok(())
+            }
+            P::All(parts) | P::Any(parts) => {
+                for p in parts {
+                    self.validate_predicate_refs(p)?;
+                }
+                Ok(())
+            }
+            P::Not(inner) => self.validate_predicate_refs(inner),
+            P::Flag(_) => Ok(()),
+        }
+    }
+
+    /// Propose a typed conditional contract: the deal enters `Proposed`.
+    /// Nothing moves yet; acceptance ≠ fulfillment.
+    #[allow(clippy::too_many_arguments)]
+    fn do_propose_deal(
+        &mut self,
+        proposal: &ActionProposal,
+        target: ActorId,
+        terms: String,
+        condition: QuestPredicate,
+        performance: QuestPredicate,
+        condition_deadline_minute: Option<u64>,
+        performance_deadline_minute: Option<u64>,
+        give: Vec<Stack>,
+        money: i64,
+        note: String,
+    ) -> ValidationOutcome {
+        let id = DealId(self.world.next_deal_id);
+        self.world.next_deal_id += 1;
+        let deal = Deal::proposed(
+            id,
+            proposal.actor.clone(),
+            target.clone(),
+            note,
+            condition,
+            performance,
+            condition_deadline_minute,
+            performance_deadline_minute,
+            self.config.deal_grace_minutes,
+            give,
+            money,
+            Vec::new(),
+            self.world.tick,
+        );
+        self.world.deals.insert(id, deal);
+        let (tick, minute) = (self.world.tick, self.world.minute_of_day);
+        self.effects_buf.push(Effect::CreateEvent {
+            summary: format!("deal #{} proposed", id.raw()),
+        });
+        self.events.push(
+            tick,
+            minute,
+            Some(proposal.actor.clone()),
+            EventKind::DealProposed {
+                deal: id,
+                debtor: proposal.actor.clone(),
+                creditor: target,
+                terms,
+            },
+            Vec::new(),
+            Vec::new(),
+        );
+        ValidationOutcome::Pending {
+            offer: None,
+            commitment: None,
+        }
+    }
+
+    /// Creditor accepts: give-on-acceptance consideration moves atomically
+    /// at `Accepted`, before the FSM enters `Active` (§4.2). Validation
+    /// already proved the debtor holds the whole bundle, so this handler
+    /// cannot fail midway — the proposal is one atomic validate_then_apply.
+    fn do_accept_deal(&mut self, proposal: &ActionProposal, deal_id: DealId) -> ValidationOutcome {
+        let Some(deal) = self.world.deals.get(&deal_id).cloned() else {
+            return ValidationOutcome::Rejected(RejectReason::UnknownDeal(deal_id));
+        };
+        let (tick, minute) = (self.world.tick, self.world.minute_of_day);
+        // Escrow: consideration moves atomically at Accepted (§4.2).
+        for stack in &deal.give {
+            self.move_item(&deal.debtor, &deal.creditor, &stack.item, stack.qty);
+        }
+        if deal.money > 0 {
+            self.transfer_money(&deal.debtor, &deal.creditor, deal.money);
+        }
+        if let Some(d) = self.world.deals.get_mut(&deal_id) {
+            let _ = d.advance(DealEvent::Accept, minute as u64);
+            let _ = d.advance(DealEvent::Activate, minute as u64);
+        }
+        self.effects_buf.push(Effect::CreateEvent {
+            summary: format!("deal #{} accepted and active", deal_id.raw()),
+        });
+        self.events.push(
+            tick,
+            minute,
+            Some(proposal.actor.clone()),
+            EventKind::DealAccepted {
+                deal: deal_id,
+                by: proposal.actor.clone(),
+            },
+            Vec::new(),
+            Vec::new(),
+        );
+        self.events.push(
+            tick,
+            minute,
+            Some(proposal.actor.clone()),
+            EventKind::DealActivated { deal: deal_id },
+            Vec::new(),
+            Vec::new(),
+        );
+        ValidationOutcome::Accepted
+    }
+
+    /// Creditor rejects the proposal (terminal, exactly-once).
+    fn do_reject_deal(&mut self, proposal: &ActionProposal, deal_id: DealId) -> ValidationOutcome {
+        let (tick, minute) = (self.world.tick, self.world.minute_of_day);
+        if let Some(d) = self.world.deals.get_mut(&deal_id) {
+            let _ = d.advance(DealEvent::Reject, minute as u64);
+        }
+        self.effects_buf.push(Effect::CreateEvent {
+            summary: format!("deal #{} rejected", deal_id.raw()),
+        });
+        self.events.push(
+            tick,
+            minute,
+            Some(proposal.actor.clone()),
+            EventKind::DealRejected {
+                deal: deal_id,
+                by: proposal.actor.clone(),
+            },
+            Vec::new(),
+            Vec::new(),
+        );
+        ValidationOutcome::Accepted
+    }
+
+    /// Cancel per the §4.4 authorization matrix. The requesting party is the
+    /// caller; a unilateral debtor past ConditionMet is mapped by the FSM
+    /// itself onto the Violated path.
+    fn do_cancel_deal(&mut self, proposal: &ActionProposal, deal_id: DealId) -> ValidationOutcome {
+        let Some(deal) = self.world.deals.get(&deal_id).cloned() else {
+            return ValidationOutcome::Rejected(RejectReason::UnknownDeal(deal_id));
+        };
+        let by = if proposal.actor == deal.debtor {
+            Party::Debtor
+        } else if proposal.actor == deal.creditor {
+            Party::Creditor
+        } else {
+            return ValidationOutcome::Rejected(RejectReason::Invalid(
+                "only a deal party may cancel it".into(),
+            ));
+        };
+        let (tick, minute) = (self.world.tick, self.world.minute_of_day);
+        let _ = tick;
+        // §4.4: the debtor may cancel as `Canceled` only before ConditionMet
+        // with no consideration exchanged (§4.2: it moved atomically at
+        // `Accepted`); once exchanged, the kernel has no such arrow and the
+        // attempt is rejected — neutral, nothing mutates, and the creditor's
+        // option set (consent, authority, deadline lapse) is unchanged.
+        let outcome = deal_fsm::transition(
+            deal.state,
+            DealEvent::Cancel { by },
+            deal.consideration_exchanged(),
+        );
+        match outcome {
+            Ok(rpg_domain::deal::DealState::Violated) => {
+                let _ = self.apply_deal_event(
+                    deal_id,
+                    DealEvent::Violate {
+                        reason: ViolationReason::DebtorReneged,
+                    },
+                    minute as u64,
+                    Vec::new(),
+                );
+            }
+            Ok(_) => {
+                self.apply_deal_event(deal_id, DealEvent::Cancel { by }, minute as u64, Vec::new());
+            }
+            Err(_) => {
+                // The FSM rejected the cancellation (e.g. terminal or the
+                // transient ConditionMet state): rejection mutates nothing.
+                return ValidationOutcome::Rejected(RejectReason::Invalid(format!(
+                    "cancellation not permitted in state {}",
+                    deal.state.name()
+                )));
+            }
+        }
+        ValidationOutcome::Accepted
+    }
+
+    /// Deliver a settlement bundle (escrow §4.2). All custody was validated
+    /// before dispatch, so the transfers below either all happen (they were
+    /// already validated) or the proposal was rejected outright. A short
+    /// delivery records `DealPartialDelivery` and mutates nothing contractual
+    /// (§4.3); a satisfied performance performs the deal exactly-once (§4.6).
+    fn do_settle_deal(
+        &mut self,
+        proposal: &ActionProposal,
+        deal_id: DealId,
+        deliver: Vec<Stack>,
+        money: i64,
+    ) -> ValidationOutcome {
+        let Some(deal) = self.world.deals.get(&deal_id).cloned() else {
+            return ValidationOutcome::Rejected(RejectReason::UnknownDeal(deal_id));
+        };
+        let (tick, minute) = (self.world.tick, self.world.minute_of_day);
+        // The bundle: every component transfers now. Delivery evidence
+        // (§4.3) records the *actual* transfers, not the requested
+        // quantities: `move_item` reports what really moved, so a
+        // shortfall can never be over-reported here.
+        let mut got_by_item: BTreeMap<ItemId, u32> = BTreeMap::new();
+        for stack in &deliver {
+            let moved = self.move_item(&deal.debtor, &deal.creditor, &stack.item, stack.qty);
+            let got = got_by_item.entry(stack.item.clone()).or_insert(0);
+            *got = got.saturating_add(moved);
+        }
+        if money > 0 {
+            self.transfer_money(&deal.debtor, &deal.creditor, money);
+        }
+
+        let performance = if deal.installments.is_empty() {
+            deal.performance.clone()
+        } else {
+            // Ordered installments: the first unsettled one is next (§4.3).
+            deal.installments
+                .iter()
+                .find(|i| !i.settled)
+                .map(|i| i.performance.clone())
+                .unwrap_or_else(|| deal.performance.clone())
+        };
+        let expected_qty = if deal.installments.is_empty() {
+            deal_fsm::predicate_delivery(&performance).map(|(_, _, q)| q)
+        } else {
+            deal.installments
+                .iter()
+                .find(|i| !i.settled)
+                .and_then(|i| (i.expected_qty > 0).then_some(i.expected_qty))
+        };
+
+        if evaluate_predicate(&self.world, &performance) {
+            let settled_all = if deal.installments.is_empty() {
+                true
+            } else {
+                // Settle the first unsettled installment exactly-once.
+                let idx = deal
+                    .installments
+                    .iter()
+                    .position(|i| !i.settled)
+                    .expect("unsettled installment exists");
+                let all = self
+                    .world
+                    .deals
+                    .get_mut(&deal_id)
+                    .and_then(|d| d.settle_installment(idx, tick).ok())
+                    .unwrap_or(false);
+                let total = deal.total_installments();
+                let performed = self
+                    .world
+                    .deals
+                    .get(&deal_id)
+                    .map(|d| d.performed_installments())
+                    .unwrap_or(0);
+                self.effects_buf.push(Effect::CreateEvent {
+                    summary: format!("deal #{} installment {} settled", deal_id.raw(), idx),
+                });
+                self.events.push(
+                    tick,
+                    minute,
+                    Some(proposal.actor.clone()),
+                    EventKind::DealInstallmentSettled {
+                        deal: deal_id,
+                        index: idx,
+                        performed,
+                        total,
+                    },
+                    Vec::new(),
+                    Vec::new(),
+                );
+                all
+            };
+            if settled_all {
+                self.perform_deal(&deal_id, &proposal.actor, tick, minute);
+            }
+            return ValidationOutcome::Accepted;
+        }
+
+        // Short delivery: the deal stays PerformanceDue, a typed event
+        // records the shortfall as creditor evidence, nothing contractual
+        // mutates (§4.3). The delivered goods are real transfers; the
+        // creditor decides (renegotiate / excuse / let the deadline lapse).
+        if let Some(expected) = expected_qty {
+            let got = deal_fsm::predicate_item(&performance)
+                .and_then(|item| got_by_item.get(&item).copied())
+                .unwrap_or(0);
+            self.effects_buf.push(Effect::CreateEvent {
+                summary: format!(
+                    "deal #{} partial delivery {}/{}",
+                    deal_id.raw(),
+                    got,
+                    expected
+                ),
+            });
+            self.events.push(
+                tick,
+                minute,
+                Some(proposal.actor.clone()),
+                EventKind::DealPartialDelivery {
+                    deal: deal_id,
+                    got,
+                    expected,
+                },
+                Vec::new(),
+                Vec::new(),
+            );
+        }
+        ValidationOutcome::Accepted
+    }
+
+    /// Renegotiate a due deal: creditor consent (validated), single cycle,
+    /// then the deal re-enters `Active` with the amended terms (§4.1).
+    #[allow(clippy::too_many_arguments)]
+    fn do_renegotiate_deal(
+        &mut self,
+        proposal: &ActionProposal,
+        deal_id: DealId,
+        new_condition: Option<QuestPredicate>,
+        new_performance: Option<QuestPredicate>,
+        new_condition_deadline_minute: Option<u64>,
+        new_performance_deadline_minute: Option<u64>,
+    ) -> ValidationOutcome {
+        let (tick, minute) = (self.world.tick, self.world.minute_of_day);
+        if let Some(c) = &new_condition {
+            if let Err(reason) = self.validate_predicate_refs(c) {
+                return ValidationOutcome::Rejected(reason);
+            }
+        }
+        if let Some(p) = &new_performance {
+            if let Err(reason) = self.validate_predicate_refs(p) {
+                return ValidationOutcome::Rejected(reason);
+            }
+        }
+        if let Some(d) = self.world.deals.get_mut(&deal_id) {
+            if let Some(c) = new_condition {
+                d.condition = c;
+            }
+            if let Some(p) = new_performance {
+                d.performance = p;
+            }
+            if new_condition_deadline_minute.is_some() {
+                d.condition_deadline_minute = new_condition_deadline_minute;
+            }
+            if new_performance_deadline_minute.is_some() {
+                d.performance_deadline_minute = new_performance_deadline_minute;
+            }
+            d.condition_overdue_emitted = false;
+            d.performance_overdue_emitted = false;
+            d.grace_until_minute = None;
+            let _ = d.advance(DealEvent::Renegotiate, minute as u64);
+            let _ = d.advance(DealEvent::Reactivate, minute as u64);
+        }
+        self.effects_buf.push(Effect::CreateEvent {
+            summary: format!("deal #{} renegotiated", deal_id.raw()),
+        });
+        self.events.push(
+            tick,
+            minute,
+            Some(proposal.actor.clone()),
+            EventKind::DealRenegotiated {
+                deal: deal_id,
+                by: proposal.actor.clone(),
+            },
+            Vec::new(),
+            Vec::new(),
+        );
+        self.events.push(
+            tick,
+            minute,
+            Some(proposal.actor.clone()),
+            EventKind::DealActivated { deal: deal_id },
+            Vec::new(),
+            Vec::new(),
+        );
+        ValidationOutcome::Accepted
+    }
+
+    /// Apply one deal lifecycle event through the pinned transition kernel
+    /// and emit its typed event. `evidence` carries the authority's cited
+    /// facts for an `Excuse` release (ignored by every other event). Returns
+    /// the post-transition state, or `None` when the kernel rejected the
+    /// event (exactly-once guard).
+    fn apply_deal_event(
+        &mut self,
+        deal_id: DealId,
+        event: DealEvent,
+        minute: u64,
+        evidence: Vec<FactId>,
+    ) -> Option<rpg_domain::deal::DealState> {
+        let (tick, m) = (self.world.tick, self.world.minute_of_day);
+        let next = self
+            .world
+            .deals
+            .get_mut(&deal_id)?
+            .advance(event, minute)
+            .ok()?;
+        match event {
+            DealEvent::Accept => {
+                let by = self.world.deals.get(&deal_id)?.creditor.clone();
+                self.effects_buf.push(Effect::CreateEvent {
+                    summary: format!("deal #{} accepted", deal_id.raw()),
+                });
+                self.events.push(
+                    tick,
+                    m,
+                    None,
+                    EventKind::DealAccepted { deal: deal_id, by },
+                    Vec::new(),
+                    Vec::new(),
+                );
+            }
+            DealEvent::Activate => {
+                self.effects_buf.push(Effect::CreateEvent {
+                    summary: format!("deal #{} active", deal_id.raw()),
+                });
+                self.events.push(
+                    tick,
+                    m,
+                    None,
+                    EventKind::DealActivated { deal: deal_id },
+                    Vec::new(),
+                    Vec::new(),
+                );
+            }
+            DealEvent::ConditionMet => {
+                self.effects_buf.push(Effect::CreateEvent {
+                    summary: format!("deal #{} condition met", deal_id.raw()),
+                });
+                self.events.push(
+                    tick,
+                    m,
+                    None,
+                    EventKind::DealConditionMet { deal: deal_id },
+                    Vec::new(),
+                    Vec::new(),
+                );
+            }
+            DealEvent::ObligationDue => {
+                self.effects_buf.push(Effect::CreateEvent {
+                    summary: format!("deal #{} performance due", deal_id.raw()),
+                });
+                self.events.push(
+                    tick,
+                    m,
+                    None,
+                    EventKind::DealPerformanceDue { deal: deal_id },
+                    Vec::new(),
+                    Vec::new(),
+                );
+            }
+            DealEvent::Cancel { by } => {
+                let who = match by {
+                    Party::Debtor => self.world.deals.get(&deal_id)?.debtor.clone(),
+                    Party::Creditor | Party::Mutual => {
+                        self.world.deals.get(&deal_id)?.creditor.clone()
+                    }
+                };
+                self.effects_buf.push(Effect::CreateEvent {
+                    summary: format!("deal #{} canceled", deal_id.raw()),
+                });
+                self.events.push(
+                    tick,
+                    m,
+                    None,
+                    EventKind::DealCanceled {
+                        deal: deal_id,
+                        by: who,
+                    },
+                    Vec::new(),
+                    Vec::new(),
+                );
+            }
+            DealEvent::Violate { reason } => {
+                // A breach is appraised by the creditor through the directed
+                // contextual pathway (design §3.2; plan I-4): ΔR from the
+                // creditor's own values and current edge, exactly once —
+                // never a universal delta (review D1-b). The typed
+                // `DealViolated` event is the causal origin the appraisal
+                // cites.
+                let (debtor, creditor) = {
+                    let d = self.world.deals.get(&deal_id)?;
+                    (d.debtor.clone(), d.creditor.clone())
+                };
+                let violation_event = self.events.push(
+                    tick,
+                    m,
+                    None,
+                    EventKind::DealViolated {
+                        deal: deal_id,
+                        reason,
+                    },
+                    Vec::new(),
+                    Vec::new(),
+                );
+                self.effects_buf.push(Effect::ChangeTie {
+                    from: creditor.clone(),
+                    to: debtor.clone(),
+                    summary: format!("deal #{} violated ({})", deal_id.raw(), reason.name()),
+                });
+                self.effects_buf.push(Effect::CreateEvent {
+                    summary: format!("deal #{} violated", deal_id.raw()),
+                });
+                self.effects_buf.push(Effect::Appraise {
+                    subject: creditor.clone(),
+                    regarding: debtor.clone(),
+                    summary: "saw the promise broken".into(),
+                });
+                self.record_appraisal(
+                    &creditor,
+                    &debtor,
+                    AppraisedEvent::PromiseBroken,
+                    violation_event,
+                );
+            }
+            DealEvent::Excuse => {
+                // Authority/institution release (plan §4.4): the typed
+                // terminal event records the cited evidence; the deal's
+                // history stays intact for audit.
+                self.effects_buf.push(Effect::CreateEvent {
+                    summary: format!("deal #{} excused", deal_id.raw()),
+                });
+                self.events.push(
+                    tick,
+                    m,
+                    None,
+                    EventKind::DealExcused {
+                        deal: deal_id,
+                        evidence,
+                    },
+                    Vec::new(),
+                    Vec::new(),
+                );
+            }
+            _ => {}
+        }
+        // A relevant event for both parties' planners: their contract
+        // changed state (bounded signals, plan I-6 I6a item 1).
+        let parties: Option<(ActorId, ActorId, String)> = self.world.deals.get(&deal_id).map(|d| {
+            (
+                d.debtor.clone(),
+                d.creditor.clone(),
+                d.state.name().to_string(),
+            )
+        });
+        if let Some((debtor, creditor, state)) = parties {
+            self.signal(
+                &debtor,
+                ReplanTrigger::DealChanged {
+                    state: state.clone(),
+                },
+                None,
+            );
+            self.signal(&creditor, ReplanTrigger::DealChanged { state }, None);
+        }
+        Some(next)
+    }
+
+    /// Perform a due deal: the contracted benefit was delivered and
+    /// validated. Exactly-once via the transition kernel's state guard.
+    fn perform_deal(&mut self, deal_id: &DealId, by: &ActorId, tick: u64, minute: u32) {
+        if let Some(d) = self.world.deals.get_mut(deal_id) {
+            let _ = d.advance(DealEvent::Perform, minute as u64);
+        }
+        self.effects_buf.push(Effect::CreateEvent {
+            summary: format!("deal #{} performed", deal_id.raw()),
+        });
+        self.events.push(
+            tick,
+            minute,
+            Some(by.clone()),
+            EventKind::DealPerformed {
+                deal: *deal_id,
+                by: by.clone(),
+            },
+            Vec::new(),
+            Vec::new(),
+        );
+    }
+
+    /// Move money between actors (contractual component of deals). The
+    /// caller validates funds first, so this conserves the total exactly.
+    /// Identical parties are a structural no-op (net-change-aware: a
+    /// "transfer" to oneself moves nothing, fakes no events and — critically
+    /// — must not fake a wealth-need gain through the deplete/satisfy
+    /// asymmetry; the validation gate already rejects self-directed acts,
+    /// this guard keeps the shared lowering honest if any path ever reaches
+    /// it with identical parties).
+    fn transfer_money(&mut self, from: &ActorId, to: &ActorId, amount: i64) {
+        if from == to {
+            return;
+        }
+        // The conserved arithmetic is the audited production kernel
+        // [`split_money_transfer`] (I-8/T6.1): every caller validates custody
+        // before dispatch, so the overflow arm is unreachable in validated
+        // flows and both actors are always present (checked by `in_range`).
+        if let Some((debited, credited)) = self
+            .world
+            .actor(from)
+            .map(|a| a.inventory.money)
+            .zip(self.world.actor(to).map(|a| a.inventory.money))
+            .and_then(|(f, t)| split_money_transfer(f, t, amount).ok())
+        {
+            if let Some(a) = self.world.actor_mut(from) {
+                a.inventory.money = debited;
+            }
+            if let Some(a) = self.world.actor_mut(to) {
+                a.inventory.money = credited;
+            }
+        }
+        self.effects_buf.push(Effect::Transfer {
+            from: from.clone(),
+            to: to.clone(),
+            item: None,
+            qty: amount.max(0) as u32,
+        });
+        let (tick, minute) = (self.world.tick, self.world.minute_of_day);
+        let paid = self.events.push(
+            tick,
+            minute,
+            Some(from.clone()),
+            EventKind::MoneyPaid {
+                from: from.clone(),
+                to: to.clone(),
+                amount,
+            },
+            Vec::new(),
+            Vec::new(),
+        );
+        // Real wealth-need movement from a real validated transfer (plan I-6
+        // I6a item 3): the payer loses what it gave, the recipient gains what
+        // it received — truthful deltas scaled like the appraisal severities,
+        // event-sourced as typed `NeedChanged` events.
+        let norm = (amount as f32 / 100.0).clamp(0.05, 1.0);
+        self.apply_need_change(from, NeedKind::Wealth, -norm, "paid money", Some(paid));
+        self.apply_need_change(to, NeedKind::Wealth, norm, "received money", Some(paid));
+    }
+
+    /// Move up to `qty` of `item`; returns how many actually moved (the
+    /// caller validates custody first, so this is `qty` in validated flows).
+    /// Settlement evidence must record this *actual* count, not the
+    /// requested one (§4.3: `DealPartialDelivery` is evidence of what was
+    /// really delivered). Identical parties are a no-op (a self-transfer
+    /// moves nothing and must not fake a wealth-need movement — same
+    /// net-change-aware rule as `transfer_money`).
+    fn move_item(&mut self, from: &ActorId, to: &ActorId, item: &ItemId, qty: u32) -> u32 {
+        if from == to {
+            return 0;
+        }
         let removed = self
             .world
             .actor_mut(from)
@@ -1050,9 +2680,21 @@ impl Simulation {
             .map(|i| i.base_value)
             .unwrap_or(1);
         let value_norm = (value as f32 / 100.0).clamp(0.05, 1.0);
-        social::apply_gift(&mut self.world, from, to, value_norm);
+        // TRANSFER with ledger integrity (the move above) plus the social
+        // meaning of receiving a gift (CHANGE_TIE, mind-local appraisal).
+        self.effects_buf.push(Effect::Transfer {
+            from: from.clone(),
+            to: to.clone(),
+            item: Some(item.clone()),
+            qty: removed,
+        });
+        self.effects_buf.push(Effect::ChangeTie {
+            from: to.clone(),
+            to: from.clone(),
+            summary: format!("received {}x{}", removed, item.as_str()),
+        });
         let (tick, minute) = (self.world.tick, self.world.minute_of_day);
-        self.events.push(
+        let transfer_event = self.events.push(
             tick,
             minute,
             Some(from.clone()),
@@ -1065,6 +2707,39 @@ impl Simulation {
             Vec::new(),
             vec![to.clone()],
         );
+        // The recipient's APPRAISE of the gift: gratitude or bribery, per
+        // its own values (design §3.2 separation; plan I-4). Real wealth-need
+        // movement from the validated custody change (plan I-6 I6a item 3):
+        // the giver gave up value, the recipient gained it — truthful,
+        // event-sourced.
+        if removed > 0 {
+            self.effects_buf.push(Effect::Appraise {
+                subject: to.clone(),
+                regarding: from.clone(),
+                summary: "received a gift".into(),
+            });
+            self.apply_need_change(
+                from,
+                NeedKind::Wealth,
+                -value_norm,
+                "gave goods",
+                Some(transfer_event),
+            );
+            self.apply_need_change(
+                to,
+                NeedKind::Wealth,
+                value_norm,
+                "received goods",
+                Some(transfer_event),
+            );
+            self.record_appraisal(
+                to,
+                from,
+                AppraisedEvent::GiftReceived { value: value_norm },
+                transfer_event,
+            );
+        }
+        removed
     }
 
     fn do_transfer(
@@ -1086,39 +2761,112 @@ impl Simulation {
         amount: i64,
     ) -> ValidationOutcome {
         let from = proposal.actor.clone();
-        if let Some(a) = self.world.actor_mut(&from) {
-            a.inventory.money -= amount;
-        }
-        if let Some(a) = self.world.actor_mut(&target) {
-            a.inventory.money += amount;
+        // The conserved arithmetic is the audited production kernel
+        // [`split_money_transfer`] (I-8/T6.1): this is the audited call site
+        // for `do_pay` - direct debit/credit arithmetic here would be a
+        // bypass rejected by `scripts/check-proof-audit.sh`. `validate`
+        // already rejected self-pay, non-positive amounts and insufficient
+        // funds, so the overflow arm is unreachable.
+        if let Some((debited, credited)) = self
+            .world
+            .actor(&from)
+            .map(|a| a.inventory.money)
+            .zip(self.world.actor(&target).map(|a| a.inventory.money))
+            .and_then(|(f, t)| split_money_transfer(f, t, amount).ok())
+        {
+            if let Some(a) = self.world.actor_mut(&from) {
+                a.inventory.money = debited;
+            }
+            if let Some(a) = self.world.actor_mut(&target) {
+                a.inventory.money = credited;
+            }
         }
         let norm = (amount as f32 / 100.0).clamp(0.05, 1.0);
-        social::apply_gift(&mut self.world, &from, &target, norm);
+        self.effects_buf.push(Effect::Transfer {
+            from: from.clone(),
+            to: target.clone(),
+            item: None,
+            qty: amount.max(0) as u32,
+        });
+        self.effects_buf.push(Effect::ChangeTie {
+            from: target.clone(),
+            to: from.clone(),
+            summary: format!("received {amount} coins"),
+        });
         let (tick, minute) = (self.world.tick, self.world.minute_of_day);
-        self.events.push(
+        let payment_event = self.events.push(
             tick,
             minute,
             Some(from.clone()),
             EventKind::MoneyPaid {
-                from,
-                to: target,
+                from: from.clone(),
+                to: target.clone(),
                 amount,
             },
             Vec::new(),
             Vec::new(),
         );
+        // The recipient's APPRAISE of the payment (design §3.2; plan I-4): a
+        // directed, contextual GiftReceived appraisal exactly once — no
+        // universal aggregate deltas.
+        self.effects_buf.push(Effect::Appraise {
+            subject: target.clone(),
+            regarding: from.clone(),
+            summary: "received a payment".into(),
+        });
+        // Real wealth-need movement from the validated payment (plan I-6
+        // I6a item 3): truthful deltas, event-sourced.
+        self.apply_need_change(
+            &from,
+            NeedKind::Wealth,
+            -norm,
+            "paid money",
+            Some(payment_event),
+        );
+        self.apply_need_change(
+            &target,
+            NeedKind::Wealth,
+            norm,
+            "received money",
+            Some(payment_event),
+        );
+        self.record_appraisal(
+            &target,
+            &from,
+            AppraisedEvent::GiftReceived { value: norm },
+            payment_event,
+        );
         ValidationOutcome::Accepted
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn do_share_claim(
         &mut self,
         proposal: &ActionProposal,
         target: ActorId,
         fact: FactId,
         assertive: bool,
+        deceptive: bool,
+        retold_chain: Option<rpg_domain::behavior_types::SourceChainId>,
     ) -> ValidationOutcome {
+        // The asserted polarity (design §3.1; plan I-5 G1): the truthful
+        // path asserts the fact as stated; a deceptive assertion asserts the
+        // polarity the speaker believes false (falling back to a plain
+        // affirmation for a speaker who only *knows of* the proposition).
+        // The speaker's belief is never consulted for truth — and world
+        // truth is never touched.
+        let asserted_polarity = if deceptive {
+            let speaker_belief = self
+                .world
+                .actor(&proposal.actor)
+                .and_then(|a| a.beliefs.get(&fact))
+                .map(|b| b.believes_true);
+            !speaker_belief.unwrap_or(true)
+        } else {
+            true
+        };
         let (tick, minute) = (self.world.tick, self.world.minute_of_day);
-        social::share_claim(
+        let outcome = social::assert_claim(
             &mut self.world,
             &mut self.events,
             &mut self.rng,
@@ -1128,8 +2876,282 @@ impl Simulation {
             &target,
             &fact,
             assertive,
+            asserted_polarity,
+            deceptive,
+            // Explicit provenance selection (plan I-6 I6b §5.3): a retelling
+            // carries the chain its speaker chose; the epistemic layer
+            // validates it (speaker must own the chain for this proposition)
+            // and an invalid selection falls back to the legacy inference.
+            retold_chain,
+        );
+        // ASSERT: a claim record with provenance, never automatic belief.
+        // The asserted polarity is what the recipient was told — not what
+        // the speaker believes, and not the world's truth.
+        self.effects_buf.push(Effect::Assert {
+            speaker: proposal.actor.clone(),
+            proposition: fact.clone(),
+            asserted_polarity,
+            believed: Some(outcome.believed),
+        });
+        self.effects_buf.push(Effect::ChangeTie {
+            from: target.clone(),
+            to: proposal.actor.clone(),
+            summary: "was told a claim (familiarity)".into(),
+        });
+        // A relevant event for the recipient's planner: it just received new
+        // evidence that may change what it should do (bounded signal, plan
+        // I-6 I6a item 1). Receiving a claim is not believing it — the
+        // signal only schedules reconsideration.
+        self.signal(&target, ReplanTrigger::ClaimReceived { fact }, None);
+        ValidationOutcome::Accepted
+    }
+
+    /// Authoritative QUERY lowering (design §1.1 "no omniscient answer";
+    /// plan I-5 G2): the question is dispatched as `Effect::Query`, the
+    /// answer is derived from the target's own evidence ledger via
+    /// `answer_query` — never from world truth — and both the question and
+    /// the answer are event-sourced. Disclosure permission (design §3.1
+    /// "protect secrets by restricting disclosure choices", §9.1.2) gates
+    /// EVERY answer delivery — ledger answers and the authored-belief
+    /// fallback alike — through the same authorization a `ShareClaim` of
+    /// the fact requires (review D1-a): knowing a secret does not force
+    /// telling it. Anyone may *ask* (the asker needs no knowledge of the
+    /// fact); only the answer is gated. An unauthorized answerer refuses:
+    /// a truthful, typed answer of its own (`refused`, never conflated
+    /// with `unknown`) that transmits no polarity, confidence or evidence
+    /// and writes nothing into the asker's mind.
+    fn do_query(
+        &mut self,
+        proposal: &ActionProposal,
+        target: ActorId,
+        about: FactId,
+    ) -> ValidationOutcome {
+        let (tick, minute) = (self.world.tick, self.world.minute_of_day);
+        self.effects_buf.push(Effect::Query {
+            asker: proposal.actor.clone(),
+            target: target.clone(),
+            about: about.clone(),
+        });
+        // CREATE_EVENT first: the question is the canonical origin the
+        // answer cites as provenance.
+        let question_event = self.events.push(
+            tick,
+            minute,
+            Some(proposal.actor.clone()),
+            EventKind::QuestionAsked {
+                from: proposal.actor.clone(),
+                to: target.clone(),
+                about: about.clone(),
+            },
+            Vec::new(),
+            vec![target.clone()],
+        );
+        // PERMISSION before delivery (the ShareClaim disclosure gate,
+        // design §9.1.2): the answerer must be authorized to disclose this
+        // fact — evaluated once, for ledger answers and the authored-belief
+        // fallback alike. A question itself is never gated on knowledge.
+        let authorized = self
+            .world
+            .actor(&target)
+            .map(|answerer| {
+                self.validate_disclosure_permission(answerer, &about)
+                    .is_ok()
+            })
+            .unwrap_or(false);
+        // The answer is the target's own epistemic state, never world truth.
+        let answer = rpg_behavior::answer_query(&self.world, &target, &about);
+        let refused = !authorized && matches!(answer, rpg_behavior::QueryAnswer::Heard { .. });
+        match (&answer, refused) {
+            (rpg_behavior::QueryAnswer::Unknown, _) => {
+                // Knowing nothing is a real answer: the target cannot be
+                // made to disclose or invent the world's truth.
+                self.effects_buf.push(Effect::CreateEvent {
+                    summary: format!("query about {} answered unknown", about.as_str()),
+                });
+            }
+            (_, true) => {
+                // The refusal is the answer: the question is real, the
+                // decline is typed, and nothing about the proposition's
+                // content (polarity, confidence, evidence) crosses over.
+                self.effects_buf.push(Effect::CreateEvent {
+                    summary: format!("query about {} refused", about.as_str()),
+                });
+            }
+            (rpg_behavior::QueryAnswer::Heard { polarities, .. }, false) => {
+                // The answerer asserts what they hold: the majority polarity
+                // of their evidence (contradictions stay visible in the
+                // typed answer event; the asker's own appraisal of it is
+                // theirs to make).
+                let trues = polarities.iter().filter(|p| **p).count();
+                let asserted_polarity = trues * 2 >= polarities.len();
+                let _ = rpg_behavior::assert_proposition(
+                    &mut self.world,
+                    &mut self.events,
+                    &mut self.rng,
+                    tick,
+                    minute,
+                    &target,
+                    &proposal.actor,
+                    &about,
+                    asserted_polarity,
+                    false,
+                );
+                // Being asked and answered builds familiarity, as any
+                // delivered claim does. Exposure-maintenance classification
+                // (design §3.2 audit): directed, single-dimension exposure
+                // caused by the real typed answer — not a valenced appraisal
+                // of the answer's content; a classified background mutation
+                // pending the M1 mutation-audit pass (plan I-6). The refusal
+                // branch deliberately writes nothing: a decline is not
+                // exposure the asker profits from.
+                social::adjust_relationship(
+                    &mut self.world,
+                    &target,
+                    &proposal.actor,
+                    &social::RelationshipDelta::new().familiarity(0.05),
+                );
+                self.effects_buf.push(Effect::ChangeTie {
+                    from: target.clone(),
+                    to: proposal.actor.clone(),
+                    summary: "answered a question (familiarity)".into(),
+                });
+            }
+        }
+        let (polarities, confidence, contradicted, unknown) = match answer {
+            rpg_behavior::QueryAnswer::Unknown => (Vec::new(), 0.0, false, true),
+            rpg_behavior::QueryAnswer::Heard { .. } if refused => (Vec::new(), 0.0, false, false),
+            rpg_behavior::QueryAnswer::Heard {
+                polarities,
+                confidence,
+                contradicted,
+            } => (polarities, confidence, contradicted, false),
+        };
+        self.events.push(
+            tick,
+            minute,
+            Some(target.clone()),
+            EventKind::QueryAnswered {
+                answerer: target.clone(),
+                asker: proposal.actor.clone(),
+                about: about.clone(),
+                polarities,
+                confidence,
+                contradicted,
+                unknown,
+                refused,
+                origin: question_event,
+            },
+            vec![question_event],
+            vec![proposal.actor.clone()],
+        );
+        // A relevant event for the asker's planner: the answer (any of it —
+        // including "unknown" and a refusal) may change what it should do.
+        self.signal(
+            &proposal.actor,
+            ReplanTrigger::QueryAnswered,
+            Some(question_event),
         );
         ValidationOutcome::Accepted
+    }
+
+    /// Authoritative SANCTION lowering (design §1.1 "authority, process, cost
+    /// and evidence"; plan I-5 G3): the institutional act is dispatched as
+    /// `Effect::Sanction`, the process is the typed `SanctionIssued` event,
+    /// the cost is the fine's real transfer, and the evidence prerequisites
+    /// were validated (the authority must hold every cited fact). The
+    /// subject's APPRAISE of being sanctioned routes through the directed
+    /// contextual pathway (design §3.2; plan I-4) — no universal deltas.
+    fn do_sanction(
+        &mut self,
+        proposal: &ActionProposal,
+        target: ActorId,
+        kind: SanctionKind,
+        evidence: Vec<FactId>,
+    ) -> ValidationOutcome {
+        let (tick, minute) = (self.world.tick, self.world.minute_of_day);
+        // IDENTITY (plan I-6 I6a): dispatch records the punished incident
+        // identities exactly once, right here — the one authoritative site
+        // a punitive sanction passes through. Same identity policy the
+        // validation gate enforces (and candidate generation respects): one
+        // (evidence fact × subject) incident is punishable exactly once.
+        if !matches!(kind, SanctionKind::Praise) {
+            for fact in &evidence {
+                self.sanctions.insert((fact.clone(), target.clone()));
+            }
+        }
+        self.effects_buf.push(Effect::Sanction {
+            authority: proposal.actor.clone(),
+            subject: target.clone(),
+            action: kind.name().to_string(),
+        });
+        // PROCESS: the typed institutional record (the subject observes its
+        // own sanction).
+        let sanction_event = self.events.push(
+            tick,
+            minute,
+            Some(proposal.actor.clone()),
+            EventKind::SanctionIssued {
+                authority: proposal.actor.clone(),
+                subject: target.clone(),
+                kind: kind.name().to_string(),
+                evidence: evidence.clone(),
+            },
+            Vec::new(),
+            vec![target.clone()],
+        );
+        // COST: a fine is a real transfer of the stated amount.
+        if let SanctionKind::Fine { amount } = kind {
+            self.transfer_money(&target, &proposal.actor, amount);
+        }
+        // CUSTODY: an arrest takes the subject out of play (world state,
+        // recorded by the sanction event above).
+        if matches!(kind, SanctionKind::Arrest) {
+            if let Some(a) = self.world.actor_mut(&target) {
+                a.status = rpg_domain::world::ActorStatus::Departed;
+            }
+        }
+        // The subject's APPRAISE of the sanction (mind-local, contextual):
+        // an institutional commendation reads as praise; a penalty as an
+        // institutional affront, severity-scaled by what was taken.
+        let severity = match kind {
+            SanctionKind::Fine { amount } => (amount as f32 / 100.0).clamp(0.3, 1.0),
+            SanctionKind::Arrest => 1.0,
+            SanctionKind::Boycott => 0.7,
+            SanctionKind::Praise => 0.0,
+        };
+        let appraisal = if matches!(kind, SanctionKind::Praise) {
+            AppraisedEvent::PraiseReceived
+        } else {
+            AppraisedEvent::Sanctioned { severity }
+        };
+        self.effects_buf.push(Effect::Appraise {
+            subject: target.clone(),
+            regarding: proposal.actor.clone(),
+            summary: format!("was {} by the authority", kind.name()),
+        });
+        self.record_appraisal(&target, &proposal.actor, appraisal, sanction_event);
+        ValidationOutcome::Accepted
+    }
+
+    /// Authority-backed contract release (plan §4.4): from `PerformanceDue`,
+    /// authority/institution evidence excuses the deal. The state check and
+    /// the exactly-once guard live in the transition kernel; the authority
+    /// and evidence prerequisites were validated.
+    fn do_excuse_deal(
+        &mut self,
+        proposal: &ActionProposal,
+        deal_id: DealId,
+        evidence: Vec<FactId>,
+    ) -> ValidationOutcome {
+        let minute = self.world.minute_of_day as u64;
+        let _ = proposal;
+        match self.apply_deal_event(deal_id, DealEvent::Excuse, minute, evidence) {
+            Some(_) => ValidationOutcome::Accepted,
+            None => ValidationOutcome::Rejected(RejectReason::Invalid(format!(
+                "deal #{} cannot be excused from its current state (exactly-once)",
+                deal_id.raw()
+            ))),
+        }
     }
 
     fn do_spread_rumor(
@@ -1143,16 +3165,18 @@ impl Simulation {
             .and_then(|f| self.world.fact(f))
             .map(|f| f.truth)
             .unwrap_or(false);
-        let conf = about
-            .as_ref()
-            .and_then(|f| {
-                self.world
-                    .actor(&proposal.actor)
-                    .and_then(|a| a.beliefs.get(f))
-            })
-            .map(|b| b.confidence)
-            .unwrap_or(0.5);
+        let speaker_belief = about.as_ref().and_then(|f| {
+            self.world
+                .actor(&proposal.actor)
+                .and_then(|a| a.beliefs.get(f))
+        });
+        let conf = speaker_belief.map(|b| b.confidence).unwrap_or(0.5);
+        // The asserted polarity is the *speaker's own belief* — what they are
+        // actually claiming — never the world's canonical truth. A speaker
+        // with no belief at all passes the claim on as heard (polarity true).
+        let asserted_polarity = speaker_belief.map(|b| b.believes_true).unwrap_or(true);
         let (tick, minute) = (self.world.tick, self.world.minute_of_day);
+        let rumor_proposition = about.clone().unwrap_or_else(|| FactId::new("<rumor>"));
         social::add_rumor(
             &mut self.world,
             &mut self.events,
@@ -1164,6 +3188,16 @@ impl Simulation {
             truth,
             conf,
         );
+        // ASSERT (public) + the rumor record itself.
+        self.effects_buf.push(Effect::Assert {
+            speaker: proposal.actor.clone(),
+            proposition: rumor_proposition,
+            asserted_polarity,
+            believed: None,
+        });
+        self.effects_buf.push(Effect::CreateEvent {
+            summary: "rumor spread publicly".into(),
+        });
         ValidationOutcome::Accepted
     }
 
@@ -1208,6 +3242,12 @@ impl Simulation {
                     if let Some(a) = self.world.actor_mut(&proposal.actor) {
                         a.inventory.add(stack.item.clone(), stack.qty);
                     }
+                    self.effects_buf.push(Effect::Transfer {
+                        from: proposal.actor.clone(),
+                        to: proposal.actor.clone(),
+                        item: Some(stack.item.clone()),
+                        qty: stack.qty,
+                    });
                     self.events.push(
                         tick,
                         minute,
@@ -1245,7 +3285,17 @@ impl Simulation {
                             item: ItemId::new("investigated"),
                         },
                     );
+                    // OBSERVE: the investigator perceived the clue container.
+                    self.effects_buf.push(Effect::Observe {
+                        observer: proposal.actor.clone(),
+                        observed: format!("clue for {}", fact.as_str()),
+                        channel: rpg_domain::behavior_types::AcquisitionChannel::Read,
+                        origin_event: None,
+                    });
                 }
+                self.effects_buf.push(Effect::CreateEvent {
+                    summary: format!("investigated {}", loc.as_str()),
+                });
             }
             InvestigateTarget::Actor(other) => {
                 if let Some(a) = self.world.actor_mut(&proposal.actor) {
@@ -1286,13 +3336,25 @@ impl Simulation {
                                 event: None,
                             },
                         );
+                        self.effects_buf.push(Effect::Observe {
+                            observer: proposal.actor.clone(),
+                            observed: format!("clue held by {}", other.as_str()),
+                            channel: rpg_domain::behavior_types::AcquisitionChannel::Told,
+                            origin_event: None,
+                        });
                     }
                 }
+                self.effects_buf.push(Effect::CreateEvent {
+                    summary: format!("investigated {}", other.as_str()),
+                });
             }
             InvestigateTarget::Item(item) => {
                 if let Some(a) = self.world.actor_mut(&proposal.actor) {
                     a.inspected.insert(item.as_str().to_string());
                 }
+                self.effects_buf.push(Effect::CreateEvent {
+                    summary: format!("investigated item {}", item.as_str()),
+                });
             }
         }
         ValidationOutcome::Accepted
@@ -1304,27 +3366,78 @@ impl Simulation {
         authority: ActorId,
         evidence: Vec<FactId>,
     ) -> ValidationOutcome {
-        // Guards gain respect for credible reports and suspicion of the accused
-        // is *not* automatic; only the report itself is recorded.
-        social::adjust_relationship(
-            &mut self.world,
-            &authority,
-            &proposal.actor,
-            &social::RelationshipDelta::new().trust(0.1).respect(0.05),
-        );
         let (tick, minute) = (self.world.tick, self.world.minute_of_day);
-        self.events.push(
+        // PROCESS first: the typed report is the causal origin the
+        // authority's appraisal cites.
+        let report_event = self.events.push(
             tick,
             minute,
             Some(proposal.actor.clone()),
             EventKind::CrimeReported {
                 by: proposal.actor.clone(),
-                authority,
-                evidence,
+                authority: authority.clone(),
+                evidence: evidence.clone(),
             },
             Vec::new(),
             Vec::new(),
         );
+        // The authority's APPRAISE of the report (design §3.2; plan I-4): a
+        // directed, contextual reading of the credible report through the
+        // authority's own values and current edge, exactly once — never the
+        // legacy universal trust/respect delta (review D1-b). Suspicion of
+        // the accused is *not* automatic; only the report itself is
+        // recorded. (A self-report mutates nothing.)
+        if authority != proposal.actor {
+            self.effects_buf.push(Effect::ChangeTie {
+                from: authority.clone(),
+                to: proposal.actor.clone(),
+                summary: "received a credible report".into(),
+            });
+            self.effects_buf.push(Effect::Appraise {
+                subject: authority.clone(),
+                regarding: proposal.actor.clone(),
+                summary: "found the report credible".into(),
+            });
+            self.record_appraisal(
+                &authority,
+                &proposal.actor,
+                AppraisedEvent::AccurateClaim,
+                report_event,
+            );
+        }
+        // Shared report mechanic (behavior-engine Phase 1): the authority
+        // *receives* each reported fact as provenance-bound evidence — claim
+        // separation means a report does not silently become belief.
+        for fact in &evidence {
+            rpg_behavior::record_provenance_evidence(
+                &mut self.world,
+                &mut self.events,
+                tick,
+                minute,
+                &authority,
+                fact,
+                true,
+                &rpg_domain::world::Provenance::Told {
+                    by: proposal.actor.clone(),
+                    event: None,
+                },
+            );
+        }
+        // ASSERT (claim to the institution) + REQUEST (for action).
+        self.effects_buf.push(Effect::Assert {
+            speaker: proposal.actor.clone(),
+            proposition: evidence
+                .first()
+                .cloned()
+                .unwrap_or_else(|| FactId::new("<crime>")),
+            asserted_polarity: true,
+            believed: None,
+        });
+        self.effects_buf.push(Effect::Request {
+            from: proposal.actor.clone(),
+            to: authority.clone(),
+            demand: "investigate the reported crime".into(),
+        });
         ValidationOutcome::Accepted
     }
 
@@ -1339,6 +3452,31 @@ impl Simulation {
         }
         self.world
             .set_flag(format!("hidden:{}@{}", item.as_str(), location.as_str()));
+        // TRANSFORM: the evidence left the actor's custody (consumed into
+        // concealment); the concealment is recorded — and event-sourced.
+        self.effects_buf.push(Effect::Transform {
+            actor: proposal.actor.clone(),
+            subject: item.clone(),
+            consumed: 1,
+            produced: 0,
+            note: format!("hidden at {}", location.as_str()),
+        });
+        self.effects_buf.push(Effect::CreateEvent {
+            summary: format!("evidence {} hidden at {}", item.as_str(), location.as_str()),
+        });
+        let (tick, minute) = (self.world.tick, self.world.minute_of_day);
+        self.events.push(
+            tick,
+            minute,
+            Some(proposal.actor.clone()),
+            EventKind::EvidenceHidden {
+                actor: proposal.actor.clone(),
+                item,
+                location,
+            },
+            Vec::new(),
+            Vec::new(),
+        );
         ValidationOutcome::Accepted
     }
 
@@ -1376,6 +3514,7 @@ impl Simulation {
                     .collect()
             })
             .unwrap_or_default();
+        let resolved_count = resolved.len();
         if let Some(f) = self.world.faction_mut(&faction) {
             for i in resolved {
                 if let Some(p) = f.priorities.get_mut(i) {
@@ -1383,6 +3522,28 @@ impl Simulation {
                 }
             }
         }
+        // The faction budget is an institutional pool, not an actor's
+        // custody: the honest lowering is TRANSFORM (consumption of the
+        // faction's budget object), never a fabricated self-to-self
+        // TRANSFER. The typed `BudgetAllocated` event carries the
+        // institutional truth (faction, amount, purpose).
+        self.effects_buf.push(Effect::Transform {
+            actor: proposal.actor.clone(),
+            subject: ItemId::new(faction.as_str()),
+            consumed: amount.max(0) as u32,
+            produced: 0,
+            note: format!("{faction} budget allocated to {purpose}"),
+        });
+        if resolved_count > 0 {
+            self.effects_buf.push(Effect::ChangeGoal {
+                actor: proposal.actor.clone(),
+                goal: format!("{faction}:{purpose}"),
+                change: GoalChange::Completed,
+            });
+        }
+        self.effects_buf.push(Effect::CreateEvent {
+            summary: format!("{faction} allocated {amount} to {purpose}"),
+        });
         let (tick, minute) = (self.world.tick, self.world.minute_of_day);
         self.events.push(
             tick,
@@ -1403,10 +3564,22 @@ impl Simulation {
     fn do_repair(&mut self, proposal: &ActionProposal, location: LocationId) -> ValidationOutcome {
         let damage = self.world.damage_at(&location);
         let cost = (damage.clamp(0.0, 1.0) * 200.0) as i64;
-        // Find a faction responsible for this location that can afford it.
+        // Labor performed on site earns a real wage from the paying
+        // faction's budget (plan I-6 I6b, design §5.4: production consumes
+        // labor; §1.1: the gain is a validated resource transfer, never an
+        // artificial need boost). A quarter of the repair cost, paid only
+        // for labor physically performed at the location — a remote
+        // (contracted) repair pays no wage.
+        let on_site = self
+            .world
+            .actor(&proposal.actor)
+            .is_some_and(|a| a.location == location);
+        let wage = if on_site { cost / 4 } else { 0 };
+        // Find a faction responsible for this location that can afford the
+        // repair *and* the wage.
         let mut payer: Option<FactionId> = None;
         for f in self.world.factions.values() {
-            if f.responsible_for.contains(&location) && f.budget >= cost && f.staff > 0 {
+            if f.responsible_for.contains(&location) && f.budget >= cost + wage && f.staff > 0 {
                 payer = Some(f.id.clone());
                 break;
             }
@@ -1417,22 +3590,68 @@ impl Simulation {
             ));
         };
         if let Some(f) = self.world.faction_mut(&fid) {
-            f.budget -= cost;
+            f.budget -= cost + wage;
         }
         self.world.damage.insert(location.clone(), 0.0);
+        // TRANSFORM (the location is restored) plus the honest lowering of
+        // the institutional budget consumption: TRANSFORM of the paying
+        // faction's budget object — never a fabricated self-to-self TRANSFER.
+        // The typed `RepairCompleted` event carries the real payer and cost.
+        self.effects_buf.push(Effect::Transform {
+            actor: proposal.actor.clone(),
+            subject: ItemId::new(location.as_str()),
+            consumed: 0,
+            produced: 1,
+            note: "location repaired".into(),
+        });
+        self.effects_buf.push(Effect::Transform {
+            actor: proposal.actor.clone(),
+            subject: ItemId::new(fid.as_str()),
+            consumed: (cost + wage).max(0) as u32,
+            produced: 0,
+            note: format!("{fid} budget spent on the repair (+{wage} wage)"),
+        });
         let (tick, minute) = (self.world.tick, self.world.minute_of_day);
         self.events.push(
             tick,
             minute,
             Some(proposal.actor.clone()),
             EventKind::RepairCompleted {
-                location,
-                by: fid,
+                location: location.clone(),
+                by: fid.clone(),
                 cost,
             },
             Vec::new(),
             Vec::new(),
         );
+        // The wage is a real validated resource gain (§9.1.1 conservation
+        // modulo recorded sources/sinks): the faction's budget decreases by
+        // exactly what the worker's custody gains, recorded by the typed
+        // `WagePaid` event and a truthful, event-sourced wealth-need delta.
+        if wage > 0 {
+            if let Some(a) = self.world.actor_mut(&proposal.actor) {
+                a.inventory.money += wage;
+            }
+            let wage_event = self.events.push(
+                tick,
+                minute,
+                Some(proposal.actor.clone()),
+                EventKind::WagePaid {
+                    faction: fid.clone(),
+                    worker: proposal.actor.clone(),
+                    amount: wage,
+                },
+                Vec::new(),
+                vec![proposal.actor.clone()],
+            );
+            self.apply_need_change(
+                &proposal.actor,
+                NeedKind::Wealth,
+                (wage as f32 / 100.0).clamp(0.05, 1.0),
+                "was paid a repair wage",
+                Some(wage_event),
+            );
+        }
         ValidationOutcome::Accepted
     }
 
@@ -1451,6 +3670,18 @@ impl Simulation {
         if let Some(a) = self.world.actor_mut(&proposal.actor) {
             a.flags.insert(format!("crew_of:{}", target.as_str()));
         }
+        // AUTHORIZE: a bounded role grant (crew membership), plus the social
+        // meaning of joining (CHANGE_TIE).
+        self.effects_buf.push(Effect::Authorize {
+            grantor: proposal.actor.clone(),
+            grantee: target.clone(),
+            scope: format!("crew of {}", proposal.actor.as_str()),
+        });
+        self.effects_buf.push(Effect::ChangeTie {
+            from: target.clone(),
+            to: proposal.actor.clone(),
+            summary: "joined the crew".into(),
+        });
         let (tick, minute) = (self.world.tick, self.world.minute_of_day);
         self.events.push(
             tick,
@@ -1474,6 +3705,11 @@ impl Simulation {
         at_minute: u32,
     ) -> ValidationOutcome {
         let (tick, minute) = (self.world.tick, self.world.minute_of_day);
+        self.effects_buf.push(Effect::Schedule {
+            by: proposal.actor.clone(),
+            with: target.clone(),
+            at_minute,
+        });
         self.events.push(
             tick,
             minute,
@@ -1496,38 +3732,202 @@ impl Simulation {
         target: ActorId,
         demand: String,
     ) -> ValidationOutcome {
-        social::apply_threat(&mut self.world, &proposal.actor, &target);
         let (tick, minute) = (self.world.tick, self.world.minute_of_day);
-        self.events.push(
+        // CREATE_EVENT first: the threat is the canonical origin the
+        // appraisal cites as provenance.
+        let threat_event = self.events.push(
             tick,
             minute,
             Some(proposal.actor.clone()),
             EventKind::ThreatMade {
                 from: proposal.actor.clone(),
-                to: target,
-                demand,
+                to: target.clone(),
+                demand: demand.clone(),
             },
             Vec::new(),
             Vec::new(),
         );
+        // REQUEST (demanded act) + the target's mind-local APPRAISE (fear and
+        // anger, computed from *its* values/needs/current edge — no
+        // universal delta) + the directed relationship update.
+        self.effects_buf.push(Effect::Request {
+            from: proposal.actor.clone(),
+            to: target.clone(),
+            demand: demand.clone(),
+        });
+        self.effects_buf.push(Effect::Appraise {
+            subject: target.clone(),
+            regarding: proposal.actor.clone(),
+            summary: "was threatened".into(),
+        });
+        self.record_appraisal(
+            &target,
+            &proposal.actor,
+            AppraisedEvent::ThreatReceived { severity: 1.0 },
+            threat_event,
+        );
+        self.effects_buf.push(Effect::ChangeTie {
+            from: target.clone(),
+            to: proposal.actor.clone(),
+            summary: "fear and anger rose".into(),
+        });
         ValidationOutcome::Accepted
     }
 
     fn do_comfort(&mut self, proposal: &ActionProposal, target: ActorId) -> ValidationOutcome {
-        social::apply_comfort(&mut self.world, &proposal.actor, &target);
         let (tick, minute) = (self.world.tick, self.world.minute_of_day);
-        self.events.push(
+        let comfort_event = self.events.push(
             tick,
             minute,
             Some(proposal.actor.clone()),
             EventKind::Comforted {
                 from: proposal.actor.clone(),
-                to: target,
+                to: target.clone(),
             },
             Vec::new(),
             Vec::new(),
         );
+        // APPRAISE (mind-local: the target's grief relief / warmth, computed
+        // from its own profile) + CHANGE_TIE.
+        self.effects_buf.push(Effect::Appraise {
+            subject: target.clone(),
+            regarding: proposal.actor.clone(),
+            summary: "was comforted".into(),
+        });
+        self.record_appraisal(
+            &target,
+            &proposal.actor,
+            AppraisedEvent::ComfortReceived { sincerity: 0.8 },
+            comfort_event,
+        );
+        // Real belonging-need movement from the validated comfort (plan I-6
+        // I6a item 3): the comforted actor is less deprived of company —
+        // truthful, event-sourced.
+        self.apply_need_change(
+            &target,
+            NeedKind::Belonging,
+            0.4 * 0.8,
+            "was comforted",
+            Some(comfort_event),
+        );
+        self.effects_buf.push(Effect::ChangeTie {
+            from: target.clone(),
+            to: proposal.actor.clone(),
+            summary: "felt comforted".into(),
+        });
         ValidationOutcome::Accepted
+    }
+
+    /// Apply the mind-local `APPRAISE` of one event through the directed
+    /// contextual pathway (design §3.2; plan I-4/I-4b): the observer's value
+    /// profile, needs-driven goal urgency and current edge condition the
+    /// deltas (no universal deltas); the same call writes the observer's
+    /// emotion state (separate mind-local state, T3.12) and records the
+    /// appraisal provenance. Event-sourced as typed `AppraisalRecorded`.
+    /// A validated world action *really* moved one of the actor's needs
+    /// (design §3 `N`; plan I-6 I6a item 3): in-world need satisfaction
+    /// happens through real validated actions with truthful typed effects —
+    /// this helper is the only site needs change outside classified regular
+    /// decay, it applies the diminishing-returns `satisfy` (gains) or the
+    /// clamped `deplete` (losses), and it event-sources the change as a typed
+    /// `NeedChanged` event citing its real origin. Replay reproduces it
+    /// exactly (deterministic call sites in the validated lowering paths).
+    fn apply_need_change(
+        &mut self,
+        actor: &ActorId,
+        need: NeedKind,
+        delta: f32,
+        cause: &str,
+        origin: Option<EventId>,
+    ) {
+        let (tick, minute) = (self.world.tick, self.world.minute_of_day);
+        if let Some(a) = self.world.actor_mut(actor) {
+            if delta >= 0.0 {
+                a.needs.satisfy(need, delta, &self.config.needs);
+            } else {
+                a.needs.deplete(need, -delta);
+            }
+        }
+        self.events.push(
+            tick,
+            minute,
+            Some(actor.clone()),
+            EventKind::NeedChanged {
+                actor: actor.clone(),
+                need,
+                delta,
+                cause: cause.to_string(),
+                origin,
+            },
+            Vec::new(),
+            Vec::new(),
+        );
+    }
+
+    /// Schedule a bounded reconsideration signal for an actor (design §8:
+    /// `schedule_reconsideration(npc, priority_for(observed_events))`; plan
+    /// I-6 I6a item 1). Only genuinely relevant events produce signals —
+    /// every call site here is an event *about* the actor (its appraisal,
+    /// its question, its contracts, its needs or its emotion gates); an
+    /// unrelated event elsewhere never reaches this helper, so unrelated
+    /// events cannot trigger unbounded replanning.
+    fn signal(&mut self, actor: &ActorId, trigger: ReplanTrigger, event: Option<EventId>) {
+        let max = self.config.activation.max_signals_per_actor;
+        self.planner.record_signal(
+            actor,
+            ReplanSignal {
+                tick: self.world.tick,
+                trigger,
+                event,
+            },
+            max,
+        );
+    }
+
+    fn record_appraisal(
+        &mut self,
+        subject: &ActorId,
+        regarding: &ActorId,
+        event: AppraisedEvent,
+        origin: EventId,
+    ) {
+        let (tick, minute) = (self.world.tick, self.world.minute_of_day);
+        if let Some(outcome) = social::apply_appraised_event(
+            &mut self.world,
+            subject,
+            regarding,
+            event,
+            Some(origin),
+            &self.config.emotions,
+            &self.config.needs,
+        ) {
+            self.events.push(
+                tick,
+                minute,
+                Some(subject.clone()),
+                EventKind::AppraisalRecorded {
+                    subject: subject.clone(),
+                    regarding: regarding.clone(),
+                    event: Some(origin),
+                    interpretation: outcome.interpretation.clone(),
+                },
+                vec![origin],
+                Vec::new(),
+            );
+            self.trace.push(format!(
+                "appraise: {} {} {}",
+                subject, outcome.interpretation, regarding
+            ));
+            // A relevant event for the subject's planner: its own appraisal
+            // may change what it should do (bounded signal, plan I-6 I6a).
+            self.signal(
+                subject,
+                ReplanTrigger::Appraisal {
+                    interpretation: outcome.interpretation.clone(),
+                },
+                Some(origin),
+            );
+        }
     }
 
     fn do_place_clue(
@@ -1539,6 +3939,7 @@ impl Simulation {
         holder: Option<ActorId>,
     ) -> ValidationOutcome {
         let (tick, minute) = (self.world.tick, self.world.minute_of_day);
+        let clue_summary = format!("clue for {} placed as {:?}", fact.as_str(), kind);
         let decision = narrative::commit_change(
             &mut self.world,
             &mut self.events,
@@ -1552,7 +3953,12 @@ impl Simulation {
             },
         );
         match decision {
-            Decision::Accepted => ValidationOutcome::Accepted,
+            Decision::Accepted => {
+                self.effects_buf.push(Effect::CreateEvent {
+                    summary: clue_summary,
+                });
+                ValidationOutcome::Accepted
+            }
             Decision::Rejected(r) => ValidationOutcome::Rejected(RejectReason::Invalid(r)),
         }
     }
@@ -1597,6 +4003,7 @@ impl Simulation {
         }
 
         let mut routine = self.routine_proposals(&acted);
+        let mut claimed: BTreeSet<ActorId> = BTreeSet::new();
         // At-post gate: autonomy may replace a routine proposal only when the
         // actor is at its scheduled post (routine idles) or has no schedule
         // entry; it never hijacks schedule-driven moves. Pursuing actors are
@@ -1612,6 +4019,7 @@ impl Simulation {
             if !at_post {
                 continue;
             }
+            claimed.insert(p.proposal.actor.clone());
             if let Some(pursuit) = p.pursuit {
                 self.commit_pursuit(p.proposal.actor.clone(), pursuit);
             }
@@ -1619,6 +4027,51 @@ impl Simulation {
                 routine[pos] = p.proposal;
             } else {
                 routine.push(p.proposal);
+            }
+        }
+        // Deal responses (behavior-engine Phase 2): an actor with a due
+        // obligation answers it through the ranked options. The same at-post
+        // gate applies: a due deal never hijacks a schedule move. A dropped
+        // proposal's sampled decision record goes with it — a pending
+        // decision must never outlive its proposal and mis-attribute itself
+        // to the actor's next unrelated trace.
+        for p in self.deal_response_proposals(&acted) {
+            let at_post = match routine.iter().find(|r| r.actor == p.actor) {
+                Some(r) => matches!(r.action, Action::Idle),
+                None => true,
+            };
+            if !at_post {
+                self.pending_decisions.remove(&p.actor);
+                continue;
+            }
+            claimed.insert(p.actor.clone());
+            if let Some(pos) = routine.iter().position(|r| r.actor == p.actor) {
+                routine[pos] = p;
+            } else {
+                routine.push(p);
+            }
+        }
+        // Bounded event-driven planning (design §4.3, §8; plan I-6 I6a):
+        // the fair activation pass consumes reconsideration signals, urgent
+        // needs, gated emotion responses and existing plans — continuing
+        // plans on the fast path and replanning under explicit per-activation
+        // work caps. Same at-post gate: a plan never hijacks a schedule move.
+        // A dropped proposal's sampled decision record goes with it — a
+        // pending decision must never outlive its proposal and mis-attribute
+        // itself to the actor's next unrelated trace.
+        for p in self.planner_proposals(&acted, &claimed) {
+            let at_post = match routine.iter().find(|r| r.actor == p.actor) {
+                Some(r) => matches!(r.action, Action::Idle),
+                None => true,
+            };
+            if !at_post {
+                self.pending_decisions.remove(&p.actor);
+                continue;
+            }
+            if let Some(pos) = routine.iter().position(|r| r.actor == p.actor) {
+                routine[pos] = p;
+            } else {
+                routine.push(p);
             }
         }
         for p in &routine {
@@ -1632,7 +4085,850 @@ impl Simulation {
             self.ambient_incidents(&mut report);
         }
         self.maintain(&mut report);
+        self.mind_and_social_maintenance(&mut report);
         report
+    }
+
+    /// Mind and social maintenance (behavior-engine Phase 3; plan I-4a,
+    /// I-4b and G4): the deterministic end-of-tick pass over needs, emotions,
+    /// relationship and appraisal-memory maintenance.
+    ///
+    /// **Background mutation classification (plan G4, metric M1):** regular
+    /// needs/emotions/relationship decay and memory-salience decay are
+    /// *declared non-evented background mutations* — they mutate canonical
+    /// actor state in this pipeline without a per-tick event; this function
+    /// is the single declared site for that classification. Threshold
+    /// crossings (need urgency latch) and the mapped goal-urgency raise they
+    /// trigger ARE event-sourced as typed `NeedThresholdCrossed`,
+    /// `GoalUrgencyRaised` / `GoalUrgencyReleased` events. Everything here is
+    /// a pure function of canonical state in deterministic actor-id order,
+    /// so replay reproduces it exactly.
+    fn mind_and_social_maintenance(&mut self, report: &mut StepReport) {
+        let (tick, minute) = (self.world.tick, self.world.minute_of_day);
+        // Pass 1 — decay (classified non-evented) + crossing detection, in
+        // deterministic actor-id order.
+        let mut crossings: Vec<(ActorId, Vec<NeedCrossing>)> = Vec::new();
+        let mut gates: Vec<(ActorId, EmotionResponse)> = Vec::new();
+        for (id, actor) in self.world.actors.iter_mut() {
+            if !actor.is_alive() {
+                continue;
+            }
+            let crossed = actor.needs.decay(&self.config.needs);
+            if !crossed.is_empty() {
+                crossings.push((id.clone(), crossed));
+            }
+            actor.emotions.decay(&self.config.emotions);
+            // Threshold-gated response classes (design §11 Phase 3): the
+            // gated classes are *consumed in production action selection*
+            // (plan I-6 I6a item 3): the planner pass generates grounded,
+            // validated response candidates from them (flee/retaliate/
+            // comfort/reconcile). They are still reported.
+            for r in actor.emotions.responses(&self.config.emotions) {
+                report.gated_responses.push((id.clone(), r));
+                gates.push((id.clone(), r));
+            }
+        }
+        for (id, r) in gates {
+            self.signal(&id, ReplanTrigger::EmotionGate { response: r }, None);
+        }
+        social::decay_relationships(
+            &mut self.world,
+            &self.config.relationship_decay,
+            self.config.rel_memory_salience_decay,
+        );
+        // Pass 2 — event-sourced threshold crossings and the bounded,
+        // hysteresis-guarded goal-urgency raise they map onto.
+        for (actor_id, crossed) in crossings {
+            for c in crossed {
+                self.events.push(
+                    tick,
+                    minute,
+                    Some(actor_id.clone()),
+                    EventKind::NeedThresholdCrossed {
+                        actor: actor_id.clone(),
+                        need: c.kind,
+                        direction: c.direction,
+                        value: c.value,
+                    },
+                    Vec::new(),
+                    Vec::new(),
+                );
+                match c.direction {
+                    ThresholdDirection::FellBelow => {
+                        // A relevant event for the actor's planner: the
+                        // latched need gives it a claim on an activation
+                        // (bounded signal, plan I-6 I6a item 1).
+                        self.signal(&actor_id, ReplanTrigger::NeedUrgent { need: c.kind }, None);
+                        // Raise the mapped active goals' urgency by the
+                        // bounded mapped amount (T3.8); recorded so the
+                        // release can subtract exactly what was added.
+                        let urgency = self
+                            .world
+                            .actor(&actor_id)
+                            .map(|a| a.needs.urgency(c.kind, &self.config.needs))
+                            .unwrap_or(0.0);
+                        if urgency <= 0.0 {
+                            continue;
+                        }
+                        let need = c.kind;
+                        let Some(actor) = self.world.actor_mut(&actor_id) else {
+                            continue;
+                        };
+                        for goal in actor.goals.iter_mut() {
+                            if goal.status != rpg_domain::world::GoalStatus::Active
+                                || goal_kind_need(goal.kind) != Some(need)
+                            {
+                                continue;
+                            }
+                            goal.need_boost = urgency;
+                            goal.priority += urgency;
+                            self.events.push(
+                                tick,
+                                minute,
+                                Some(actor_id.clone()),
+                                EventKind::GoalUrgencyRaised {
+                                    actor: actor_id.clone(),
+                                    goal: goal.id,
+                                    need,
+                                    urgency,
+                                },
+                                Vec::new(),
+                                Vec::new(),
+                            );
+                        }
+                    }
+                    ThresholdDirection::Recovered => {
+                        // Release: remove exactly the boost applied at the
+                        // crossing (hysteresis guard, T3.8).
+                        let need = c.kind;
+                        let Some(actor) = self.world.actor_mut(&actor_id) else {
+                            continue;
+                        };
+                        for goal in actor.goals.iter_mut() {
+                            if goal_kind_need(goal.kind) != Some(need) || goal.need_boost <= 0.0 {
+                                continue;
+                            }
+                            goal.priority -= goal.need_boost;
+                            goal.need_boost = 0.0;
+                            self.events.push(
+                                tick,
+                                minute,
+                                Some(actor_id.clone()),
+                                EventKind::GoalUrgencyReleased {
+                                    actor: actor_id.clone(),
+                                    goal: goal.id,
+                                    need,
+                                },
+                                Vec::new(),
+                                Vec::new(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Production deal responses (behavior-engine Phase 2): an actor with a
+    /// due obligation answers it through the ranked options.
+    ///
+    /// * **Fast path** (T2.1): an adopted intention continues without
+    ///   re-deliberation while it stays valid (its satisfaction predicate —
+    ///   the deal's performance predicate — has not begun to hold and its
+    ///   abandonment criteria are unmet) *and* is still the ranked best.
+    /// * **Re-plan**: otherwise the options are re-ranked with the switch
+    ///   penalty against the standing intention (η_i·switch_i deters
+    ///   oscillation) and the best acceptable option is adopted. Rejected
+    ///   attempts count toward the abandonment criteria; an intention whose
+    ///   configured failure threshold is reached is abandoned and is not
+    ///   re-adopted.
+    ///
+    /// Deterministic: the ranking is a pure function of world state; no
+    /// sampling in the pipeline (the seeded softmax sampler remains available
+    /// to callers that track an RNG stream).
+    pub fn deal_response_proposals(
+        &mut self,
+        already_acted: &BTreeSet<ActorId>,
+    ) -> Vec<ActionProposal> {
+        let mut out = Vec::new();
+        if self.world.deals.is_empty() {
+            return out;
+        }
+        // Retire intentions that are satisfied, even when no deal is due
+        // anymore (an intention is not an obligation). *Abandoned* intentions
+        // are deliberately kept: the configured failure threshold has
+        // declared the goal given up, and keeping the abandoned intention in
+        // place is what stops the pipeline from re-adopting the same
+        // abandoned plan on a later tick (T2.1).
+        let stale: Vec<ActorId> = self
+            .deal_intentions
+            .iter()
+            .filter(|(id, intent)| {
+                matches!(
+                    rpg_behavior::consider_replan(intent, &self.world),
+                    rpg_behavior::Replan::Replan(rpg_behavior::ReplanReason::GoalSatisfied)
+                ) || !self
+                    .world
+                    .actor(id)
+                    .is_some_and(|a| a.is_alive() && a.kind != ActorKind::Player)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in stale {
+            self.deal_intentions.remove(&id);
+        }
+        let due_debtors: Vec<ActorId> = {
+            let mut ids: BTreeSet<ActorId> = self
+                .world
+                .deals
+                .values()
+                .filter(|d| d.state == rpg_domain::deal::DealState::PerformanceDue)
+                .map(|d| d.debtor.clone())
+                .collect();
+            ids.retain(|id| {
+                self.world.actor(id).is_some_and(|a| {
+                    a.is_alive()
+                        && a.kind != ActorKind::Player
+                        && !already_acted.contains(&a.id)
+                        && !self.paths.contains_key(&a.id)
+                        && a.in_private_conversation_with.is_none()
+                        && !self
+                            .pending_private
+                            .iter()
+                            .any(|p| p.a == a.id || p.b == a.id)
+                        && !self.autonomy.is_pursuing(&a.id)
+                })
+            });
+            ids.into_iter().collect()
+        };
+        for npc in due_debtors {
+            let tick = self.world.tick;
+            // Fast path: the adopted intention continues.
+            if let Some(intent) = self.deal_intentions.get(&npc).cloned() {
+                match rpg_behavior::consider_replan(&intent, &self.world) {
+                    rpg_behavior::Replan::Continue => {
+                        let options = rpg_agents::deal_response_options(
+                            &self.world,
+                            &npc,
+                            Some(&intent),
+                            Some(self.config.talk_radius),
+                            &self.config.needs,
+                        );
+                        if let Some(options) = options {
+                            if options
+                                .ranking
+                                .ranked
+                                .first()
+                                .is_some_and(|b| b.id == intent.option)
+                            {
+                                if let Some(action) = rpg_agents::deal_response_action(
+                                    &self.world,
+                                    &options,
+                                    &intent.option,
+                                ) {
+                                    out.push(ActionProposal {
+                                        actor: npc,
+                                        action,
+                                        source: ProposalSource::NpcPolicy,
+                                        rationale: format!(
+                                            "deal intention: {} (fast path)",
+                                            intent.option
+                                        ),
+                                    });
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    rpg_behavior::Replan::Replan(rpg_behavior::ReplanReason::GoalSatisfied) => {
+                        // Invalidated (satisfied): clear it and re-deliberate
+                        // below.
+                        self.deal_intentions.remove(&npc);
+                    }
+                    rpg_behavior::Replan::Replan(rpg_behavior::ReplanReason::Abandoned) => {
+                        // The configured failure threshold declared the goal
+                        // abandoned: the actor gives it up. No proposal is
+                        // generated and the abandoned intention is *not*
+                        // re-adopted — re-deliberating would deterministically
+                        // re-choose the same option and loop the failure
+                        // counter forever. The deadline path (§4.5) still
+                        // owns the contract's breach resolution.
+                        continue;
+                    }
+                }
+            }
+            // Re-plan: rank and adopt through seeded, recorded utility
+            // selection (design §4.2, T2.9b): the ranking is a pure function
+            // of the actor's needs and the option expectations; the sample is
+            // drawn from the sim's persistent RNG stream and recorded into
+            // the decision stream (rationale + causal trace). Replay
+            // reproduces the choice; save/load preserves the stream.
+            let previous = self.deal_intentions.get(&npc).cloned();
+            let Some(options) = rpg_agents::deal_response_options(
+                &self.world,
+                &npc,
+                previous.as_ref(),
+                Some(self.config.talk_radius),
+                &self.config.needs,
+            ) else {
+                continue;
+            };
+            let sample_params = rpg_behavior::Params {
+                switch_penalty: 2.0,
+                tau: self.config.utility_sampling.tau,
+                needs_alpha: 1.0,
+            };
+            let sampled = if self.config.utility_sampling.enabled {
+                rpg_behavior::sample(&options.ranking, sample_params, &mut self.rng)
+            } else {
+                options
+                    .ranking
+                    .ranked
+                    .first()
+                    .map(|s| rpg_behavior::Sampled {
+                        id: s.id.clone(),
+                        index: 0,
+                        sample: 0.0,
+                    })
+            };
+            let Some(sampled) = sampled else {
+                continue;
+            };
+            let best = match options.ranking.ranked.iter().find(|s| s.id == sampled.id) {
+                Some(s) => s.clone(),
+                None => continue,
+            };
+            self.pending_decisions.insert(
+                npc.clone(),
+                DecisionRecord {
+                    option: best.id.clone(),
+                    utilities: options
+                        .ranking
+                        .ranked
+                        .iter()
+                        .map(|s| (s.id.clone(), s.utility))
+                        .collect(),
+                    sample: if self.config.utility_sampling.enabled {
+                        Some(sampled.sample)
+                    } else {
+                        None
+                    },
+                    tau: sample_params.tau,
+                },
+            );
+            let Some(action) = rpg_agents::deal_response_action(&self.world, &options, &best.id)
+            else {
+                continue;
+            };
+            let satisfaction = self
+                .world
+                .deals
+                .get(&options.deal)
+                .map(|d| d.performance.clone());
+            let intention = rpg_behavior::Intention::adopt(
+                format!("respond to deal #{}", options.deal.raw()),
+                best.id.clone(),
+                satisfaction,
+                rpg_domain::behavior_types::AbandonmentCriteria {
+                    after_failed_attempts: Some(3),
+                    predicate: None,
+                },
+                tick,
+                previous.as_ref(),
+            );
+            self.deal_intentions.insert(npc.clone(), intention);
+            out.push(ActionProposal {
+                actor: npc,
+                action,
+                source: ProposalSource::NpcPolicy,
+                rationale: if self.config.utility_sampling.enabled {
+                    format!(
+                        "deal #{}: {} (sample={:.4}, tau={:.2})",
+                        options.deal.raw(),
+                        best.id,
+                        sampled.sample,
+                        sample_params.tau
+                    )
+                } else {
+                    format!("deal #{}: {}", options.deal.raw(), best.id)
+                },
+            });
+        }
+        out
+    }
+
+    /// Record a failed attempt on the actor's adopted deal intention (a
+    /// rejection of its proposed action), feeding the abandonment criteria.
+    pub fn record_deal_intention_failure(&mut self, actor: &ActorId) {
+        if let Some(intent) = self.deal_intentions.get_mut(actor) {
+            intent.record_failure();
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Bounded event-driven planning (design §4.3, §8; plan I-6 I6a item 1)
+    // -----------------------------------------------------------------
+
+    /// The fair, bounded, event-driven activation pass.
+    ///
+    /// * **Event-driven**: only actors with a *relevant* pending trigger are
+    ///   considered — bounded reconsideration signals (their own appraisal,
+    ///   their own question, their own contracts, their latched needs, their
+    ///   gated emotion responses, an offer made to them), a persistent plan
+    ///   to continue, a latched-urgent need, or a gated emotion class. An
+    ///   unrelated event elsewhere never produces a trigger, so it can never
+    ///   cause an activation or a replan (adversarial regression).
+    /// * **Deterministically fair**: round-robin rotation over the eligible
+    ///   set with a stable order — over a window of ticks every eligible NPC
+    ///   is activated (design §8 `pick_active_agents_with_budget`); actors
+    ///   with pending relevant signals go first within the same budget.
+    /// * **Bounded**: at most `max_activations_per_tick` activations per
+    ///   step and at most `max_candidates_per_activation` candidate options
+    ///   considered per activation (hard caps; design §9.2.4, M6). The fast
+    ///   path continues an adopted plan without re-deliberation (§4.3) and
+    ///   consumes no randomness; only a fresh adoption draws a recorded
+    ///   softmax sample from the sim's persistent RNG stream.
+    /// * **Persistent**: adopted plans (design §3 `J`) survive ticks and
+    ///   save/load in the transient state; abandonment suppresses the same
+    ///   option for a cooldown window instead of looping.
+    ///
+    /// Determinism: eligibility collection and activation run in actor-id
+    /// order; the activation budget, candidate cap and RNG draws are all
+    /// pure functions of canonical state plus the seeded RNG stream.
+    pub fn planner_proposals(
+        &mut self,
+        already_acted: &BTreeSet<ActorId>,
+        claimed: &BTreeSet<ActorId>,
+    ) -> Vec<ActionProposal> {
+        let mut out = Vec::new();
+        self.last_planner_pass = PlannerPassRecord::default();
+        if !self.config.activation.enabled {
+            return out;
+        }
+        let tick = self.world.tick;
+        let budget = self.config.activation.max_activations_per_tick;
+        let candidate_cap = self.config.activation.max_candidates_per_activation.max(1);
+
+        // 1. Eligibility + triggers, deterministic actor-id order.
+        let mut eligible: BTreeSet<ActorId> = BTreeSet::new();
+        for actor in self.world.actors.values() {
+            let id = &actor.id;
+            if !actor.is_alive()
+                || actor.kind == ActorKind::Player
+                || already_acted.contains(id)
+                || claimed.contains(id)
+                || self.paths.contains_key(id)
+                || actor.in_private_conversation_with.is_some()
+                || self
+                    .pending_private
+                    .iter()
+                    .any(|p| p.a == *id || p.b == *id)
+            {
+                continue;
+            }
+            // Conversation preservation (same rule the autonomy layer
+            // applies): never redirect an actor standing next to the player.
+            if self
+                .world
+                .actor(&ActorId::new(PLAYER))
+                .is_some_and(|p| p.pos.distance(actor.pos) <= self.config.talk_radius)
+            {
+                continue;
+            }
+            let triggered = !self.planner.signals.get(id).is_none_or(|s| s.is_empty())
+                || self.planner.plans.contains_key(id)
+                || rpg_domain::needs::NEED_KINDS
+                    .iter()
+                    .any(|k| actor.needs.is_urgent(*k))
+                || !actor.emotions.responses(&self.config.emotions).is_empty();
+            if triggered {
+                eligible.insert(id.clone());
+            }
+        }
+        if eligible.is_empty() {
+            return out;
+        }
+
+        // 2. Fair deterministic activation (signals first, round-robin fill).
+        let priority: Vec<ActorId> = eligible
+            .iter()
+            .filter(|id| self.planner.signals.get(*id).is_some_and(|s| !s.is_empty()))
+            .cloned()
+            .collect();
+        self.planner
+            .activation
+            .ensure_order(&eligible.iter().cloned().collect::<Vec<_>>());
+        self.planner.prune_abandoned(tick);
+        let activated = self
+            .planner
+            .activation
+            .pick(&eligible, &priority, budget, tick);
+
+        // 3. Per-activation work, under explicit caps.
+        for actor in activated {
+            // Consume this actor's pending signals exactly once (bounded).
+            let signal_count = self.planner.take_signals(&actor).len();
+            let mut work = 0usize;
+            let mut replanned = false;
+            // The intention this activation switches from, when the plan it
+            // retired is re-deliberated below (§4.2 switch bookkeeping).
+            let mut switch_from: Option<rpg_behavior::Intention> = None;
+
+            // Fast path: the persistent plan continues without
+            // re-deliberation while it stays valid (design §4.3, T2.1).
+            if let Some(plan) = self.planner.plans.get(&actor).cloned() {
+                match rpg_behavior::consider_replan(&plan.intention, &self.world) {
+                    rpg_behavior::Replan::Continue => {
+                        // One-shot plans retire once their validated outcome
+                        // event exists (a question asked, a sanction issued,
+                        // an excuse granted, an apology given) — matched by
+                        // the plan's full parameters, never by actor+kind
+                        // alone (plan I-6 I6b hardening).
+                        let done = rpg_agents::planner_candidates::is_one_shot_option(
+                            &plan.intention.option,
+                        ) && rpg_agents::planner_candidates::one_shot_completed(
+                            &plan.action,
+                            &actor,
+                            &self.events,
+                            plan.adopted_tick,
+                        );
+                        if done {
+                            // Bounded attention (design §6.4): a completed
+                            // one-shot option is not re-adopted for the
+                            // cooldown window — a freshly completed question/
+                            // sanction/excuse/retell must not immediately
+                            // re-fire while its outcome is still the latest
+                            // news (the plan's goal state exists).
+                            self.planner.record_abandoned(
+                                &actor,
+                                &plan.intention.option,
+                                tick + self.config.activation.abandon_cooldown_ticks,
+                            );
+                            self.planner.plans.remove(&actor);
+                            if signal_count == 0 {
+                                self.last_planner_pass.activations.push(PlannerActivation {
+                                    actor,
+                                    signals: signal_count,
+                                    work,
+                                    replanned,
+                                });
+                                continue;
+                            }
+                            // Signals delivered in the same step the plan
+                            // completes are not silently consumed: the plan
+                            // is retired above and the activation falls
+                            // through to deliberation, so the pending
+                            // signals are spent on a real decision in this
+                            // pass (one-shot completion + same-step
+                            // retirement signal handling, I6b item 5).
+                        } else if plan.last_proposed_tick.is_some() {
+                            // The plan's own step was already proposed: a
+                            // one-shot never re-executes (no duplicate
+                            // outcomes). Two cases only: the outcome event
+                            // exists but has scrolled past the bounded
+                            // retirement window under event load — retire on
+                            // the proposed-once record; or the step was
+                            // rejected — failure bookkeeping owns the bounded
+                            // retry (3 attempts → abandonment), so fall
+                            // through to re-deliberation.
+                            let proposed_at = plan.last_proposed_tick.unwrap_or(0);
+                            let rejected_since = self.events.all().iter().rev().take(64).any(|e| {
+                                e.tick >= proposed_at
+                                    && e.actor.as_ref() == Some(&actor)
+                                    && matches!(
+                                        &e.kind,
+                                        EventKind::ActionRejected { action, .. }
+                                            if action.as_str()
+                                                == plan.action.kind_name()
+                                    )
+                            });
+                            if !rejected_since {
+                                // Bounded attention (design §6.4): the
+                                // window-miss retirement carries the same
+                                // cooldown as an observed completion — the
+                                // outcome event exists (the proposal was
+                                // accepted and dispatched) even though it
+                                // scrolled past the bounded retirement
+                                // window under event load. Without this a
+                                // flood re-deliberation re-adopts and
+                                // re-executes the same proposal (duplicate
+                                // outcome). Bounded: re-adoption resumes
+                                // after the cooldown window expires.
+                                self.planner.record_abandoned(
+                                    &actor,
+                                    &plan.intention.option,
+                                    tick + self.config.activation.abandon_cooldown_ticks,
+                                );
+                                self.planner.plans.remove(&actor);
+                                self.last_planner_pass.activations.push(PlannerActivation {
+                                    actor,
+                                    signals: signal_count,
+                                    work,
+                                    replanned,
+                                });
+                                continue;
+                            }
+                        }
+                        if signal_count == 0 {
+                            out.push(ActionProposal {
+                                actor: actor.clone(),
+                                action: plan.action.clone(),
+                                source: ProposalSource::NpcPolicy,
+                                rationale: format!("plan: {} (fast path)", plan.intention.option),
+                            });
+                            if rpg_agents::planner_candidates::is_one_shot_option(
+                                &plan.intention.option,
+                            ) {
+                                if let Some(p) = self.planner.plans.get_mut(&actor) {
+                                    p.last_proposed_tick = Some(tick);
+                                }
+                            }
+                            self.last_planner_pass.activations.push(PlannerActivation {
+                                actor,
+                                signals: signal_count,
+                                work,
+                                replanned,
+                            });
+                            continue;
+                        }
+                        // Relevant signals arrived (the actor's own
+                        // appraisal, question, contract, need, gate, offer or
+                        // delivered claim): bounded reconsideration (design
+                        // §4.3 medium path). The plan stays installed and is
+                        // ranked as the incumbent below — it is kept unless a
+                        // challenger beats it through the switch penalty.
+                    }
+                    rpg_behavior::Replan::Replan(rpg_behavior::ReplanReason::GoalSatisfied) => {
+                        // The plan reached its predicate: retire it and
+                        // re-deliberate below (the same activation may adopt
+                        // the next grounded plan). The retired intention is
+                        // the `previous` a fresh adoption switches from.
+                        switch_from = Some(plan.intention.clone());
+                        self.planner.plans.remove(&actor);
+                    }
+                    rpg_behavior::Replan::Replan(rpg_behavior::ReplanReason::Abandoned) => {
+                        // Explicitly given up; suppress re-adoption of the
+                        // same option for the cooldown window (no loop).
+                        let option = plan.intention.option.clone();
+                        self.planner.record_abandoned(
+                            &actor,
+                            &option,
+                            tick + self.config.activation.abandon_cooldown_ticks,
+                        );
+                        self.planner.plans.remove(&actor);
+                        self.last_planner_pass.activations.push(PlannerActivation {
+                            actor,
+                            signals: signal_count,
+                            work,
+                            replanned,
+                        });
+                        continue;
+                    }
+                }
+            }
+
+            // Re-plan/deliberate (a fresh adoption, a retirement, or — when
+            // relevant signals arrived during an active plan — a bounded
+            // reconsideration of the incumbent): generate the actor's local
+            // candidates, bounded by the per-activation work cap (enforced
+            // inside generation).
+            replanned = true;
+            let generated = rpg_agents::planner_candidates::planner_candidates(
+                &self.world,
+                &actor,
+                &self.events,
+                &self.config.needs,
+                &self.config.emotions,
+                self.config.talk_radius,
+                candidate_cap,
+                &self.sanctions,
+            );
+            work += generated.len();
+            let candidates: Vec<&rpg_agents::planner_candidates::PlannerCandidate> = generated
+                .iter()
+                .filter(|c| !self.planner.recently_abandoned(&actor, &c.option.id, tick))
+                .take(candidate_cap)
+                .collect();
+            if candidates.is_empty() {
+                // Nothing grounded to do — an activation with no work spent
+                // is honest no-op (bounded deliberation, §4.3). A plan that
+                // was merely reconsidered stays installed.
+                self.last_planner_pass.activations.push(PlannerActivation {
+                    actor,
+                    signals: signal_count,
+                    work,
+                    replanned,
+                });
+                continue;
+            }
+            // The live incumbent (an active plan under reconsideration) is
+            // ranked *as* the current intention: challengers pay the §4.2
+            // switch penalty (η_i·switch_i), so signals genuinely reopen
+            // deliberation without defeating intention persistence.
+            let previous = self
+                .planner
+                .plans
+                .get(&actor)
+                .map(|p| p.intention.clone())
+                .or(switch_from);
+            let incumbent = previous.as_ref().map(|i| i.option.clone());
+            let params = rpg_behavior::Params {
+                switch_penalty: 2.0,
+                tau: self.config.utility_sampling.tau,
+                needs_alpha: 1.0,
+            };
+            let needs = self
+                .world
+                .actor(&actor)
+                .map(|a| a.needs.clone())
+                .unwrap_or_default();
+            let ranking = rpg_behavior::rank_with_needs(
+                &candidates
+                    .iter()
+                    .map(|c| c.option.clone())
+                    .collect::<Vec<_>>(),
+                incumbent.as_deref(),
+                params,
+                &needs,
+                &self.config.needs,
+            );
+            // Seeded, recorded utility selection (design §4.2, T2.9b): the
+            // sample is drawn from the sim's persistent RNG stream (replay
+            // reproduces it; save/load preserves it) and recorded into the
+            // decision stream (rationale + causal trace).
+            let chosen = if self.config.utility_sampling.enabled {
+                rpg_behavior::sample(&ranking, params, &mut self.rng)
+            } else {
+                ranking.ranked.first().map(|s| rpg_behavior::Sampled {
+                    id: s.id.clone(),
+                    index: 0,
+                    sample: 0.0,
+                })
+            };
+            let Some(sampled) = chosen else {
+                self.last_planner_pass.activations.push(PlannerActivation {
+                    actor,
+                    signals: signal_count,
+                    work,
+                    replanned,
+                });
+                continue;
+            };
+            let Some(candidate) = candidates
+                .iter()
+                .find(|c| c.option.id == sampled.id)
+                .cloned()
+                .cloned()
+            else {
+                self.last_planner_pass.activations.push(PlannerActivation {
+                    actor,
+                    signals: signal_count,
+                    work,
+                    replanned,
+                });
+                continue;
+            };
+            self.pending_decisions.insert(
+                actor.clone(),
+                DecisionRecord {
+                    option: sampled.id.clone(),
+                    utilities: ranking
+                        .ranked
+                        .iter()
+                        .map(|s| (s.id.clone(), s.utility))
+                        .collect(),
+                    sample: if self.config.utility_sampling.enabled {
+                        Some(sampled.sample)
+                    } else {
+                        None
+                    },
+                    tau: params.tau,
+                },
+            );
+            // Reconsideration kept the incumbent: the plan is *not*
+            // re-adopted (its adopted tick and failure history persist —
+            // intention persistence, §4.3); it simply continues this tick.
+            if let Some(plan) = self.planner.plans.get(&actor).cloned() {
+                if plan.intention.option == sampled.id {
+                    out.push(ActionProposal {
+                        actor: actor.clone(),
+                        action: plan.action.clone(),
+                        source: ProposalSource::NpcPolicy,
+                        rationale: format!("plan: {} (reconsidered: kept)", plan.intention.option),
+                    });
+                    if rpg_agents::planner_candidates::is_one_shot_option(&plan.intention.option) {
+                        if let Some(p) = self.planner.plans.get_mut(&actor) {
+                            p.last_proposed_tick = Some(tick);
+                        }
+                    }
+                    self.last_planner_pass.activations.push(PlannerActivation {
+                        actor,
+                        signals: signal_count,
+                        work,
+                        replanned,
+                    });
+                    continue;
+                }
+            }
+            let plan = rpg_behavior::planner::adopt_plan(
+                &candidate.summary,
+                candidate.option.id.clone(),
+                candidate.action.clone(),
+                candidate.satisfaction.clone(),
+                rpg_domain::behavior_types::AbandonmentCriteria {
+                    after_failed_attempts: Some(3),
+                    predicate: None,
+                },
+                tick,
+                previous.as_ref(),
+            );
+            // A plan is adopted to *achieve* its satisfaction predicate. When
+            // the predicate already holds, adopting would churn: the step is
+            // rejected honestly (its precondition is gone), the satisfied
+            // predicate retires the plan, and a fresh adoption restarts the
+            // cycle every tick. Adopting nothing is the honest no-op
+            // (bounded deliberation, design §4.3).
+            if plan
+                .intention
+                .satisfaction
+                .as_ref()
+                .is_some_and(|pred| rpg_domain::world::evaluate_predicate(&self.world, pred))
+            {
+                self.last_planner_pass.activations.push(PlannerActivation {
+                    actor,
+                    signals: signal_count,
+                    work,
+                    replanned,
+                });
+                continue;
+            }
+            self.planner.plans.insert(actor.clone(), plan);
+            if rpg_agents::planner_candidates::is_one_shot_option(&sampled.id) {
+                if let Some(p) = self.planner.plans.get_mut(&actor) {
+                    p.last_proposed_tick = Some(tick);
+                }
+            }
+            out.push(ActionProposal {
+                actor: actor.clone(),
+                action: candidate.action,
+                source: ProposalSource::NpcPolicy,
+                rationale: if self.config.utility_sampling.enabled {
+                    format!(
+                        "plan: {} (sample={:.4}, tau={:.2})",
+                        sampled.id, sampled.sample, params.tau
+                    )
+                } else {
+                    format!("plan: {0}", sampled.id)
+                },
+            });
+            self.last_planner_pass.activations.push(PlannerActivation {
+                actor,
+                signals: signal_count,
+                work,
+                replanned,
+            });
+        }
+        out
     }
 
     fn advance_clock(&mut self) {
@@ -1760,10 +5056,28 @@ impl Simulation {
     /// Faction budgets: pay for the highest-value affordable priority. This is
     /// where "cost of inaction" shows up — unresolved damage accumulates and
     /// priorities compete for a finite budget.
+    /// The member-report belief above which a faction funds a repair
+    /// initiative (design §5.5: group decisions derive from communicated
+    /// member reports, never truth access).
+    const REPAIR_INITIATIVE_MIN_BELIEF: f32 = 0.3;
+    /// Cooldown (ticks) between repair initiatives for the same
+    /// (faction, location): bounded institutional attention (§6.4).
+    const REPAIR_INITIATIVE_COOLDOWN_TICKS: u64 = 60;
+
     pub fn faction_tick(&mut self) {
+        let (tick, minute) = (self.world.tick, self.world.minute_of_day);
         let faction_ids: Vec<FactionId> = self.world.factions.keys().cloned().collect();
         for fid in faction_ids {
-            // Unresolved damage to responsible locations accumulates.
+            let members: Vec<ActorId> = self
+                .world
+                .faction(&fid)
+                .map(|f| f.members.clone())
+                .unwrap_or_default();
+            // Unresolved damage to responsible locations accumulates. The
+            // wear itself is environmental physics; each 0.01 increment is
+            // event-sourced (carrying the 0.1-granular level), so the
+            // previously silent background accumulation becomes a causal
+            // record (M1: substantive world mutations are evented).
             let damaged: Vec<LocationId> = self
                 .world
                 .faction(&fid)
@@ -1776,9 +5090,89 @@ impl Simulation {
                 })
                 .unwrap_or_default();
             for loc in &damaged {
-                // Damage slowly worsens while ignored.
+                // Damage slowly worsens while ignored. Every wear tick is
+                // event-sourced (M1: the previously silent background
+                // accumulation becomes a causal record).
                 let cur = self.world.damage_at(loc);
-                self.world.damage.insert(loc.clone(), (cur + 0.01).min(1.0));
+                let next = (cur + 0.01).min(1.0);
+                self.world.damage.insert(loc.clone(), next);
+                self.events.push(
+                    tick,
+                    minute,
+                    None,
+                    EventKind::WearProgressed {
+                        location: loc.clone(),
+                        level: (next * 10.0).floor() as u8,
+                    },
+                    Vec::new(),
+                    Vec::new(),
+                );
+            }
+            // Group decision from member reports (design §5.5): the faction
+            // believes what its members' own ledgers support — it has no
+            // truth access here. When the aggregate says a responsible
+            // location needs repair, the faction funds an initiative from
+            // its own budget (a real institutional spend, evented); the
+            // repair itself is only ever performed by a real member through
+            // validated dispatch (the `work_repair` planner family). A
+            // misreporting member therefore makes the faction spend on a
+            // repair truth never needs — that is the honest cost of being
+            // wrong (T4.3).
+            let responsible: Vec<LocationId> = self
+                .world
+                .faction(&fid)
+                .map(|f| f.responsible_for.clone())
+                .unwrap_or_default();
+            for loc in responsible {
+                let believed = rpg_agents::planner_candidates::faction_believed_damage(
+                    &self.world,
+                    &fid,
+                    &loc,
+                );
+                if believed < Self::REPAIR_INITIATIVE_MIN_BELIEF {
+                    continue;
+                }
+                let cooldown_key = format!("{fid}|{loc}");
+                let ready = self
+                    .faction_repair_cooldown
+                    .get(&cooldown_key)
+                    .is_none_or(|until| tick >= *until);
+                if !ready {
+                    continue;
+                }
+                // The budget estimate is the faction's *believed* severity —
+                // a misbelief overpays exactly as much as it believes.
+                let amount = (believed * 200.0) as i64;
+                if amount <= 0 {
+                    continue;
+                }
+                match self.world.faction_mut(&fid) {
+                    Some(f) if f.budget >= amount => f.budget -= amount,
+                    _ => continue,
+                }
+                *self
+                    .world
+                    .ledger
+                    .entry(format!("{fid}:repair {loc}"))
+                    .or_insert(0) += amount;
+                self.events.push(
+                    tick,
+                    minute,
+                    None,
+                    EventKind::FactionRepairInitiated {
+                        faction: fid.clone(),
+                        location: loc.clone(),
+                        believed_damage: believed,
+                        amount,
+                    },
+                    Vec::new(),
+                    members.clone(),
+                );
+                self.trace.push(format!(
+                    "{fid} funded repair of {loc} on member reports (believed {believed:.2}, {amount})"
+                ));
+                self.faction_repair_cooldown
+                    .insert(cooldown_key, tick + Self::REPAIR_INITIATIVE_COOLDOWN_TICKS);
             }
             let Some(idx) = self
                 .world
@@ -1803,6 +5197,22 @@ impl Simulation {
                 .ledger
                 .entry(format!("{fid}:{desc}"))
                 .or_insert(0) += cost;
+            // M1: the previously unevented background spend becomes a causal
+            // record — a typed institutional budget event (same kind as a
+            // member-initiated allocation).
+            self.events.push(
+                tick,
+                minute,
+                None,
+                EventKind::BudgetAllocated {
+                    faction: fid.clone(),
+                    amount: cost,
+                    purpose: desc.clone(),
+                    priority: desc.clone(),
+                },
+                Vec::new(),
+                members,
+            );
             self.trace.push(format!("{fid} funded '{desc}' for {cost}"));
         }
     }
@@ -1831,7 +5241,40 @@ impl Simulation {
             .insert(loc.clone(), (cur + severity).min(1.0));
         let desc = "an unattended accident caused damage".to_string();
         let (tick, minute) = (self.world.tick, self.world.minute_of_day);
-        self.events.push(
+        // The incident is reported under a canonical public fact (design
+        // §5.5): whoever is at the location witnesses it and holds evidence
+        // for the fact; a faction's member-report aggregate of those
+        // beliefs — never the world's truth — is what its group decisions
+        // act on (T4.3). Ids are deterministic from the incident minute.
+        let fact_id = FactId::new(format!(
+            "f_damage_{}_{}",
+            loc.as_str(),
+            self.world.day as u64 * 1440 + minute as u64
+        ));
+        self.world.facts.insert(
+            fact_id.clone(),
+            rpg_domain::world::Fact {
+                id: fact_id.clone(),
+                statement: format!("the {loc} was damaged"),
+                truth: true,
+                sensitivity: rpg_domain::world::Sensitivity::Public,
+                category: rpg_domain::world::FactCategory::Location,
+                prerequisites: Vec::new(),
+                eligible_holders: Vec::new(),
+                eligible_containers: Vec::new(),
+                committed: true,
+                placed_at: None,
+            },
+        );
+        self.world.damage_facts.insert(loc.clone(), fact_id.clone());
+        let witnesses: Vec<ActorId> = self
+            .world
+            .actors
+            .values()
+            .filter(|a| a.is_alive() && a.location == loc)
+            .map(|a| a.id.clone())
+            .collect();
+        let incident = self.events.push(
             tick,
             minute,
             None,
@@ -1841,13 +5284,27 @@ impl Simulation {
                 severity,
             },
             Vec::new(),
-            Vec::new(),
+            witnesses.clone(),
         );
+        for w in &witnesses {
+            social::record_belief(
+                &mut self.world,
+                &mut self.events,
+                tick,
+                minute,
+                w,
+                &fact_id,
+                true,
+                rpg_domain::behavior_types::AcquisitionChannel::Witnessed.default_reliability(),
+                rpg_domain::world::Provenance::Witnessed { event: incident },
+            );
+        }
         report.background_incidents.push(desc);
     }
 
     /// Story maintenance: satisfy commitments, activate checkpoints, place
-    /// clues. Runs after every step when the director is enabled.
+    /// clues, and advance deals. Runs after every step when the director is
+    /// enabled.
     fn maintain(&mut self, report: &mut StepReport) {
         let (tick, minute) = (self.world.tick, self.world.minute_of_day);
         report
@@ -1858,6 +5315,125 @@ impl Simulation {
                 tick,
                 minute,
             ));
+        self.advance_deals();
+    }
+
+    /// Deal pipeline (plan §4.5: deadline processing is part of the
+    /// deterministic step pipeline, never an out-of-band mutation).
+    ///
+    /// Per tick, per deal, in id order:
+    /// * `Active`: the condition predicate holding moves the deal
+    ///   ConditionMet and — in the same deterministic pass — makes the
+    ///   obligation due (design §7 step 5: separate events, separate state).
+    /// * `PerformanceDue`: the performance predicate holding performs the
+    ///   deal exactly-once (validated world predicate or settled transfer
+    ///   evidence; a fulfillment *claim* alone never moves the FSM).
+    /// * Deadlines: crossing emits exactly one typed `ObligationDue` event
+    ///   (idempotent by state check) and starts the grace policy; an elapsed
+    ///   grace window violates the deal with a typed `DealViolated` event.
+    fn advance_deals(&mut self) {
+        let now = self.world.day as u64 * 1440 + self.world.minute_of_day as u64;
+        let (tick, minute) = (self.world.tick, self.world.minute_of_day);
+        let ids: Vec<DealId> = self.world.deals.keys().copied().collect();
+        for id in ids {
+            // At most one full Active → ConditionMet → PerformanceDue →
+            // Performed chain per deal per tick.
+            for _ in 0..4 {
+                let Some(d) = self.world.deals.get(&id).cloned() else {
+                    break;
+                };
+                if d.is_terminal() {
+                    break;
+                }
+                match d.state {
+                    rpg_domain::deal::DealState::Active => {
+                        if evaluate_predicate(&self.world, &d.condition) {
+                            if self
+                                .apply_deal_event(id, DealEvent::ConditionMet, now, Vec::new())
+                                .is_none()
+                            {
+                                break;
+                            }
+                            continue;
+                        }
+                        if d.condition_deadline_minute
+                            .is_some_and(|deadline| now >= deadline)
+                        {
+                            let crossed = self
+                                .world
+                                .deals
+                                .get_mut(&id)
+                                .map(|x| x.cross_deadline(false, now))
+                                .unwrap_or(false);
+                            if crossed {
+                                self.events.push(
+                                    tick,
+                                    minute,
+                                    None,
+                                    EventKind::ObligationDue { deal: id },
+                                    Vec::new(),
+                                    Vec::new(),
+                                );
+                            }
+                        }
+                        if d.condition_overdue_emitted && d.grace_elapsed(now) {
+                            self.apply_deal_event(
+                                id,
+                                DealEvent::Violate {
+                                    reason: ViolationReason::DeadlineLapsed,
+                                },
+                                now,
+                                Vec::new(),
+                            );
+                        }
+                        break;
+                    }
+                    rpg_domain::deal::DealState::ConditionMet => {
+                        // The obligation becomes due: the trigger predicate
+                        // held, the benefit is still pending.
+                        self.apply_deal_event(id, DealEvent::ObligationDue, now, Vec::new());
+                    }
+                    rpg_domain::deal::DealState::PerformanceDue => {
+                        if evaluate_predicate(&self.world, &d.performance) {
+                            self.perform_deal(&id, &d.debtor, tick, minute);
+                            break;
+                        }
+                        if d.performance_deadline_minute
+                            .is_some_and(|deadline| now >= deadline)
+                        {
+                            let crossed = self
+                                .world
+                                .deals
+                                .get_mut(&id)
+                                .map(|x| x.cross_deadline(true, now))
+                                .unwrap_or(false);
+                            if crossed {
+                                self.events.push(
+                                    tick,
+                                    minute,
+                                    None,
+                                    EventKind::ObligationDue { deal: id },
+                                    Vec::new(),
+                                    Vec::new(),
+                                );
+                            }
+                        }
+                        if d.performance_overdue_emitted && d.grace_elapsed(now) {
+                            self.apply_deal_event(
+                                id,
+                                DealEvent::Violate {
+                                    reason: ViolationReason::DeadlineLapsed,
+                                },
+                                now,
+                                Vec::new(),
+                            );
+                        }
+                        break;
+                    }
+                    _ => break,
+                }
+            }
+        }
     }
 
     fn director_tick(&mut self, report: &mut StepReport) {
@@ -1893,8 +5469,71 @@ impl Simulation {
         total
     }
 
+    /// Deterministic offscreen catch-up (design §8; plan I-6 I6b item 2):
+    /// advance the world by `minutes` of world time with **zero external
+    /// proposals**, so the causal consequences of the skip happen exactly as
+    /// they would have online — through the *same* production step pipeline
+    /// (deal FSM deadlines, faction accounting, seeded incidents, need
+    /// maintenance), never through a parallel reimplementation.
+    ///
+    /// **Documented bounds (T4.6):**
+    /// * at most [`CATCH_UP_MAX_TICKS`] simulation ticks per call — a longer
+    ///   skip is truncated (`report.truncated`) and the caller continues it
+    ///   with further calls; per-tick event counts are the pipeline's own
+    ///   bounded caps (budgeted planner, bounded candidates), so the catch-up
+    ///   event total is bounded by `ticks × per-tick caps`;
+    /// * zero external proposals and zero LLM calls (the bounded planner and
+    ///   the deterministic routine layer are the only deliberation);
+    /// * **causal-equivalence classification**: debts (the deal FSM's
+    ///   deadline arrows, exactly-once), deaths/custody (validated
+    ///   authoritative transitions only), clues (committed narrative state)
+    ///   and resources (validated, conserved transfers) are processed by the
+    ///   *same* authoritative pathways as online play — bit-exact; incidental
+    ///   animation (schedule-driven movement) is exact too in this
+    ///   implementation, which is strictly stronger than the design's
+    ///   "animation need not be exact" allowance.
+    /// * **no duplicated outcomes**: each tick of world time is processed
+    ///   exactly once (the world's own clock is the cursor — a skipped tick
+    ///   is a real tick), and every entry point is recorded as a
+    ///   [`SimOp::Step`], so replay and save/load continuation reproduce the
+    ///   catch-up bit-identically.
+    pub fn catch_up(&mut self, minutes: u32) -> CatchUpReport {
+        let per_tick = self.config.minutes_per_tick.max(1) as u64;
+        let requested = (minutes as u64).div_ceil(per_tick);
+        let ticks = requested.min(CATCH_UP_MAX_TICKS as u64) as u32;
+        let truncated = requested > CATCH_UP_MAX_TICKS as u64;
+        let mut report = CatchUpReport {
+            ticks,
+            truncated,
+            ..CatchUpReport::default()
+        };
+        for _ in 0..ticks {
+            let r = self.step(Vec::new());
+            report.accepted += r.accepted as u64;
+            report.pending += r.pending as u64;
+            report.rejected += r.rejected as u64;
+            report.deals_due += r.satisfied_commitments.len() as u64;
+            report.incidents += r.background_incidents.len() as u64;
+        }
+        report
+    }
+
     /// Convenience: the player actor id.
     pub fn player_id() -> ActorId {
         ActorId::new(PLAYER)
+    }
+}
+
+/// Facts an action is epistemically about (used by causal traces).
+fn action_facts(action: &Action) -> Vec<FactId> {
+    match action {
+        Action::ShareClaim { fact, .. } | Action::WarnContact { fact, .. } => vec![fact.clone()],
+        Action::Query { about, .. } => vec![about.clone()],
+        Action::Sanction { evidence, .. } | Action::ExcuseDeal { evidence, .. } => evidence.clone(),
+        Action::SpreadRumor { about, .. } => about.clone().into_iter().collect(),
+        Action::ReportCrime { evidence, .. } => evidence.clone(),
+        Action::MakeOffer { disclose, .. } => disclose.clone().into_iter().collect(),
+        Action::PlaceClue { fact, .. } => vec![fact.clone()],
+        _ => Vec::new(),
     }
 }

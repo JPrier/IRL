@@ -100,6 +100,7 @@ string_id!(
 num_id!(EventId, "Monotonic id of a committed canonical event.");
 num_id!(OfferId, "Id of a proposed or accepted exchange.");
 num_id!(CommitmentId, "Id of a promise, favour, debt or obligation.");
+num_id!(DealId, "Id of a typed conditional contract (the deal FSM).");
 num_id!(RumorId, "Id of a rumor or claim in circulation.");
 
 /// Convenience: the well-known player id.

@@ -8,9 +8,14 @@ description = "Agentic RPG: authoritative world simulation, action validation an
 
 [dependencies]
 rpg_domain.workspace = true
+rpg_behavior.workspace = true
+rpg_agents.workspace = true
 rpg_perception.workspace = true
 rpg_social.workspace = true
 rpg_narrative.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+rpg_persistence.workspace = true

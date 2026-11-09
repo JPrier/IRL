@@ -22,3 +22,4 @@ rusqlite.workspace = true
 tempfile = "3"
 rpg_agents.workspace = true
 rpg_content.workspace = true
+rpg_social.workspace = true
