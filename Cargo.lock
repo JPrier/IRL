@@ -5363,6 +5363,7 @@ dependencies = [
 name = "rpg_eval"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "rpg_agents",
  "rpg_behavior",
  "rpg_content",
@@ -5440,6 +5441,17 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "rpg_proof_kernels"
+version = "0.1.0"
+dependencies = [
+ "rpg_behavior",
+ "rpg_content",
+ "rpg_domain",
+ "rpg_sim",
+ "serde_json",
 ]
 
 [[package]]

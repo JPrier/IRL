@@ -1,5 +1,5 @@
 # One-command developer workflow.
-.PHONY: setup play text dist dist-slim verify fmt clippy test scenarios bench
+.PHONY: setup play text dist dist-slim verify fmt clippy test scenarios proof-audit proof bench
 
 # Fetch and verify every asset the game needs (neural speech + local model).
 setup:
@@ -38,4 +38,13 @@ dist-slim:
 	./scripts/package.sh --slim
 
 # The PR gate. Real-model/neural-voice jobs are separate (self-hosted).
-verify: fmt clippy test scenarios
+# `proof-audit` enforces the I-8 proof-boundary artifacts locally; the Kani
+# harnesses themselves run on Linux only (WSL2 locally:
+# `cargo kani -p rpg_proof_kernels`; CI: the `proof` job in ci.yml).
+verify: fmt clippy test scenarios proof-audit
+
+proof-audit:
+	bash scripts/check-proof-audit.sh
+
+proof:
+	cargo kani -p rpg_proof_kernels --output-format terse

@@ -1,0 +1,19 @@
+[package]
+name = "rpg_proof_kernels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Agentic RPG: production-bound Kani proof harnesses (I-8 / T6.1-T6.8)."
+
+[dependencies]
+rpg_domain.workspace = true
+rpg_behavior.workspace = true
+rpg_sim.workspace = true
+rpg_content.workspace = true
+serde_json.workspace = true
+
+# `cfg(kani)` only exists under the Kani verifier's own toolchain; declare it
+# so normal builds (and clippy's unexpected_cfgs lint) stay clean.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

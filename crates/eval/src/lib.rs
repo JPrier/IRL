@@ -19,6 +19,12 @@ use rpg_domain::ports::InferenceEngine;
 use rpg_sim::{SimConfig, Simulation, StepReport};
 use std::collections::VecDeque;
 
+/// Property-based safety/replay checks (T6.5/T6.5b, plan I-8). Runtime
+/// evidence at generated scale - deliberately labeled evidence, never
+/// formal proof; the [PROOF] layer lives in `crates/proof-kernels`.
+#[cfg(test)]
+mod properties;
+
 /// How many conversation turns (player and NPC lines together) the session
 /// keeps for follow-up context. Mirrors the runtime's
 /// `rpg_runtime::MAX_CONVERSATION_TURNS` so eval exercises the same window

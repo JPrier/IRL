@@ -12,6 +12,7 @@ members = [
     "crates/persistence",
     "crates/content",
     "crates/eval",
+    "crates/proof-kernels",
     "crates/inference",
     "crates/runtime",
     "crates/openrouter",

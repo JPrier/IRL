@@ -52,6 +52,44 @@ fn goal_kind_need(kind: rpg_domain::world::GoalKind) -> Option<NeedKind> {
     }
 }
 
+/// Why the pure money-transfer arithmetic rejected a movement (I-8/T6.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoneyTransferOverflow {
+    /// The debit `from_money - amount` does not fit in `i64`.
+    Debit,
+    /// The credit `to_money + amount` does not fit in `i64`.
+    Credit,
+}
+
+/// The pure, total money-transfer arithmetic kernel: the single source of
+/// truth for every conserved money movement in the simulation. Production
+/// callers route through [`Simulation::transfer_money`] and
+/// [`Simulation::do_pay`] (the shared lowering behind payments, deal
+/// settlement and sanction fines), which call this function; the Kani
+/// harness `i8_t61_money_transfer_conservation` (`crates/proof-kernels`)
+/// proves conservation and overflow-rejection over the full `i64` input
+/// space directly against this symbol.
+///
+/// Overflow is *rejected*, not wrapped: every production caller validates
+/// custody before dispatch (`validate` checks `amount > 0` and
+/// `from.money >= amount`), so `Err` is unreachable in validated flows and
+/// behavior is preserved (previously the unchecked arithmetic would wrap in
+/// release / panic in debug on inputs no validated caller can produce; see
+/// `crates/proof-kernels/AUDIT.md` for the audited call sites).
+pub fn split_money_transfer(
+    from_money: i64,
+    to_money: i64,
+    amount: i64,
+) -> Result<(i64, i64), MoneyTransferOverflow> {
+    let debited = from_money
+        .checked_sub(amount)
+        .ok_or(MoneyTransferOverflow::Debit)?;
+    let credited = to_money
+        .checked_add(amount)
+        .ok_or(MoneyTransferOverflow::Credit)?;
+    Ok((debited, credited))
+}
+
 /// Tunable, scenario-fixed simulation parameters.
 #[derive(Clone, Debug)]
 pub struct SimConfig {
@@ -2568,11 +2606,23 @@ impl Simulation {
         if from == to {
             return;
         }
-        if let Some(a) = self.world.actor_mut(from) {
-            a.inventory.money -= amount;
-        }
-        if let Some(a) = self.world.actor_mut(to) {
-            a.inventory.money += amount;
+        // The conserved arithmetic is the audited production kernel
+        // [`split_money_transfer`] (I-8/T6.1): every caller validates custody
+        // before dispatch, so the overflow arm is unreachable in validated
+        // flows and both actors are always present (checked by `in_range`).
+        if let Some((debited, credited)) = self
+            .world
+            .actor(from)
+            .map(|a| a.inventory.money)
+            .zip(self.world.actor(to).map(|a| a.inventory.money))
+            .and_then(|(f, t)| split_money_transfer(f, t, amount).ok())
+        {
+            if let Some(a) = self.world.actor_mut(from) {
+                a.inventory.money = debited;
+            }
+            if let Some(a) = self.world.actor_mut(to) {
+                a.inventory.money = credited;
+            }
         }
         self.effects_buf.push(Effect::Transfer {
             from: from.clone(),
@@ -2711,11 +2761,25 @@ impl Simulation {
         amount: i64,
     ) -> ValidationOutcome {
         let from = proposal.actor.clone();
-        if let Some(a) = self.world.actor_mut(&from) {
-            a.inventory.money -= amount;
-        }
-        if let Some(a) = self.world.actor_mut(&target) {
-            a.inventory.money += amount;
+        // The conserved arithmetic is the audited production kernel
+        // [`split_money_transfer`] (I-8/T6.1): this is the audited call site
+        // for `do_pay` - direct debit/credit arithmetic here would be a
+        // bypass rejected by `scripts/check-proof-audit.sh`. `validate`
+        // already rejected self-pay, non-positive amounts and insufficient
+        // funds, so the overflow arm is unreachable.
+        if let Some((debited, credited)) = self
+            .world
+            .actor(&from)
+            .map(|a| a.inventory.money)
+            .zip(self.world.actor(&target).map(|a| a.inventory.money))
+            .and_then(|(f, t)| split_money_transfer(f, t, amount).ok())
+        {
+            if let Some(a) = self.world.actor_mut(&from) {
+                a.inventory.money = debited;
+            }
+            if let Some(a) = self.world.actor_mut(&target) {
+                a.inventory.money = credited;
+            }
         }
         let norm = (amount as f32 / 100.0).clamp(0.05, 1.0);
         self.effects_buf.push(Effect::Transfer {

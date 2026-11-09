@@ -100,16 +100,59 @@ pub fn aggregate_about(epistemics: &Epistemics, observer: &ActorId, fact: &FactI
         }
     }
 
+    // The fold itself is the extracted pure core (the same symbol the T6.8
+    // proof exercises); `into_values` yields groups in ascending group-id
+    // order and the Vec preserves it, so the accumulation order - and with
+    // it the f32 result - is identical to the previous inline fold.
+    let group_data: Vec<GroupData> = groups
+        .into_values()
+        .map(|(max_rel, chains, true_votes)| GroupData {
+            max_reliability: max_rel,
+            distinct_chains: chains.len() as u32,
+            true_votes,
+        })
+        .collect();
+    aggregate_from_groups(&group_data)
+}
+
+/// The per-group corroboration weight (I-8/T6.8 proof target): the
+/// strongest item in the group, plus a small capped bonus for extra
+/// *distinct chains* inside the same origin group - partial corroboration
+/// without full independence. Pure, total and side-effect free;
+/// [`aggregate_about`] calls this for every correlation group, and the
+/// T6.8 Kani harness (`crates/proof-kernels`) proves the cap
+/// (`weight <= max_reliability + 0.24` for any chain count) directly
+/// against this symbol.
+pub fn group_weight(max_reliability: f32, distinct_chains: usize) -> f32 {
+    (max_reliability + 0.08 * (distinct_chains.saturating_sub(1) as f32))
+        .min(max_reliability + 0.24)
+}
+
+/// One pre-grouped correlation group: the strongest perceived reliability
+/// among the group's items, how many distinct provenance chains it
+/// contains, and how many items asserted the true polarity. The numeric
+/// fold input for [`aggregate_from_groups`] (I-8/T6.8 proof target).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GroupData {
+    pub max_reliability: f32,
+    pub distinct_chains: u32,
+    pub true_votes: u32,
+}
+
+/// The numeric fold of pre-grouped correlation groups into an
+/// [`Aggregate`]: per-group capped weight ([`group_weight`]), polarity
+/// split, and the neutral-mass confidence. Pure, total and side-effect
+/// free; [`aggregate_about`] buckets the ledger by origin identity (the
+/// map side of the fold) and calls this with the group data, so the
+/// production aggregation and the T6.8 proof exercise the same symbols.
+pub fn aggregate_from_groups(groups: &[GroupData]) -> Aggregate {
     let mut score_true = 0.0f32;
     let mut score_false = 0.0f32;
     let mut true_groups = 0u32;
     let mut false_groups = 0u32;
-    for (max_rel, chains, true_votes) in groups.into_values() {
-        // Per-group weight: the strongest item in the group, plus a small
-        // capped bonus for extra *distinct chains* inside the same origin
-        // (partial corroboration without full independence).
-        let weight = (max_rel + 0.08 * (chains.len().saturating_sub(1) as f32)).min(max_rel + 0.24);
-        if true_votes > 0 {
+    for group in groups {
+        let weight = group_weight(group.max_reliability, group.distinct_chains as usize);
+        if group.true_votes > 0 {
             score_true += weight;
             true_groups += 1;
         } else {
@@ -339,34 +382,30 @@ pub struct Acceptance {
     pub claim_event: Option<EventId>,
 }
 
-/// Shared acceptance mechanic for one delivered assertion (design §3.1):
+/// # The acceptance-probability core
 ///
-/// 1. Aggregate the observer's *pre-existing* ledger (correlation-protected).
-/// 2. Compute the acceptance probability: the legacy relationship-sensitive
-///    formula plus a bounded prior term from genuinely independent evidence.
-///    An empty ledger reproduces the legacy probability exactly.
-/// 3. Roll belief against the probability.
-/// 4. On the told path, emit the typed `ClaimShared` delivery event carrying
-///    the rolled outcome, insert the evidence item (delivery is guaranteed),
-///    and emit the typed `EvidenceRecorded` event causally linked to the
-///    delivery (`caused_by`) so every told-path evidence write is traceable
-///    to the claim that caused it.
+/// The acceptance-probability core (I-8/T6.8 P1/P2/P5 proof target): the
+/// production relationship-sensitive formula plus the bounded prior term,
+/// and the perceived-reliability derivation, in one pure, total function.
+///
+/// Returns `(probability, perceived_reliability)`:
+///
+/// * `probability` is clamped to [0.05, 0.97] (P1) - the prior term is
+///   `0.2 * strength`, exactly `0` for an empty ledger, so the empty-ledger
+///   probability reproduces the legacy relationship-only formula exactly
+///   (P2);
+/// * `perceived_reliability` is the item reliability the acceptance writes
+///   into the ledger, clamped to [0.05, 0.98] (P5).
+///
+/// [`accept_assertion`] computes the pre-ledger strength with
+/// [`aggregate_about`]/[`prior_strength`] and calls this - the numeric
+/// arbitration and the production acceptance path are the same symbols.
 #[allow(clippy::too_many_arguments)]
-pub fn accept_assertion(
-    world: &mut World,
-    events: &mut EventLog,
-    tick: u64,
-    minute: u32,
-    observer: &ActorId,
-    draft: AssertionDraft,
-    appraisal: RecipientAppraisal,
+pub fn acceptance_probability(
+    appraisal: &RecipientAppraisal,
     speaker_confidence: f32,
-    assertive: bool,
-    rng: &mut DeterministicRng,
-) -> Acceptance {
-    let prior = aggregate_about(&world.epistemics, observer, &draft.proposition);
-    let strength = prior_strength(&prior);
-
+    strength: f32,
+) -> (f32, f32) {
     let trust_01 = (1.0 + appraisal.trust) * 0.5;
     let suspicion_01 = (1.0 + appraisal.suspicion) * 0.5;
     // Perceived reliability of this item: the source's own confidence,
@@ -385,6 +424,42 @@ pub fn accept_assertion(
         - 0.35 * suspicion_01
         - 0.15 * appraisal.fear;
     p = p.clamp(0.05, 0.97);
+    (p, reliability)
+}
+
+/// Shared acceptance mechanic for one delivered assertion (design §3.1):
+///
+/// 1. Aggregate the observer's *pre-existing* ledger (correlation-protected).
+/// 2. Compute the acceptance probability: the legacy relationship-sensitive
+///    formula plus a bounded prior term from genuinely independent evidence.
+///    An empty ledger reproduces the legacy probability exactly.
+/// 3. Roll belief against the probability.
+/// 4. On the told path, emit the typed `ClaimShared` delivery event carrying
+///    the rolled outcome, insert the evidence item (delivery is guaranteed),
+///    and emit the typed `EvidenceRecorded` event causally linked to the
+///    delivery (`caused_by`) so every told-path evidence write is traceable
+///    to the claim that caused it.
+///
+#[allow(clippy::too_many_arguments)]
+pub fn accept_assertion(
+    world: &mut World,
+    events: &mut EventLog,
+    tick: u64,
+    minute: u32,
+    observer: &ActorId,
+    draft: AssertionDraft,
+    appraisal: RecipientAppraisal,
+    speaker_confidence: f32,
+    assertive: bool,
+    rng: &mut DeterministicRng,
+) -> Acceptance {
+    let prior = aggregate_about(&world.epistemics, observer, &draft.proposition);
+    let strength = prior_strength(&prior);
+
+    // The numeric core (probability + perceived reliability) is the
+    // extracted pure production function the T6.8 harness proves directly
+    // (P1/P2/P5) - same symbol the production acceptance path calls.
+    let (p, reliability) = acceptance_probability(&appraisal, speaker_confidence, strength);
 
     let record_draft = AssertionDraft {
         reliability,
