@@ -89,7 +89,8 @@ pub enum EventKind {
     },
     /// Damage at a location worsened while unattended (the environmental
     /// wear tick). Event-sourced so the otherwise-silent background damage
-    /// accumulation is a causal record (M1); emitted at 0.1 boundaries.
+    /// accumulation is a causal record (M1); emitted for each 0.01 wear
+    /// increment, carrying the 0.1-granular damage level reached.
     WearProgressed {
         location: LocationId,
         level: u8,

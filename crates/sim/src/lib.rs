@@ -4579,6 +4579,22 @@ impl Simulation {
                                     )
                             });
                             if !rejected_since {
+                                // Bounded attention (design §6.4): the
+                                // window-miss retirement carries the same
+                                // cooldown as an observed completion — the
+                                // outcome event exists (the proposal was
+                                // accepted and dispatched) even though it
+                                // scrolled past the bounded retirement
+                                // window under event load. Without this a
+                                // flood re-deliberation re-adopts and
+                                // re-executes the same proposal (duplicate
+                                // outcome). Bounded: re-adoption resumes
+                                // after the cooldown window expires.
+                                self.planner.record_abandoned(
+                                    &actor,
+                                    &plan.intention.option,
+                                    tick + self.config.activation.abandon_cooldown_ticks,
+                                );
                                 self.planner.plans.remove(&actor);
                                 self.last_planner_pass.activations.push(PlannerActivation {
                                     actor,
@@ -4994,10 +5010,10 @@ impl Simulation {
                 .map(|f| f.members.clone())
                 .unwrap_or_default();
             // Unresolved damage to responsible locations accumulates. The
-            // wear itself is environmental physics; each 0.1 boundary it
-            // crosses is event-sourced, so the previously silent background
-            // accumulation becomes a causal record (M1: substantive world
-            // mutations are evented).
+            // wear itself is environmental physics; each 0.01 increment is
+            // event-sourced (carrying the 0.1-granular level), so the
+            // previously silent background accumulation becomes a causal
+            // record (M1: substantive world mutations are evented).
             let damaged: Vec<LocationId> = self
                 .world
                 .faction(&fid)

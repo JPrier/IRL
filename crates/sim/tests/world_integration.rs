@@ -1034,6 +1034,263 @@ fn t4_5d_signals_arriving_with_completion_are_spent_on_a_real_decision() {
     );
 }
 
+/// Replay-safe contradicted-ledger world: both polarities are seeded on the
+/// world *before* `Simulation::new` (through the real adapters against a
+/// scratch event log that is then dropped), so every post-construction
+/// mutation flows through recorded entry points (`apply`/`step`) and
+/// `replay_ops` reproduces the whole arc. `m3` is a warm co-located bystander
+/// — a second same-kind query target for the mismatched-outcome phase.
+fn contradicted_ledger_world_replayable() -> World {
+    let mut w = world_fixture();
+    w.actor_mut(&a("m1"))
+        .unwrap()
+        .needs
+        .set(NeedKind::Safety, 0.2);
+    let mut m3 = actor("m3", SHOP, 7.0);
+    m3.relationship_mut(&a("m1")).trust = 1.0;
+    w.actors.insert(a("m3").clone(), m3);
+    add_fact(&mut w, "f_x", Sensitivity::Public, vec![]);
+    add_fact(&mut w, "f_other", Sensitivity::Public, vec![]);
+    let mut scratch = rpg_domain::events::EventLog::new();
+    let (tick, minute) = (0u64, 480u32);
+    let mut push_origin = |text: &str| {
+        scratch.push(
+            tick,
+            minute,
+            Some(a("m1")),
+            EventKind::SpeechEmitted {
+                speaker: a("m1"),
+                text: text.to_string(),
+                addressee: None,
+                loudness: rpg_domain::action::Loudness::Normal,
+                location: LocationId::new(SHOP),
+                private: false,
+            },
+            Vec::new(),
+            Vec::new(),
+        )
+    };
+    let e1 = push_origin("first report");
+    let e2 = push_origin("second report");
+    witness_evidence(&mut w, &mut scratch, tick, minute, "m1", "f_x", e1);
+    let draft = rpg_behavior::AssertionDraft {
+        speaker: Some(a("m2")),
+        proposition: FactId::new("f_x"),
+        asserted_polarity: false,
+        channel: rpg_domain::behavior_types::AcquisitionChannel::Told,
+        origin_event: Some(e2),
+        reliability: 0.6,
+        retold_chain: None,
+        deceptive: true,
+    };
+    let appraisal = rpg_behavior::RecipientAppraisal {
+        trust: 0.0,
+        suspicion: 0.0,
+        fear: 0.0,
+        assertiveness: 1.0,
+    };
+    rpg_behavior::accept_assertion(
+        &mut w,
+        &mut scratch,
+        tick,
+        minute,
+        &a("m1"),
+        draft,
+        appraisal,
+        0.9,
+        true,
+        &mut rpg_domain::DeterministicRng::new(1),
+    );
+    w
+}
+
+/// D1 repair regression (I6b independent review): a window-miss one-shot
+/// retirement — the plan's outcome scrolled past the bounded 64-event
+/// window under a >64-event flood, so completion detection misses and the
+/// proposed-once record retires the plan — must carry the SAME bounded
+/// attention cooldown as a detected completion. Without it, the flood's own
+/// signals re-open deliberation, the sampler re-adopts the just-executed
+/// option and the identical outcome re-fires (a duplicated question under
+/// event load). The suppression is bounded, never permanent: after the
+/// cooldown expires a genuine signal may legitimately re-open the same
+/// epistemic plan. Seed-robust (swept, not pinned to one stream), and the
+/// cooldown bookkeeping is covered across save/load and replay.
+#[test]
+fn t4_5e_window_miss_retirement_carries_the_completion_cooldown() {
+    for seed in [2026u64, 7, 31, 99, 404, 20260909] {
+        let query_opt = format!(
+            "{}:{}:{}",
+            rpg_agents::planner_candidates::option_ids::QUERY,
+            "f_x",
+            "m2"
+        );
+        let asked_identical = |s: &Simulation| {
+            count_events(s, |k| {
+                matches!(k, EventKind::QuestionAsked { from, to, about, .. }
+                    if from == &a("m1") && to == &a("m2") && about == &FactId::new("f_x"))
+            })
+        };
+
+        // A: the plan is adopted and its own question executes exactly once.
+        let mut s = Simulation::new(contradicted_ledger_world_replayable(), seed, config());
+        for _ in 0..6 {
+            s.step(Vec::new());
+            if asked_identical(&s) == 1 {
+                break;
+            }
+        }
+        assert_eq!(
+            asked_identical(&s),
+            1,
+            "seed {seed}: fixture — the f_x question was asked exactly once"
+        );
+
+        // B: a 70-speak flood (>64 events) scrolls the outcome past the
+        // bounded retirement window; the plan retires on its proposed-once
+        // record — and that retirement must carry the completion cooldown
+        // (the D1 defect retired it bare, inviting an immediate re-fire).
+        let mut flood = Vec::new();
+        for i in 0..70 {
+            flood.push(ActionProposal {
+                actor: a("m2"),
+                action: Action::Speak {
+                    target: Some(a("m1")),
+                    text: format!("flood {i}"),
+                    loudness: rpg_domain::action::Loudness::Normal,
+                },
+                source: ProposalSource::Player,
+                rationale: String::new(),
+            });
+        }
+        s.step(flood);
+        // A parameter-mismatched same-kind outcome through the real route:
+        // asking a different target is a DIFFERENT outcome (t4_5b) — it
+        // must not complete the plan, and it hands the asker a genuine
+        // QueryAnswered reconsideration signal for the phases below.
+        apply(
+            &mut s,
+            "m1",
+            Action::Query {
+                target: a("m3"),
+                about: FactId::new("f_x"),
+            },
+        );
+        let retired_at = s.world.tick;
+        let cooldown = s.config.activation.abandon_cooldown_ticks;
+        let cooldown_end = retired_at + cooldown;
+        assert_ne!(
+            s.planner
+                .plans
+                .get(&a("m1"))
+                .map(|p| p.intention.option.clone())
+                .as_deref(),
+            Some(query_opt.as_str()),
+            "seed {seed}: the window-missed plan is retired"
+        );
+        assert!(
+            s.planner
+                .recently_abandoned(&a("m1"), &query_opt, retired_at),
+            "seed {seed}: the window-miss retirement carries the completion cooldown (D1)"
+        );
+
+        // Save/load continuity: the cooldown is persisted planner state.
+        // Restoring mid-window keeps the suppression active, and the
+        // restored sim continues byte-identically under the same inputs.
+        let json = serde_json::to_string(&s.transient()).unwrap();
+        let transient: rpg_sim::SimTransient = serde_json::from_str(&json).unwrap();
+        let mut restored = Simulation::restore_full(
+            s.seed,
+            s.world.clone(),
+            s.events.clone(),
+            s.rng.clone(),
+            transient,
+            s.ops.clone(),
+            s.initial_world.clone(),
+            s.config.clone(),
+        );
+        assert!(
+            restored
+                .planner
+                .recently_abandoned(&a("m1"), &query_opt, restored.world.tick),
+            "seed {seed}: the cooldown survives save/load"
+        );
+
+        // C+D: genuine re-deliberation pressure (a fresh talk signal plus a
+        // tolerated repeated bystander ask every step, the same inputs to
+        // both sims in lockstep). While the cooldown holds, the identical
+        // outcome must NOT re-fire; after expiry it legitimately may — and
+        // when it does, that re-fire is strictly post-cooldown.
+        let mut re_fired_tick: Option<u64> = None;
+        for _ in 0..30 {
+            let bystander_ask = ActionProposal {
+                actor: a("m1"),
+                action: Action::Query {
+                    target: a("m3"),
+                    about: FactId::new("f_x"),
+                },
+                source: ProposalSource::Player,
+                rationale: String::new(),
+            };
+            let _ = s.apply(&bystander_ask);
+            let _ = restored.apply(&bystander_ask);
+            let chatter = (0..3)
+                .map(|i| ActionProposal {
+                    actor: a("m2"),
+                    action: Action::Speak {
+                        target: Some(a("m1")),
+                        text: format!("chatter {} {i}", s.world.tick),
+                        loudness: rpg_domain::action::Loudness::Normal,
+                    },
+                    source: ProposalSource::Player,
+                    rationale: String::new(),
+                })
+                .collect::<Vec<_>>();
+            s.step(chatter.clone());
+            restored.step(chatter);
+            let asked = asked_identical(&s);
+            if s.world.tick < cooldown_end {
+                assert_eq!(
+                    asked, 1,
+                    "seed {seed}: no repeated identical outcome during the documented cooldown \
+                     (tick {}, cooldown ends {})",
+                    s.world.tick, cooldown_end
+                );
+            } else if asked == 2 {
+                re_fired_tick = Some(s.world.tick);
+                break;
+            }
+        }
+        assert_eq!(
+            asked_identical(&s),
+            asked_identical(&restored),
+            "seed {seed}: save/load continuation reproduces the same outcome history"
+        );
+        let fire = re_fired_tick.unwrap_or_else(|| {
+            panic!("seed {seed}: legitimate later reconsideration re-fires after the cooldown (no permanent suppression)")
+        });
+        assert!(
+            fire >= cooldown_end,
+            "seed {seed}: the re-fire is post-cooldown ({fire} < {cooldown_end})"
+        );
+
+        // Replay continuity: the recorded entry points reproduce the whole
+        // arc — including the flood, the window-miss retirement and the
+        // post-cooldown reconsideration — exactly.
+        let replay =
+            Simulation::replay_ops(s.initial_world.clone(), s.seed, s.config.clone(), &s.ops);
+        assert_eq!(
+            serde_json::to_string(&replay.world).unwrap(),
+            serde_json::to_string(&s.world).unwrap(),
+            "seed {seed}: replay reproduces the world"
+        );
+        assert_eq!(
+            replay.events.checksum(),
+            s.events.checksum(),
+            "seed {seed}: replay reproduces the event log"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // T4.6 — bounded deterministic offscreen catch-up
 // ---------------------------------------------------------------------------
