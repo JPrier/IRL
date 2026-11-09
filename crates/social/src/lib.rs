@@ -452,7 +452,7 @@ pub fn share_claim(
     assertive: bool,
 ) -> ShareOutcome {
     assert_claim(
-        world, events, rng, tick, minute, from, to, fact, assertive, true, false,
+        world, events, rng, tick, minute, from, to, fact, assertive, true, false, None,
     )
 }
 
@@ -476,6 +476,7 @@ pub fn assert_claim(
     assertive: bool,
     asserted_polarity: bool,
     deceptive: bool,
+    retold_chain: Option<rpg_domain::behavior_types::SourceChainId>,
 ) -> ShareOutcome {
     let speaker_confidence = world
         .actor(from)
@@ -506,7 +507,7 @@ pub fn assert_claim(
         channel: rpg_domain::behavior_types::AcquisitionChannel::Told,
         origin_event: None,
         reliability: 0.6,
-        retold_chain: None,
+        retold_chain,
         deceptive,
     };
     let acceptance = rpg_behavior::accept_assertion(
@@ -776,7 +777,14 @@ pub fn propagate_rumor(
             channel: rpg_domain::behavior_types::AcquisitionChannel::Told,
             origin_event: None,
             reliability: 0.6,
-            retold_chain: None,
+            // The retelling continues the provenance chain explicitly (§5.3):
+            // the reteller's latest held chain for the proposition — the same
+            // chain the legacy inference would pick, now selected explicitly.
+            retold_chain: world
+                .epistemics
+                .evidence_about(&speaker, fact)
+                .last()
+                .map(|e| e.source_chain_id),
             deceptive: false,
         };
         let acceptance = rpg_behavior::accept_assertion(
@@ -944,6 +952,7 @@ mod tests {
             offers: BTreeMap::new(),
             rumors: Vec::new(),
             damage: BTreeMap::new(),
+            damage_facts: BTreeMap::new(),
             location_items: BTreeMap::new(),
             flags: BTreeSet::new(),
             ledger: BTreeMap::new(),

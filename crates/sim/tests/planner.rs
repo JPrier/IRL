@@ -116,6 +116,7 @@ fn world_fixture() -> World {
         deals: BTreeMap::new(),
         rumors: Vec::new(),
         damage: BTreeMap::new(),
+        damage_facts: BTreeMap::new(),
         location_items: BTreeMap::new(),
         flags: BTreeSet::new(),
         ledger: BTreeMap::new(),
@@ -276,6 +277,7 @@ fn t4_1a_unrelated_events_do_not_replan_the_plan_holder() {
                 fact: FactId::new("f_other"),
                 assertive: true,
                 deceptive: false,
+                retold_chain: None,
             },
         );
     }
@@ -524,6 +526,7 @@ fn t4_9a_query_candidate_is_actor_local_and_boundary_preserving() {
             fact: FactId::new("f_noise"),
             assertive: true,
             deceptive: false,
+            retold_chain: None,
         },
     );
 
@@ -886,6 +889,7 @@ fn t4_10b_excuse_deal_candidate_is_grounding_gated() {
             fact: FactId::new("f_law"),
             assertive: true,
             deceptive: false,
+            retold_chain: None,
         },
     );
     let mut excused = false;
@@ -1864,6 +1868,7 @@ fn t4_4b_relevant_signals_reconsider_an_active_plan_with_switch_costs() {
             fact: FactId::new("f_noise"),
             assertive: true,
             deceptive: false,
+            retold_chain: None,
         },
     );
     s.step(Vec::new());
@@ -1925,6 +1930,7 @@ fn t4_4b_relevant_signals_reconsider_an_active_plan_with_switch_costs() {
             fact: FactId::new("f_noise"),
             assertive: true,
             deceptive: false,
+            retold_chain: None,
         },
     );
     control.step(Vec::new());
@@ -1986,6 +1992,7 @@ fn t2_9c_dropped_at_post_proposal_leaves_no_stale_decision_record() {
             fact: FactId::new("f_other"),
             assertive: true,
             deceptive: false,
+            retold_chain: None,
         },
     );
 

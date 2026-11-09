@@ -1055,6 +1055,7 @@ fn knowledge_boundaries(seed: u64) -> ScenarioResult {
         fact: FactId::new("f_shipments_diverted"),
         assertive: true,
         deceptive: false,
+        retold_chain: None,
     });
     check(
         &mut checks,
@@ -1074,6 +1075,7 @@ fn knowledge_boundaries(seed: u64) -> ScenarioResult {
         fact: FactId::new("f_leader_identity"),
         assertive: true,
         deceptive: false,
+        retold_chain: None,
     });
     check(
         &mut checks,
@@ -1196,6 +1198,7 @@ mod tests {
             fact: FactId::new("f_grocer_ledger"),
             assertive: true,
             deceptive: false,
+            retold_chain: None,
         };
         let line = spoken_line_in(&session.sim.world, &claim).expect("statement");
         assert!(line.contains("ledger"), "unexpected line: {line}");

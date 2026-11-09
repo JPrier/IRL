@@ -835,6 +835,13 @@ pub struct World {
 
     /// Structural damage 0..1 per location (1 = destroyed).
     pub damage: BTreeMap<LocationId, f32>,
+    /// The canonical fact a location's current damage episode is reported
+    /// under (plan I-6 I6b, §5.5): incidents mint a public fact, witnesses
+    /// hold evidence for it, and a faction's member-report aggregate of
+    /// those beliefs is the group's believed damage. `serde(default)` keeps
+    /// older saves loading (the map simply starts empty).
+    #[serde(default)]
+    pub damage_facts: BTreeMap<LocationId, FactId>,
     /// Items lying in a location that a thorough search can recover.
     #[serde(default)]
     pub location_items: BTreeMap<LocationId, Vec<ItemStack>>,
@@ -874,6 +881,14 @@ impl World {
 
     pub fn location(&self, id: &LocationId) -> Option<&Location> {
         self.locations.get(id)
+    }
+
+    /// The canonical fact this location's current damage episode is reported
+    /// under, when one has been minted (plan I-6 I6b §5.5): witnesses hold
+    /// evidence for it and a faction's member-report aggregate of those
+    /// beliefs is its believed damage.
+    pub fn damage_fact_of(&self, location: &LocationId) -> Option<FactId> {
+        self.damage_facts.get(location).cloned()
     }
 
     pub fn fact(&self, id: &FactId) -> Option<&Fact> {
@@ -1012,6 +1027,7 @@ mod tests {
             deals: BTreeMap::new(),
             rumors: Vec::new(),
             damage: BTreeMap::new(),
+            damage_facts: BTreeMap::new(),
             location_items: BTreeMap::new(),
             flags: BTreeSet::new(),
             ledger: BTreeMap::new(),

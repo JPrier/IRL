@@ -209,6 +209,7 @@ fn fixture() -> (World, ActorId, ActorId) {
         offers: BTreeMap::new(),
         rumors: Vec::new(),
         damage: BTreeMap::new(),
+        damage_facts: BTreeMap::new(),
         location_items: BTreeMap::new(),
         flags: BTreeSet::new(),
         ledger: BTreeMap::new(),
@@ -348,6 +349,7 @@ fn every_accepted_action_produces_typed_effects() {
                 fact: FactId::new("f_x"),
                 assertive: true,
                 deceptive: false,
+                retold_chain: None,
             },
             vec!["assert", "change_tie"],
         ),
@@ -549,6 +551,7 @@ fn rejected_actions_mutate_nothing() {
             fact: FactId::new("f_secret"),
             assertive: true,
             deceptive: false,
+            retold_chain: None,
         },
         Action::MoveTo {
             location: LocationId::new("nowhere"),
@@ -625,6 +628,7 @@ fn knowledge_is_not_permission() {
             fact: FactId::new("f_secret"),
             assertive: true,
             deceptive: false,
+            retold_chain: None,
         },
     );
     assert!(matches!(
@@ -657,6 +661,7 @@ fn replay_reproduces_the_evidence_ledger_and_checksum() {
             fact: FactId::new("f_x"),
             assertive: true,
             deceptive: false,
+            retold_chain: None,
         },
     );
     let _ = apply(
@@ -754,6 +759,7 @@ fn causal_traces_explain_goal_belief_event_cost() {
             fact: FactId::new("f_x"),
             assertive: true,
             deceptive: false,
+            retold_chain: None,
         },
     );
     assert!(matches!(out, ValidationOutcome::Accepted));
@@ -1069,11 +1075,25 @@ fn f3_budget_actions_never_fabricate_a_self_transfer() {
             );
         }
     }
-    // 0.5 damage -> cost 100; the paying faction's budget is truthfully
-    // deducted and the consumption is a Transform.
+    // 0.5 damage -> cost 100; the worker (the player fixture stands in the
+    // shop) performed the labor on site, so the paying faction also pays a
+    // real wage of 25 (plan I-6 I6b §5.4): the budget is truthfully
+    // deducted by cost + wage and the consumption is one Transform.
+    let wage_paid = sim.events.all().iter().any(|e| {
+        matches!(
+            e.kind,
+            rpg_domain::events::EventKind::WagePaid { amount: 25, .. }
+        )
+    });
+    assert!(wage_paid, "on-site repair pays a real typed wage");
+    assert_eq!(
+        sim.world.actor(&player).unwrap().inventory.money,
+        125,
+        "the worker's custody gained exactly the wage"
+    );
     assert_eq!(
         sim.world.faction(&FactionId::new("watch")).unwrap().budget,
-        350
+        325
     );
     assert_eq!(
         outcome
@@ -1081,11 +1101,11 @@ fn f3_budget_actions_never_fabricate_a_self_transfer() {
             .iter()
             .filter(|e| matches!(
                 e,
-                rpg_domain::behavior_types::Effect::Transform { consumed: 100, .. }
+                rpg_domain::behavior_types::Effect::Transform { consumed: 125, .. }
             ))
             .count(),
         1,
-        "the budget consumption is a Transform"
+        "the budget consumption (repair + wage) is a Transform"
     );
     assert!(
         outcome.effects.iter().any(|e| matches!(
@@ -1128,6 +1148,7 @@ fn f4_trace_cites_only_real_causes() {
             fact: FactId::new("f_x"),
             assertive: true,
             deceptive: false,
+            retold_chain: None,
         },
     );
     assert!(matches!(out, ValidationOutcome::Accepted));
@@ -1579,6 +1600,7 @@ fn t1_9_deceptive_assertion_canonical_end_to_end() {
             fact: FactId::new("f_w"),
             assertive: true,
             deceptive: false,
+            retold_chain: None,
         },
     );
     assert!(
@@ -1609,6 +1631,7 @@ fn t1_9_deceptive_assertion_canonical_end_to_end() {
             fact: FactId::new("f_w"),
             assertive: true,
             deceptive: true,
+            retold_chain: None,
         },
     );
     assert!(matches!(out, ValidationOutcome::Accepted), "{out:?}");
@@ -1662,6 +1685,7 @@ fn t1_9_deceptive_assertion_canonical_end_to_end() {
             fact: FactId::new("f_w"),
             assertive: true,
             deceptive: true,
+            retold_chain: None,
         },
     );
     assert!(matches!(out, ValidationOutcome::Accepted), "{out:?}");
@@ -1698,6 +1722,7 @@ fn t1_9_deceptive_assertion_canonical_end_to_end() {
             fact: FactId::new("f_unheard"),
             assertive: true,
             deceptive: true,
+            retold_chain: None,
         },
     );
     assert!(
@@ -1718,6 +1743,7 @@ fn t1_9_deceptive_assertion_canonical_end_to_end() {
             fact: FactId::new("f_secret"),
             assertive: true,
             deceptive: true,
+            retold_chain: None,
         },
     );
     assert!(

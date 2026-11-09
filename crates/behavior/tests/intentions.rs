@@ -39,6 +39,7 @@ fn tiny_world() -> World {
         deals: BTreeMap::new(),
         rumors: Vec::new(),
         damage: BTreeMap::new(),
+        damage_facts: BTreeMap::new(),
         location_items: BTreeMap::new(),
         flags: BTreeSet::new(),
         ledger: BTreeMap::new(),

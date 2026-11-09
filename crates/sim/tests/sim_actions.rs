@@ -89,6 +89,7 @@ pub fn test_world() -> World {
         offers: BTreeMap::new(),
         rumors: Vec::new(),
         damage: BTreeMap::new(),
+        damage_facts: BTreeMap::new(),
         location_items: BTreeMap::new(),
         flags: BTreeSet::new(),
         ledger: BTreeMap::new(),
@@ -361,6 +362,7 @@ fn cannot_disclose_fact_you_do_not_believe() {
                 fact: FactId::new("shipment"),
                 assertive: true,
                 deceptive: false,
+                retold_chain: None,
             }
         )),
         ValidationOutcome::Rejected(RejectReason::LacksKnowledge(_))
@@ -726,6 +728,7 @@ fn outsider_cannot_disclose_secret_fact() {
             fact: FactId::new("shipment"),
             assertive: true,
             deceptive: false,
+            retold_chain: None,
         },
     ));
     assert!(
@@ -750,6 +753,7 @@ fn canonical_holder_can_disclose_secret_fact() {
             fact: FactId::new("shipment"),
             assertive: true,
             deceptive: false,
+            retold_chain: None,
         },
     ));
     assert_eq!(
@@ -789,6 +793,7 @@ fn inner_circle_fact_requires_flag_and_holder() {
             fact: FactId::new("f_leader"),
             assertive: true,
             deceptive: false,
+            retold_chain: None,
         },
     ));
     assert!(
@@ -812,6 +817,7 @@ fn inner_circle_fact_requires_flag_and_holder() {
             fact: FactId::new("f_leader"),
             assertive: true,
             deceptive: false,
+            retold_chain: None,
         },
     ));
     assert_eq!(allowed, ValidationOutcome::Accepted);

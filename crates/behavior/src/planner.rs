@@ -83,6 +83,15 @@ pub struct Plan {
     pub action: Action,
     /// Tick the plan was adopted.
     pub adopted_tick: u64,
+    /// The last tick the plan's own step was proposed for execution (plan
+    /// I-6 I6b one-shot hardening): a one-shot plan proposes its step at
+    /// most once — if the parameter-matched outcome event has scrolled past
+    /// the retirement window by the next activation, the plan retires on
+    /// this record instead of re-executing (no duplicate outcomes).
+    /// Rejections do not set it (a rejected attempt is failure bookkeeping,
+    /// not a completion), so retry-until-abandonment semantics are intact.
+    #[serde(default)]
+    pub last_proposed_tick: Option<u64>,
 }
 
 /// Which need/actor-local condition currently gives an actor a claim on an
@@ -298,6 +307,7 @@ pub fn adopt_plan(
         ),
         action,
         adopted_tick,
+        last_proposed_tick: None,
     }
 }
 

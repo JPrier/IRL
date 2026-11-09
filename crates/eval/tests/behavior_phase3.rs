@@ -139,6 +139,7 @@ fn fixture(needs_decay: f32, emotions_decay: f32) -> (Simulation, SimConfig) {
         offers: BTreeMap::new(),
         rumors: Vec::new(),
         damage: BTreeMap::new(),
+        damage_facts: BTreeMap::new(),
         location_items: BTreeMap::new(),
         flags: BTreeSet::new(),
         ledger: BTreeMap::new(),

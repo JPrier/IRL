@@ -871,6 +871,7 @@ fn parse_decision(
             fact: FactId::new(d.fact?),
             assertive: d.assertive.unwrap_or(true),
             deceptive: false,
+            retold_chain: None,
         }),
         "offer" => {
             let condition = d
@@ -993,6 +994,7 @@ pub fn heuristic_decision(
                 fact: FactId::new("f_grocer_ledger"),
                 assertive: true,
                 deceptive: false,
+                retold_chain: None,
             };
         }
         return Action::MakeOffer {
@@ -1027,6 +1029,7 @@ pub fn heuristic_decision(
                 fact,
                 assertive: true,
                 deceptive: false,
+                retold_chain: None,
             };
         }
     }
@@ -1295,6 +1298,7 @@ impl NpcPolicy {
                             fact: fact.clone(),
                             assertive: true,
                             deceptive: false,
+                            retold_chain: None,
                         },
                         source: ProposalSource::NpcPolicy,
                         rationale: format!("honouring a satisfied deal ({fact})"),
@@ -1672,6 +1676,7 @@ pub fn deal_response_action(
                 fact: fact.clone(),
                 assertive: true,
                 deceptive: false,
+                retold_chain: None,
             })
         }
         "settle_delivery" => {
@@ -1915,6 +1920,7 @@ mod tests {
             offers: BTreeMap::new(),
             rumors: vec![],
             damage: BTreeMap::new(),
+            damage_facts: BTreeMap::new(),
             location_items: BTreeMap::new(),
             flags: BTreeSet::new(),
             ledger: BTreeMap::new(),

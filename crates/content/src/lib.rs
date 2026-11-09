@@ -1285,6 +1285,7 @@ pub fn build_town() -> World {
         offers: BTreeMap::new(),
         rumors: Vec::new(),
         damage: BTreeMap::new(),
+            damage_facts: BTreeMap::new(),
         location_items,
         flags: BTreeSet::new(),
         ledger: BTreeMap::new(),

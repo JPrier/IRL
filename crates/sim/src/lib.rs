@@ -185,6 +185,31 @@ pub struct StepReport {
     pub gated_responses: Vec<(ActorId, EmotionResponse)>,
 }
 
+/// Hard per-call bound of [`Simulation::catch_up`] (documented, T4.6): a
+/// longer offscreen skip is truncated and continued with further calls, so
+/// no single call can exceed this many ticks of world time.
+pub const CATCH_UP_MAX_TICKS: u32 = 720;
+
+/// Summary of one bounded offscreen catch-up (plan I-6 I6b item 2). The
+/// counts are the aggregate of the real production steps the catch-up ran —
+/// never derived separately.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CatchUpReport {
+    /// Simulation ticks actually advanced.
+    pub ticks: u32,
+    /// True when the requested skip exceeded [`CATCH_UP_MAX_TICKS`] and was
+    /// truncated (continue with further calls).
+    pub truncated: bool,
+    pub accepted: u64,
+    pub pending: u64,
+    pub rejected: u64,
+    /// Commitments satisfied while offscreen (the deal/commitment deadline
+    /// pathway — debts are causally exact).
+    pub deals_due: u64,
+    /// Seeded background incidents that occurred while offscreen.
+    pub incidents: u64,
+}
+
 /// One planner activation of the most recent pass (observability for the
 /// budget/work caps; rebuilt identically by replay, never persisted).
 #[derive(Clone, Debug, PartialEq)]
@@ -243,6 +268,13 @@ pub struct SimTransient {
     /// load with an empty ledger).
     #[serde(default)]
     pub sanctions: BTreeSet<(FactId, ActorId)>,
+    /// Bounded institutional attention (design §6.4): the tick until which a
+    /// (faction, location) pair may not spawn another member-report repair
+    /// initiative. Keys are "faction|location" (JSON-safe, like the world
+    /// ledger). Persisted so a save/load cycle cannot re-open a cooling
+    /// initiative (old saves load with an empty map).
+    #[serde(default)]
+    pub faction_repair_cooldown: BTreeMap<String, u64>,
 }
 
 /// A recorded public entry point, used for input/proposal replay.
@@ -303,6 +335,8 @@ pub struct Simulation {
     last_planner_pass: PlannerPassRecord,
     /// Formal punitive-sanction identity ledger (see `SimTransient::sanctions`).
     pub sanctions: BTreeSet<(FactId, ActorId)>,
+    /// Faction repair-initiative cooldowns (see `SimTransient::faction_repair_cooldown`).
+    faction_repair_cooldown: BTreeMap<String, u64>,
 }
 
 impl Simulation {
@@ -324,6 +358,7 @@ impl Simulation {
             deal_intentions: BTreeMap::new(),
             planner: rpg_behavior::PlannerState::default(),
             sanctions: BTreeSet::new(),
+            faction_repair_cooldown: BTreeMap::new(),
             recording: true,
             outcomes: Vec::new(),
             causal_traces: Vec::new(),
@@ -371,6 +406,7 @@ impl Simulation {
             deal_intentions: transient.deal_intentions,
             planner: transient.planner,
             sanctions: transient.sanctions,
+            faction_repair_cooldown: transient.faction_repair_cooldown,
             recording: true,
             outcomes: Vec::new(),
             causal_traces: Vec::new(),
@@ -390,6 +426,7 @@ impl Simulation {
             deal_intentions: self.deal_intentions.clone(),
             planner: self.planner.clone(),
             sanctions: self.sanctions.clone(),
+            faction_repair_cooldown: self.faction_repair_cooldown.clone(),
         }
     }
 
@@ -1267,7 +1304,8 @@ impl Simulation {
                 fact,
                 assertive,
                 deceptive,
-            } => self.do_share_claim(proposal, target, fact, assertive, deceptive),
+                retold_chain,
+            } => self.do_share_claim(proposal, target, fact, assertive, deceptive, retold_chain),
             Action::Query { target, about } => self.do_query(proposal, target, about),
             Action::Sanction {
                 target,
@@ -1284,7 +1322,7 @@ impl Simulation {
                 self.do_hide_evidence(proposal, item, location)
             }
             Action::WarnContact { target, fact } => {
-                self.do_share_claim(proposal, target, fact, true, false)
+                self.do_share_claim(proposal, target, fact, true, false, None)
             }
             Action::AllocateBudget {
                 faction,
@@ -2737,6 +2775,7 @@ impl Simulation {
         ValidationOutcome::Accepted
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn do_share_claim(
         &mut self,
         proposal: &ActionProposal,
@@ -2744,6 +2783,7 @@ impl Simulation {
         fact: FactId,
         assertive: bool,
         deceptive: bool,
+        retold_chain: Option<rpg_domain::behavior_types::SourceChainId>,
     ) -> ValidationOutcome {
         // The asserted polarity (design §3.1; plan I-5 G1): the truthful
         // path asserts the fact as stated; a deceptive assertion asserts the
@@ -2774,6 +2814,11 @@ impl Simulation {
             assertive,
             asserted_polarity,
             deceptive,
+            // Explicit provenance selection (plan I-6 I6b §5.3): a retelling
+            // carries the chain its speaker chose; the epistemic layer
+            // validates it (speaker must own the chain for this proposition)
+            // and an invalid selection falls back to the legacy inference.
+            retold_chain,
         );
         // ASSERT: a claim record with provenance, never automatic belief.
         // The asserted polarity is what the recipient was told — not what
@@ -3455,10 +3500,22 @@ impl Simulation {
     fn do_repair(&mut self, proposal: &ActionProposal, location: LocationId) -> ValidationOutcome {
         let damage = self.world.damage_at(&location);
         let cost = (damage.clamp(0.0, 1.0) * 200.0) as i64;
-        // Find a faction responsible for this location that can afford it.
+        // Labor performed on site earns a real wage from the paying
+        // faction's budget (plan I-6 I6b, design §5.4: production consumes
+        // labor; §1.1: the gain is a validated resource transfer, never an
+        // artificial need boost). A quarter of the repair cost, paid only
+        // for labor physically performed at the location — a remote
+        // (contracted) repair pays no wage.
+        let on_site = self
+            .world
+            .actor(&proposal.actor)
+            .is_some_and(|a| a.location == location);
+        let wage = if on_site { cost / 4 } else { 0 };
+        // Find a faction responsible for this location that can afford the
+        // repair *and* the wage.
         let mut payer: Option<FactionId> = None;
         for f in self.world.factions.values() {
-            if f.responsible_for.contains(&location) && f.budget >= cost && f.staff > 0 {
+            if f.responsible_for.contains(&location) && f.budget >= cost + wage && f.staff > 0 {
                 payer = Some(f.id.clone());
                 break;
             }
@@ -3469,7 +3526,7 @@ impl Simulation {
             ));
         };
         if let Some(f) = self.world.faction_mut(&fid) {
-            f.budget -= cost;
+            f.budget -= cost + wage;
         }
         self.world.damage.insert(location.clone(), 0.0);
         // TRANSFORM (the location is restored) plus the honest lowering of
@@ -3486,9 +3543,9 @@ impl Simulation {
         self.effects_buf.push(Effect::Transform {
             actor: proposal.actor.clone(),
             subject: ItemId::new(fid.as_str()),
-            consumed: cost.max(0) as u32,
+            consumed: (cost + wage).max(0) as u32,
             produced: 0,
-            note: format!("{fid} budget spent on the repair"),
+            note: format!("{fid} budget spent on the repair (+{wage} wage)"),
         });
         let (tick, minute) = (self.world.tick, self.world.minute_of_day);
         self.events.push(
@@ -3496,13 +3553,41 @@ impl Simulation {
             minute,
             Some(proposal.actor.clone()),
             EventKind::RepairCompleted {
-                location,
-                by: fid,
+                location: location.clone(),
+                by: fid.clone(),
                 cost,
             },
             Vec::new(),
             Vec::new(),
         );
+        // The wage is a real validated resource gain (§9.1.1 conservation
+        // modulo recorded sources/sinks): the faction's budget decreases by
+        // exactly what the worker's custody gains, recorded by the typed
+        // `WagePaid` event and a truthful, event-sourced wealth-need delta.
+        if wage > 0 {
+            if let Some(a) = self.world.actor_mut(&proposal.actor) {
+                a.inventory.money += wage;
+            }
+            let wage_event = self.events.push(
+                tick,
+                minute,
+                Some(proposal.actor.clone()),
+                EventKind::WagePaid {
+                    faction: fid.clone(),
+                    worker: proposal.actor.clone(),
+                    amount: wage,
+                },
+                Vec::new(),
+                vec![proposal.actor.clone()],
+            );
+            self.apply_need_change(
+                &proposal.actor,
+                NeedKind::Wealth,
+                (wage as f32 / 100.0).clamp(0.05, 1.0),
+                "was paid a repair wage",
+                Some(wage_event),
+            );
+        }
         ValidationOutcome::Accepted
     }
 
@@ -4432,7 +4517,9 @@ impl Simulation {
                     rpg_behavior::Replan::Continue => {
                         // One-shot plans retire once their validated outcome
                         // event exists (a question asked, a sanction issued,
-                        // an excuse granted, an apology given).
+                        // an excuse granted, an apology given) — matched by
+                        // the plan's full parameters, never by actor+kind
+                        // alone (plan I-6 I6b hardening).
                         let done = rpg_agents::planner_candidates::is_one_shot_option(
                             &plan.intention.option,
                         ) && rpg_agents::planner_candidates::one_shot_completed(
@@ -4442,14 +4529,65 @@ impl Simulation {
                             plan.adopted_tick,
                         );
                         if done {
+                            // Bounded attention (design §6.4): a completed
+                            // one-shot option is not re-adopted for the
+                            // cooldown window — a freshly completed question/
+                            // sanction/excuse/retell must not immediately
+                            // re-fire while its outcome is still the latest
+                            // news (the plan's goal state exists).
+                            self.planner.record_abandoned(
+                                &actor,
+                                &plan.intention.option,
+                                tick + self.config.activation.abandon_cooldown_ticks,
+                            );
                             self.planner.plans.remove(&actor);
-                            self.last_planner_pass.activations.push(PlannerActivation {
-                                actor,
-                                signals: signal_count,
-                                work,
-                                replanned,
+                            if signal_count == 0 {
+                                self.last_planner_pass.activations.push(PlannerActivation {
+                                    actor,
+                                    signals: signal_count,
+                                    work,
+                                    replanned,
+                                });
+                                continue;
+                            }
+                            // Signals delivered in the same step the plan
+                            // completes are not silently consumed: the plan
+                            // is retired above and the activation falls
+                            // through to deliberation, so the pending
+                            // signals are spent on a real decision in this
+                            // pass (one-shot completion + same-step
+                            // retirement signal handling, I6b item 5).
+                        } else if plan.last_proposed_tick.is_some() {
+                            // The plan's own step was already proposed: a
+                            // one-shot never re-executes (no duplicate
+                            // outcomes). Two cases only: the outcome event
+                            // exists but has scrolled past the bounded
+                            // retirement window under event load — retire on
+                            // the proposed-once record; or the step was
+                            // rejected — failure bookkeeping owns the bounded
+                            // retry (3 attempts → abandonment), so fall
+                            // through to re-deliberation.
+                            let proposed_at = plan.last_proposed_tick.unwrap_or(0);
+                            let rejected_since = self.events.all().iter().rev().take(64).any(|e| {
+                                e.tick >= proposed_at
+                                    && e.actor.as_ref() == Some(&actor)
+                                    && matches!(
+                                        &e.kind,
+                                        EventKind::ActionRejected { action, .. }
+                                            if action.as_str()
+                                                == plan.action.kind_name()
+                                    )
                             });
-                            continue;
+                            if !rejected_since {
+                                self.planner.plans.remove(&actor);
+                                self.last_planner_pass.activations.push(PlannerActivation {
+                                    actor,
+                                    signals: signal_count,
+                                    work,
+                                    replanned,
+                                });
+                                continue;
+                            }
                         }
                         if signal_count == 0 {
                             out.push(ActionProposal {
@@ -4458,6 +4596,13 @@ impl Simulation {
                                 source: ProposalSource::NpcPolicy,
                                 rationale: format!("plan: {} (fast path)", plan.intention.option),
                             });
+                            if rpg_agents::planner_candidates::is_one_shot_option(
+                                &plan.intention.option,
+                            ) {
+                                if let Some(p) = self.planner.plans.get_mut(&actor) {
+                                    p.last_proposed_tick = Some(tick);
+                                }
+                            }
                             self.last_planner_pass.activations.push(PlannerActivation {
                                 actor,
                                 signals: signal_count,
@@ -4631,6 +4776,11 @@ impl Simulation {
                         source: ProposalSource::NpcPolicy,
                         rationale: format!("plan: {} (reconsidered: kept)", plan.intention.option),
                     });
+                    if rpg_agents::planner_candidates::is_one_shot_option(&plan.intention.option) {
+                        if let Some(p) = self.planner.plans.get_mut(&actor) {
+                            p.last_proposed_tick = Some(tick);
+                        }
+                    }
                     self.last_planner_pass.activations.push(PlannerActivation {
                         actor,
                         signals: signal_count,
@@ -4652,7 +4802,32 @@ impl Simulation {
                 tick,
                 previous.as_ref(),
             );
+            // A plan is adopted to *achieve* its satisfaction predicate. When
+            // the predicate already holds, adopting would churn: the step is
+            // rejected honestly (its precondition is gone), the satisfied
+            // predicate retires the plan, and a fresh adoption restarts the
+            // cycle every tick. Adopting nothing is the honest no-op
+            // (bounded deliberation, design §4.3).
+            if plan
+                .intention
+                .satisfaction
+                .as_ref()
+                .is_some_and(|pred| rpg_domain::world::evaluate_predicate(&self.world, pred))
+            {
+                self.last_planner_pass.activations.push(PlannerActivation {
+                    actor,
+                    signals: signal_count,
+                    work,
+                    replanned,
+                });
+                continue;
+            }
             self.planner.plans.insert(actor.clone(), plan);
+            if rpg_agents::planner_candidates::is_one_shot_option(&sampled.id) {
+                if let Some(p) = self.planner.plans.get_mut(&actor) {
+                    p.last_proposed_tick = Some(tick);
+                }
+            }
             out.push(ActionProposal {
                 actor: actor.clone(),
                 action: candidate.action,
@@ -4801,10 +4976,28 @@ impl Simulation {
     /// Faction budgets: pay for the highest-value affordable priority. This is
     /// where "cost of inaction" shows up — unresolved damage accumulates and
     /// priorities compete for a finite budget.
+    /// The member-report belief above which a faction funds a repair
+    /// initiative (design §5.5: group decisions derive from communicated
+    /// member reports, never truth access).
+    const REPAIR_INITIATIVE_MIN_BELIEF: f32 = 0.3;
+    /// Cooldown (ticks) between repair initiatives for the same
+    /// (faction, location): bounded institutional attention (§6.4).
+    const REPAIR_INITIATIVE_COOLDOWN_TICKS: u64 = 60;
+
     pub fn faction_tick(&mut self) {
+        let (tick, minute) = (self.world.tick, self.world.minute_of_day);
         let faction_ids: Vec<FactionId> = self.world.factions.keys().cloned().collect();
         for fid in faction_ids {
-            // Unresolved damage to responsible locations accumulates.
+            let members: Vec<ActorId> = self
+                .world
+                .faction(&fid)
+                .map(|f| f.members.clone())
+                .unwrap_or_default();
+            // Unresolved damage to responsible locations accumulates. The
+            // wear itself is environmental physics; each 0.1 boundary it
+            // crosses is event-sourced, so the previously silent background
+            // accumulation becomes a causal record (M1: substantive world
+            // mutations are evented).
             let damaged: Vec<LocationId> = self
                 .world
                 .faction(&fid)
@@ -4817,9 +5010,89 @@ impl Simulation {
                 })
                 .unwrap_or_default();
             for loc in &damaged {
-                // Damage slowly worsens while ignored.
+                // Damage slowly worsens while ignored. Every wear tick is
+                // event-sourced (M1: the previously silent background
+                // accumulation becomes a causal record).
                 let cur = self.world.damage_at(loc);
-                self.world.damage.insert(loc.clone(), (cur + 0.01).min(1.0));
+                let next = (cur + 0.01).min(1.0);
+                self.world.damage.insert(loc.clone(), next);
+                self.events.push(
+                    tick,
+                    minute,
+                    None,
+                    EventKind::WearProgressed {
+                        location: loc.clone(),
+                        level: (next * 10.0).floor() as u8,
+                    },
+                    Vec::new(),
+                    Vec::new(),
+                );
+            }
+            // Group decision from member reports (design §5.5): the faction
+            // believes what its members' own ledgers support — it has no
+            // truth access here. When the aggregate says a responsible
+            // location needs repair, the faction funds an initiative from
+            // its own budget (a real institutional spend, evented); the
+            // repair itself is only ever performed by a real member through
+            // validated dispatch (the `work_repair` planner family). A
+            // misreporting member therefore makes the faction spend on a
+            // repair truth never needs — that is the honest cost of being
+            // wrong (T4.3).
+            let responsible: Vec<LocationId> = self
+                .world
+                .faction(&fid)
+                .map(|f| f.responsible_for.clone())
+                .unwrap_or_default();
+            for loc in responsible {
+                let believed = rpg_agents::planner_candidates::faction_believed_damage(
+                    &self.world,
+                    &fid,
+                    &loc,
+                );
+                if believed < Self::REPAIR_INITIATIVE_MIN_BELIEF {
+                    continue;
+                }
+                let cooldown_key = format!("{fid}|{loc}");
+                let ready = self
+                    .faction_repair_cooldown
+                    .get(&cooldown_key)
+                    .is_none_or(|until| tick >= *until);
+                if !ready {
+                    continue;
+                }
+                // The budget estimate is the faction's *believed* severity —
+                // a misbelief overpays exactly as much as it believes.
+                let amount = (believed * 200.0) as i64;
+                if amount <= 0 {
+                    continue;
+                }
+                match self.world.faction_mut(&fid) {
+                    Some(f) if f.budget >= amount => f.budget -= amount,
+                    _ => continue,
+                }
+                *self
+                    .world
+                    .ledger
+                    .entry(format!("{fid}:repair {loc}"))
+                    .or_insert(0) += amount;
+                self.events.push(
+                    tick,
+                    minute,
+                    None,
+                    EventKind::FactionRepairInitiated {
+                        faction: fid.clone(),
+                        location: loc.clone(),
+                        believed_damage: believed,
+                        amount,
+                    },
+                    Vec::new(),
+                    members.clone(),
+                );
+                self.trace.push(format!(
+                    "{fid} funded repair of {loc} on member reports (believed {believed:.2}, {amount})"
+                ));
+                self.faction_repair_cooldown
+                    .insert(cooldown_key, tick + Self::REPAIR_INITIATIVE_COOLDOWN_TICKS);
             }
             let Some(idx) = self
                 .world
@@ -4844,6 +5117,22 @@ impl Simulation {
                 .ledger
                 .entry(format!("{fid}:{desc}"))
                 .or_insert(0) += cost;
+            // M1: the previously unevented background spend becomes a causal
+            // record — a typed institutional budget event (same kind as a
+            // member-initiated allocation).
+            self.events.push(
+                tick,
+                minute,
+                None,
+                EventKind::BudgetAllocated {
+                    faction: fid.clone(),
+                    amount: cost,
+                    purpose: desc.clone(),
+                    priority: desc.clone(),
+                },
+                Vec::new(),
+                members,
+            );
             self.trace.push(format!("{fid} funded '{desc}' for {cost}"));
         }
     }
@@ -4872,7 +5161,40 @@ impl Simulation {
             .insert(loc.clone(), (cur + severity).min(1.0));
         let desc = "an unattended accident caused damage".to_string();
         let (tick, minute) = (self.world.tick, self.world.minute_of_day);
-        self.events.push(
+        // The incident is reported under a canonical public fact (design
+        // §5.5): whoever is at the location witnesses it and holds evidence
+        // for the fact; a faction's member-report aggregate of those
+        // beliefs — never the world's truth — is what its group decisions
+        // act on (T4.3). Ids are deterministic from the incident minute.
+        let fact_id = FactId::new(format!(
+            "f_damage_{}_{}",
+            loc.as_str(),
+            self.world.day as u64 * 1440 + minute as u64
+        ));
+        self.world.facts.insert(
+            fact_id.clone(),
+            rpg_domain::world::Fact {
+                id: fact_id.clone(),
+                statement: format!("the {loc} was damaged"),
+                truth: true,
+                sensitivity: rpg_domain::world::Sensitivity::Public,
+                category: rpg_domain::world::FactCategory::Location,
+                prerequisites: Vec::new(),
+                eligible_holders: Vec::new(),
+                eligible_containers: Vec::new(),
+                committed: true,
+                placed_at: None,
+            },
+        );
+        self.world.damage_facts.insert(loc.clone(), fact_id.clone());
+        let witnesses: Vec<ActorId> = self
+            .world
+            .actors
+            .values()
+            .filter(|a| a.is_alive() && a.location == loc)
+            .map(|a| a.id.clone())
+            .collect();
+        let incident = self.events.push(
             tick,
             minute,
             None,
@@ -4882,8 +5204,21 @@ impl Simulation {
                 severity,
             },
             Vec::new(),
-            Vec::new(),
+            witnesses.clone(),
         );
+        for w in &witnesses {
+            social::record_belief(
+                &mut self.world,
+                &mut self.events,
+                tick,
+                minute,
+                w,
+                &fact_id,
+                true,
+                rpg_domain::behavior_types::AcquisitionChannel::Witnessed.default_reliability(),
+                rpg_domain::world::Provenance::Witnessed { event: incident },
+            );
+        }
         report.background_incidents.push(desc);
     }
 
@@ -5052,6 +5387,55 @@ impl Simulation {
             total.director_notes.extend(r.director_notes);
         }
         total
+    }
+
+    /// Deterministic offscreen catch-up (design §8; plan I-6 I6b item 2):
+    /// advance the world by `minutes` of world time with **zero external
+    /// proposals**, so the causal consequences of the skip happen exactly as
+    /// they would have online — through the *same* production step pipeline
+    /// (deal FSM deadlines, faction accounting, seeded incidents, need
+    /// maintenance), never through a parallel reimplementation.
+    ///
+    /// **Documented bounds (T4.6):**
+    /// * at most [`CATCH_UP_MAX_TICKS`] simulation ticks per call — a longer
+    ///   skip is truncated (`report.truncated`) and the caller continues it
+    ///   with further calls; per-tick event counts are the pipeline's own
+    ///   bounded caps (budgeted planner, bounded candidates), so the catch-up
+    ///   event total is bounded by `ticks × per-tick caps`;
+    /// * zero external proposals and zero LLM calls (the bounded planner and
+    ///   the deterministic routine layer are the only deliberation);
+    /// * **causal-equivalence classification**: debts (the deal FSM's
+    ///   deadline arrows, exactly-once), deaths/custody (validated
+    ///   authoritative transitions only), clues (committed narrative state)
+    ///   and resources (validated, conserved transfers) are processed by the
+    ///   *same* authoritative pathways as online play — bit-exact; incidental
+    ///   animation (schedule-driven movement) is exact too in this
+    ///   implementation, which is strictly stronger than the design's
+    ///   "animation need not be exact" allowance.
+    /// * **no duplicated outcomes**: each tick of world time is processed
+    ///   exactly once (the world's own clock is the cursor — a skipped tick
+    ///   is a real tick), and every entry point is recorded as a
+    ///   [`SimOp::Step`], so replay and save/load continuation reproduce the
+    ///   catch-up bit-identically.
+    pub fn catch_up(&mut self, minutes: u32) -> CatchUpReport {
+        let per_tick = self.config.minutes_per_tick.max(1) as u64;
+        let requested = (minutes as u64).div_ceil(per_tick);
+        let ticks = requested.min(CATCH_UP_MAX_TICKS as u64) as u32;
+        let truncated = requested > CATCH_UP_MAX_TICKS as u64;
+        let mut report = CatchUpReport {
+            ticks,
+            truncated,
+            ..CatchUpReport::default()
+        };
+        for _ in 0..ticks {
+            let r = self.step(Vec::new());
+            report.accepted += r.accepted as u64;
+            report.pending += r.pending as u64;
+            report.rejected += r.rejected as u64;
+            report.deals_due += r.satisfied_commitments.len() as u64;
+            report.incidents += r.background_incidents.len() as u64;
+        }
+        report
     }
 
     /// Convenience: the player actor id.

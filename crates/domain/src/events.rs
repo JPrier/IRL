@@ -78,6 +78,32 @@ pub enum EventKind {
         to: ActorId,
         amount: i64,
     },
+    /// An institutional wage disbursement (plan I-6 I6b, §5.4): a faction
+    /// paid a worker from its budget for real performed labor. This is the
+    /// recorded institutional source of actor money — conservation modulo
+    /// sources/sinks (design §9.1.1) is checked against exactly this event.
+    WagePaid {
+        faction: FactionId,
+        worker: ActorId,
+        amount: i64,
+    },
+    /// Damage at a location worsened while unattended (the environmental
+    /// wear tick). Event-sourced so the otherwise-silent background damage
+    /// accumulation is a causal record (M1); emitted at 0.1 boundaries.
+    WearProgressed {
+        location: LocationId,
+        level: u8,
+    },
+    /// A faction funded a repair initiative from *member reports* (design
+    /// §5.5: group decisions derive from communicated member reports, never
+    /// the world's truth). `believed_damage` is the member-report aggregate
+    /// the decision was based on; the world's true damage may differ.
+    FactionRepairInitiated {
+        faction: FactionId,
+        location: LocationId,
+        believed_damage: f32,
+        amount: i64,
+    },
     OfferCreated {
         offer: OfferId,
         from: ActorId,
@@ -431,6 +457,26 @@ impl EventKind {
             } => format!("{actor} found {qty}x{item} in {location}"),
             EventKind::MoneyPaid { from, to, amount } => {
                 format!("{from} paid {amount} to {to}")
+            }
+            EventKind::WagePaid {
+                faction,
+                worker,
+                amount,
+            } => {
+                format!("{faction} paid wage {amount} to {worker}")
+            }
+            EventKind::WearProgressed { location, level } => {
+                format!("wear at {location} reached level {level}")
+            }
+            EventKind::FactionRepairInitiated {
+                faction,
+                location,
+                believed_damage,
+                amount,
+            } => {
+                format!(
+                    "{faction} funded repair of {location} on member reports (believed {believed_damage:.2}, {amount})"
+                )
             }
             EventKind::OfferCreated {
                 offer, from, to, ..

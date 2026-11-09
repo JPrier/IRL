@@ -72,6 +72,7 @@ fn liar_fools_gullible_while_skeptic_seeks_evidence() {
             fact: lie.clone(),
             assertive: true,
             deceptive: false,
+            retold_chain: None,
         });
         assert!(matches!(
             out,
@@ -99,6 +100,7 @@ fn liar_fools_gullible_while_skeptic_seeks_evidence() {
             fact: lie.clone(),
             assertive: true,
             deceptive: false,
+            retold_chain: None,
         });
         assert!(matches!(
             out,
@@ -164,6 +166,7 @@ fn every_claim_and_evidence_write_is_provenance_typed() {
         fact: lie.clone(),
         assertive: true,
         deceptive: false,
+        retold_chain: None,
     });
     // 2. The dockworker (authored believer) shares an operational fact to the
     //    guard captain — an NPC-to-NPC claim through the same pathway.
@@ -187,6 +190,7 @@ fn every_claim_and_evidence_write_is_provenance_typed() {
             fact: FactId::new("f_shipments_diverted"),
             assertive: true,
             deceptive: false,
+            retold_chain: None,
         },
         source: rpg_domain::action::ProposalSource::NpcPolicy,
         rationale: "audit fixture".into(),
@@ -206,6 +210,7 @@ fn every_claim_and_evidence_write_is_provenance_typed() {
         fact: lie.clone(),
         assertive: true,
         deceptive: true,
+        retold_chain: None,
     });
     assert!(
         matches!(out, rpg_domain::action::ValidationOutcome::Accepted),

@@ -141,6 +141,7 @@ fn fixture() -> World {
         deals: BTreeMap::new(),
         rumors: Vec::new(),
         damage: BTreeMap::new(),
+        damage_facts: BTreeMap::new(),
         location_items: BTreeMap::new(),
         flags: BTreeSet::new(),
         ledger: BTreeMap::new(),
@@ -294,6 +295,7 @@ fn t2_2_pinned_lifecycle_and_exactly_once_terminal() {
             fact: FactId::new("f_ledger"),
             assertive: true,
             deceptive: false,
+            retold_chain: None,
         },
     );
     assert!(matches!(out, ValidationOutcome::Accepted), "{out:?}");

@@ -174,6 +174,15 @@ pub enum Action {
         /// false. Never mutates world truth.
         #[serde(default)]
         deceptive: bool,
+        /// The provenance chain this retelling explicitly continues (plan
+        /// I-6 I6b: autonomous retellings select *which* chain they pass on,
+        /// which need not be the speaker's latest). The epistemic layer
+        /// validates the selection — the chain must be registered and owned
+        /// by the speaker for this proposition — and an invalid selection
+        /// falls back to the legacy inference (a bogus pointer never
+        /// corrupts the chain registry). `None` keeps the legacy behaviour.
+        #[serde(default)]
+        retold_chain: Option<crate::behavior_types::SourceChainId>,
     },
     /// Ask another actor about a proposition (the QUERY primitive, design
     /// §1.1: no omniscient answer). The authoritative lowering derives the
